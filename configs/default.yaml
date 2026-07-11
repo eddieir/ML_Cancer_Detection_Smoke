@@ -7,6 +7,7 @@ data:
   nlst_outcomes_csv: null
   tumor_barcodes: null
   n_hvgs: 2000
+  min_cells_per_subject: 50
   out_dir: data/processed
 
 model:
@@ -14,7 +15,8 @@ model:
   embedding_dim: 256
   num_smoke_types: 6
   num_cell_types: 4
-  dropout: 0.3
+  encoder_dropout: 0.3
+  head_dropout: 0.2
   attention_dim: 128
 
 train:
