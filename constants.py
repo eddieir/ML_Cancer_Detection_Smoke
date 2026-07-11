@@ -1,0 +1,51 @@
+"""
+constants.py
+Shared across ALL modules. Single source of truth — never duplicate these.
+"""
+
+SMOKE_TYPE_MAP: dict[str, int] = {
+    "cigarette": 0,
+    "vape": 1, "ecig": 1, "e-cig": 1,
+    "cigar": 2,
+    "cannabis": 3, "weed": 3,
+    "dual_use": 4, "dual": 4,
+    "unexposed": 5, "never": 5, "control": 5,
+}
+
+SMOKE_TYPES: dict[int, str] = {
+    0: "cigarette", 1: "vape_ecig", 2: "cigar",
+    3: "cannabis", 4: "dual_use", 5: "unexposed",
+}
+
+CELL_TYPE_MAP: dict[str, int] = {
+    # coarse
+    "epithelial": 0, "endothelial": 1, "immune": 2, "stromal": 3,
+    # CellTypist granular → coarse
+    "Basal cell": 0, "Club cell": 0, "Ciliated cell": 0,
+    "AT1 cell": 0, "AT2 cell": 0, "Bronchial epithelial cell": 0,
+    "Endothelial cell": 1, "Capillary EC": 1, "Arterial EC": 1, "Venous EC": 1,
+    "Macrophage": 2, "T cell": 2, "NK cell": 2, "B cell": 2,
+    "Monocyte": 2, "Dendritic cell": 2, "Neutrophil": 2,
+    "Fibroblast": 3, "Smooth muscle cell": 3, "Pericyte": 3,
+}
+
+CELL_TYPES: dict[int, str] = {
+    0: "epithelial", 1: "endothelial", 2: "immune", 3: "stromal",
+}
+
+# Ma et al. 2024 — smoking-discriminative markers per cell type.
+# Force-included in HVG selection regardless of variance rank.
+SMOKE_MARKER_GENES: dict[str, list[str]] = {
+    "endothelial": ["B2M", "EEF1A1", "TPT1"],
+    "epithelial":  ["FTL", "MT-ATP8", "SCGB1A1", "MUC5AC"],
+    "immune":      ["HLA-B", "HLA-C", "S100A8", "S100A9"],
+    "stromal":     ["HSP90B1", "LCN2", "COL1A1"],
+}
+
+ALL_SMOKE_MARKERS: list[str] = [
+    g for genes in SMOKE_MARKER_GENES.values() for g in genes
+]
+
+N_SMOKE_CLASSES = 6
+N_CELL_TYPES    = 4
+N_HVGS_DEFAULT  = 2000
