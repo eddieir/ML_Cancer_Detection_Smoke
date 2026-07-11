@@ -13,6 +13,24 @@ import scanpy as sc
 from constants import SMOKE_TYPE_MAP
 
 
+def _try_auto_download(path: Path) -> None:
+    """
+    If a raw file is missing, check if its parent directory name matches
+    a known GEO accession and trigger the downloader automatically.
+    """
+    from data.downloaders import GEO_DATASETS, download_geo
+    for accession, (subdir, *_) in GEO_DATASETS.items():
+        if accession in str(path):
+            print(f"[loader] {path.name} not found — auto-downloading {accession}")
+            download_geo(accession)
+            return
+    raise FileNotFoundError(
+        f"{path} not found.\n"
+        "Run: python3 src/data/downloaders.py --check\n"
+        "Then: python3 src/data/downloaders.py --geo"
+    )
+
+
 def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
                           subject_id_series: pd.Series,
                           modality: str, is_pseudo_bulk: bool) -> ad.AnnData:
@@ -29,7 +47,10 @@ def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
 
 def load_scrna(h5ad_path: str, smoke_type: str,
                subject_col: str = "donor_id") -> ad.AnnData:
-    """Load a true scRNA-seq h5ad (GSE136831, etc.)."""
+    """Load a true scRNA-seq h5ad. Auto-downloads if missing and accession known."""
+    path = Path(h5ad_path)
+    if not path.exists():
+        _try_auto_download(path)
     adata = sc.read_h5ad(h5ad_path)
     sid = (adata.obs[subject_col].astype(str)
            if subject_col in adata.obs.columns

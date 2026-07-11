@@ -31,6 +31,9 @@ def merge_sources(*adatas: ad.AnnData) -> ad.AnnData:
 
     merged = ad.concat(clipped, axis=0, join="inner", label="source")
     merged.var_names_make_unique()
+    import scipy.sparse as sp
+    if sp.issparse(merged.X):
+        merged.X = merged.X.toarray()              # explicit: avoids UserWarning from scale()
     sc.pp.scale(merged, max_value=10)
     print(f"[assembly] merge  final {merged.n_obs:,} cells x {merged.n_vars:,} genes")
     return merged

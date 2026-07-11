@@ -63,9 +63,11 @@ def normalize(adata: ad.AnnData) -> ad.AnnData:
     """CPM + log1p. Skips if microarray (already log-transformed)."""
     adata.layers["counts"] = adata.X.copy()
     if adata.obs["data_modality"].iloc[0] == "microarray":
+        adata.layers["lognorm"] = adata.X.copy()   # already log-scaled
         return adata
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
+    adata.layers["lognorm"] = adata.X.copy()        # preserve before any scaling
     return adata
 
 
@@ -125,8 +127,15 @@ def annotate_cell_types(adata: ad.AnnData) -> ad.AnnData:
     try:
         import celltypist
         from celltypist import models
+
+        # CellTypist requires log1p normalized X (CPM → log1p).
+        # After merge_sources() X holds z-scores, so we restore lognorm layer.
+        ct_input = adata.copy()
+        if "lognorm" in adata.layers:
+            ct_input.X = adata.layers["lognorm"]
+
         model = models.Model.load(model="Immune_All_Low.pkl")
-        pred  = celltypist.annotate(adata, model=model, majority_voting=True)
+        pred  = celltypist.annotate(ct_input, model=model, majority_voting=True)
         adata.obs["cell_type_name"] = pred.predicted_labels.majority_voting.values
         adata.obs["cell_type_id"]   = (
             adata.obs["cell_type_name"]
