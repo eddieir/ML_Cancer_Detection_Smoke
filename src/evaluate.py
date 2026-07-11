@@ -189,19 +189,25 @@ class Evaluator:
         # Single subject forward pass
         records = self._forward_subjects(subject_dataset)
 
+        # Raw predictions — needed by visualize.plot_all()
+        raw = {
+            "y_true_cancer": [r["label"] for r in records],
+            "y_prob_cancer":  [r["prob"]  for r in records],
+        }
+
         report = {
             "cell_level":       self.cell_level(cell_dataset),
             "subject_level":    self._subject_metrics_from_records(records, threshold),
             "interpretability": self._interpretability_from_records(records),
         }
 
-        path = out / "evaluation_report.json"
-        with open(path, "w") as f:
+        rpath = out / "evaluation_report.json"
+        with open(rpath, "w") as f:
             json.dump(report, f, indent=2)
 
         self._print_summary(report)
-        print(f"\n[evaluate] report → {path}")
-        return report
+        print(f"\n[evaluate] report → {rpath}")
+        return report, raw   # raw contains y_true/y_prob for ROC/PR/calibration plots
 
     # ── Private: single forward pass ──────────────────────────────────────────
 
@@ -273,9 +279,13 @@ class Evaluator:
         }
 
     def _print_summary(self, report: Dict) -> None:
-        cl = report["cell_level"]
-        sl = report["subject_level"]
-        ip = report["interpretability"]
+        cl       = report["cell_level"]
+        sl       = report["subject_level"]
+        ip       = report["interpretability"]
+        top_cell = max(
+            ip["mean_attention_by_cell_type"],
+            key=ip["mean_attention_by_cell_type"].get,
+        )
         print("\n── Evaluation Summary ──────────────────────────")
         print(f"  Cells          : {cl['n_cells']:,}")
         print(f"  Smoke macro-F1 : {cl['smoke_type']['macro_f1']:.3f}")
@@ -285,9 +295,7 @@ class Evaluator:
         print(f"  Sensitivity    : {sl['cancer']['sensitivity']}")
         print(f"  Specificity    : {sl['cancer']['specificity']}")
         print(f"  Malig-attn ρ   : {ip['malignancy_attention_correlation']:.4f}")
-        top_cell_type = max(ip["mean_attention_by_cell_type"],
-                            key=ip["mean_attention_by_cell_type"].get)
-        print(f"  Top cell type  : {top_cell_type}")
+        print(f"  Top cell type  : {top_cell}")
         print("────────────────────────────────────────────────")
 
 
@@ -360,7 +368,7 @@ if __name__ == "__main__":
           f"  n_cells={ip['n_cells_analysed']}")
 
     # full_report uses single subject pass — verify it produces the same n_subjects
-    report = ev.full_report(cell_ds, subject_ds)
+    report, raw = ev.full_report(cell_ds, subject_ds)
     assert report["subject_level"]["n_subjects"] == N_SUBJ
     assert (Path(__file__).parents[1] / "checkpoints" / "evaluation_report.json").exists()
 
