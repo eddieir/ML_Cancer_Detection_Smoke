@@ -1,10 +1,18 @@
 data:
-  scrna_sources: []
-  microarray_sources: []
-  loiselle_path: null
-  gse288003_path: null
-  nlst_csv: null
-  nlst_outcomes_csv: null
+  # Populated by:
+  #   python3 src/data/downloaders.py --all
+  #   python3 src/data/converters.py --all
+  # A source is silently skipped by run_pipeline() if its file doesn't exist
+  # yet, so this is safe to check in with real paths even before download.
+  scrna_sources:
+    - [data/processed/converted/GSE136831.h5ad, cigarette, donor_id]
+  microarray_sources:
+    - [data/processed/converted/GSE994.csv, cigarette]
+    - [data/processed/converted/GSE123352.csv, cigarette]
+  loiselle_path: data/processed/converted/GSE130148_loiselle.csv
+  gse288003_path: data/processed/converted/GSE288003.h5ad
+  nlst_csv: data/raw/subjects/NLST/screen.csv
+  nlst_outcomes_csv: data/processed/converted/nlst_outcomes.csv
   tumor_barcodes: null
   n_hvgs: 2000
   min_cells_per_subject: 50

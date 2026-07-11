@@ -59,7 +59,7 @@ requirements.txt
 | `src/inference.py` | Implemented, passes synthetic smoke test |
 | `tests/*` | Stubs only, no assertions yet |
 | `notebooks/*` | Empty stubs |
-| Real data wiring (GEO/NLST/TCGA sources in `configs/default.yaml`) | Not started — all current runs use synthetic data |
+| Real data wiring (GEO/NLST/TCGA sources in `configs/default.yaml`) | Wired — `configs/default.yaml` points at converted files; download + convert still required before a real run |
 
 Every implemented `src/*.py` module (`preprocess.py`, `model.py`, `train.py`,
 `evaluate.py`, `inference.py`) has a `__main__` smoke test that runs it
@@ -86,6 +86,23 @@ python3 src/evaluate.py     # cell + subject metrics, interpretability report �
 python3 src/inference.py    # untrained-model predict_subject/predict_batch/save_results smoke test
 ```
 
+## Wiring real data sources
+
+Raw GEO/NLST files don't arrive in the shape `src/data/loaders.py` expects
+(GEO series matrices carry metadata headers, GSE136831/GSE288003 are 10x-style
+sparse triples, NLST outcomes use different column names). `src/data/converters.py`
+bridges that gap; `configs/default.yaml` already points at its output paths.
+
+```bash
+python3 src/data/downloaders.py --all              # fetch raw GEO + TCGA files
+python3 src/data/downloaders.py --nlst-instructions # NLST requires manual DUA approval
+python3 src/data/converters.py --all               # → data/processed/converted/*.h5ad, *.csv
+python3 src/preprocess.py                            # now run_pipeline(configs/default.yaml) has real data
+```
+
+Any source missing at conversion time is skipped with a message rather than
+failing the whole pipeline — run with whatever subset you already have.
+
 ## Running inference on real data
 
 ```bash
@@ -105,7 +122,7 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Wire real data sources (GEO GSE994/GSE123352/GSE136831/GSE288003, NLST,
-  TCGA-LUAD/LUSC, Loiselle 2018) into `configs/default.yaml` and `src/preprocess.py`
-- Fill in `tests/*` with real assertions
+- Run `downloaders.py --all` + `converters.py --all` against the real GEO/NLST
+  sources and confirm `preprocess.py` produces sane cell counts per smoke class
+- Fill in `tests/*` with real assertions (including `tests/test_converters.py`)
 - Populate `notebooks/*` walkthroughs
