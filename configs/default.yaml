@@ -1,0 +1,30 @@
+data:
+  scrna_sources: []
+  microarray_sources: []
+  loiselle_path: null
+  gse288003_path: null
+  nlst_csv: null
+  nlst_outcomes_csv: null
+  tumor_barcodes: null
+  n_hvgs: 2000
+  out_dir: data/processed
+
+model:
+  input_dim: 2000
+  embedding_dim: 256
+  num_smoke_types: 6
+  num_cell_types: 4
+  dropout: 0.3
+  attention_dim: 128
+
+train:
+  phase1_epochs: 15
+  phase1_lr: 1.0e-3
+  phase1_batch_size: 512
+  phase2_epochs: 12
+  phase2_lr: 5.0e-4
+  phase3_epochs: 8
+  phase3_lr: 1.0e-4
+  patience: 5
+  grad_clip: 1.0
+  checkpoint_dir: checkpoints

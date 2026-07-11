@@ -1,0 +1,27 @@
+# data — never commit raw or processed genomics data
+data/raw/
+data/processed/
+
+# model checkpoints
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# environments
+.venv/
+env/
+.env
+
+# notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
