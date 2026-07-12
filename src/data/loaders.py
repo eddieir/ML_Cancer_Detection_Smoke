@@ -64,6 +64,11 @@ def load_microarray(csv_path: str, smoke_type: str) -> ad.AnnData:
     """
     Load a genes-x-samples bulk microarray CSV (GSE994, GSE123352).
     Each sample becomes one row (pseudo-bulk cell).
+
+    If a sibling `<name>_samples_meta.csv` exists (written by
+    data/converters.py from GEO sample characteristics), per-sample smoke_type
+    overrides the blanket `smoke_type` default — e.g. GSE994 contains both
+    smokers and never-smokers in one series matrix.
     """
     df    = pd.read_csv(csv_path, index_col=0)       # genes x samples
     X     = df.T.values.astype(np.float32)
@@ -71,6 +76,18 @@ def load_microarray(csv_path: str, smoke_type: str) -> ad.AnnData:
     sid   = pd.Series(df.columns.astype(str), index=df.columns)
     adata = ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=df.index))
     adata = _attach_standard_obs(adata, smoke_type, sid, "microarray", True)
+
+    meta_path = Path(csv_path).with_name(Path(csv_path).stem + "_samples_meta.csv")
+    if meta_path.exists():
+        meta = pd.read_csv(meta_path).set_index("sample_id")["smoke_type"]
+        per_sample = adata.obs_names.map(meta).fillna(smoke_type)
+        adata.obs["smoke_type_name"] = per_sample.values
+        adata.obs["smoke_type"] = per_sample.map(
+            lambda s: SMOKE_TYPE_MAP.get(str(s).lower(), 5)
+        ).values
+        n_over = (per_sample != smoke_type).sum()
+        print(f"[loader] microarray  {n_over} samples relabelled from {meta_path.name}")
+
     print(f"[loader] microarray {adata.n_obs:>7,} samples  {smoke_type}  {Path(csv_path).name}")
     return adata
 

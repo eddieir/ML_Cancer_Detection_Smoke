@@ -55,21 +55,34 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     cfg    = load_config(config)
     adatas = []
 
+    def _exists(path: str) -> bool:
+        ok = Path(path).exists()
+        if not ok:
+            print(f"[preprocess] skip  {path}  (not found — run downloaders.py / converters.py)")
+        return ok
+
     for path, stype, scol in cfg.get("scrna_sources", []):
-        adatas.append(normalize(qc_filter(load_scrna(path, stype, scol))))
+        if _exists(path):
+            adatas.append(normalize(qc_filter(load_scrna(path, stype, scol))))
 
     for path, stype in cfg.get("microarray_sources", []):
-        adatas.append(normalize(load_microarray(path, stype)))
+        if _exists(path):
+            adatas.append(normalize(load_microarray(path, stype)))
 
-    if cfg.get("loiselle_path"):
+    if cfg.get("loiselle_path") and _exists(cfg["loiselle_path"]):
         adatas.append(load_pseudo_bulk_loiselle(cfg["loiselle_path"]))
 
-    if cfg.get("gse288003_path"):
+    if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
         a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
         adatas.append(normalize(qc_filter(a)))
 
     if not adatas:
-        raise ValueError("No data sources provided in config.")
+        raise ValueError(
+            "No data sources found. Run:\n"
+            "  python3 src/data/downloaders.py --all\n"
+            "  python3 src/data/converters.py --all\n"
+            "or pass a config with paths to already-converted files."
+        )
 
     merged = merge_sources(*adatas)
     merged = smoke_aware_hvg(merged, n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT))
@@ -84,7 +97,7 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
 
     outcomes: Optional[pd.DataFrame] = None
-    if cfg.get("nlst_outcomes_csv"):
+    if cfg.get("nlst_outcomes_csv") and Path(cfg["nlst_outcomes_csv"]).exists():
         outcomes = pd.read_csv(cfg["nlst_outcomes_csv"])
 
     bags = assemble_subject_bags(
