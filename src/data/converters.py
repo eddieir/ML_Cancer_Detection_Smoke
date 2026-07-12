@@ -252,6 +252,10 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
         adata.obs["donor_id"] = prefixes.map(donor_map).fillna("unknown").values
     elif "donor_id" not in adata.obs.columns:
         adata.obs["donor_id"] = "unknown"
+        print(f"[convert] {accession}  WARNING: no donor_map supplied and no "
+              f"donor_id in source — all {adata.n_obs:,} cells will collapse "
+              "into a single MIL bag under subject 'unknown'. Pass donor_map= "
+              "with the accession's real barcode→donor mapping before training.")
 
     adata.write_h5ad(out_path)
     print(f"[convert] {accession}  {adata.n_obs:,} cells x {adata.n_vars:,} genes → {out_path.name}")

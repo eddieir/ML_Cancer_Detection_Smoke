@@ -97,8 +97,12 @@ bridges that gap; `configs/default.yaml` already points at its output paths.
 python3 src/data/downloaders.py --all              # fetch raw GEO + TCGA files
 python3 src/data/downloaders.py --nlst-instructions # NLST requires manual DUA approval
 python3 src/data/converters.py --all               # → data/processed/converted/*.h5ad, *.csv
-python3 src/preprocess.py                            # now run_pipeline(configs/default.yaml) has real data
+python3 -c "from preprocess import run_pipeline; run_pipeline('configs/default.yaml')"
 ```
+
+(`python3 src/preprocess.py` with no arguments only runs its synthetic-data
+smoke test — it does not read `configs/default.yaml`. Call `run_pipeline()`
+directly, as above, to process real data.)
 
 Any source missing at conversion time is skipped with a message rather than
 failing the whole pipeline — run with whatever subset you already have.
