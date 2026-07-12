@@ -120,12 +120,12 @@ class Evaluator:
 
     # ── Cell-level ────────────────────────────────────────────────────────────
 
-    def cell_level(
+    def _cell_predictions(
         self,
         cell_dataset: CellLevelDataset,
         batch_size:   int = 512,
     ) -> Dict:
-        """Smoke type F1 + malignancy AUC. Corresponds to Phase 1 evaluation."""
+        """Single forward pass over cell_dataset — shared by cell_level() and full_report()."""
         smoke_preds, smoke_true = [], []
         malig_probs, malig_true = [], []
 
@@ -139,9 +139,21 @@ class Evaluator:
                 malig_true.extend(batch["malignancy_label"].tolist())
 
         return {
-            "n_cells":    len(smoke_true),
-            "smoke_type": _smoke_metrics(smoke_true, smoke_preds),
-            "malignancy": _binary_metrics(malig_true, malig_probs, threshold=0.5),
+            "smoke_pred": smoke_preds, "smoke_true": smoke_true,
+            "malig_prob": malig_probs, "malig_true": malig_true,
+        }
+
+    def cell_level(
+        self,
+        cell_dataset: CellLevelDataset,
+        batch_size:   int = 512,
+    ) -> Dict:
+        """Smoke type F1 + malignancy AUC. Corresponds to Phase 1 evaluation."""
+        p = self._cell_predictions(cell_dataset, batch_size)
+        return {
+            "n_cells":    len(p["smoke_true"]),
+            "smoke_type": _smoke_metrics(p["smoke_true"], p["smoke_pred"]),
+            "malignancy": _binary_metrics(p["malig_true"], p["malig_prob"], threshold=0.5),
         }
 
     # ── Subject-level ─────────────────────────────────────────────────────────
@@ -188,15 +200,22 @@ class Evaluator:
 
         # Single subject forward pass
         records = self._forward_subjects(subject_dataset)
+        cell_preds = self._cell_predictions(cell_dataset)
 
         # Raw predictions — needed by visualize.plot_all()
         raw = {
             "y_true_cancer": [r["label"] for r in records],
             "y_prob_cancer":  [r["prob"]  for r in records],
+            "y_true_smoke":   cell_preds["smoke_true"],
+            "y_pred_smoke":   cell_preds["smoke_pred"],
         }
 
         report = {
-            "cell_level":       self.cell_level(cell_dataset),
+            "cell_level": {
+                "n_cells":    len(cell_preds["smoke_true"]),
+                "smoke_type": _smoke_metrics(cell_preds["smoke_true"], cell_preds["smoke_pred"]),
+                "malignancy": _binary_metrics(cell_preds["malig_true"], cell_preds["malig_prob"], threshold=0.5),
+            },
             "subject_level":    self._subject_metrics_from_records(records, threshold),
             "interpretability": self._interpretability_from_records(records),
         }
@@ -371,5 +390,12 @@ if __name__ == "__main__":
     report, raw = ev.full_report(cell_ds, subject_ds)
     assert report["subject_level"]["n_subjects"] == N_SUBJ
     assert (Path(__file__).parents[1] / "checkpoints" / "evaluation_report.json").exists()
+
+    # Persist raw predictions too — scripts/generate_plots.py reads this to
+    # render ROC/PR/calibration/confusion-matrix plots without rerunning the model.
+    raw_path = Path(__file__).parents[1] / "checkpoints" / "evaluation_raw.json"
+    with open(raw_path, "w") as f:
+        json.dump(raw, f)
+    print(f"[evaluate] raw predictions → {raw_path}")
 
     print("\n=== PASSED ===")

@@ -23,6 +23,9 @@ env/
 # notebooks
 .ipynb_checkpoints/
 
+# demo run output (logs + generated report, created by scripts/run_demo.sh)
+demo_run_*/
+
 # OS
 .DS_Store
 

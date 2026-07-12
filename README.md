@@ -86,6 +86,21 @@ python3 src/evaluate.py     # cell + subject metrics, interpretability report �
 python3 src/inference.py    # untrained-model predict_subject/predict_batch/save_results smoke test
 ```
 
+## Running the full demo
+
+```bash
+./scripts/run_demo.sh
+```
+
+Installs dependencies, runs the pytest suite, runs every module's smoke test
+in order (`preprocess.py` → `model.py` → `train.py` → `evaluate.py` →
+`inference.py`), renders every plot in `src/visualize.py` from the artifacts
+those steps just wrote (training curves, ROC/PR/calibration curves, smoke-type
+confusion matrix, attention-by-cell-type/smoke-type, a sample patient risk
+profile), and bundles logs, plots, and metrics into a single `report.docx` and
+`report.pdf`. Everything lands in a timestamped `demo_run_<timestamp>/`
+directory (gitignored) — nothing here needs real data or a trained checkpoint.
+
 ## Running the test suite
 
 ```bash
