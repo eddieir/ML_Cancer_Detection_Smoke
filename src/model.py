@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 
-from constants import N_CELL_TYPES, N_HVGS_DEFAULT, N_SMOKE_CLASSES, SMOKE_TYPES
+from constants import N_CELL_TYPES, N_HVGS_DEFAULT, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
 
 
 # ─── DRY layer builder ────────────────────────────────────────────────────────
@@ -107,6 +107,39 @@ class MalignancyHead(nn.Module):
         return torch.sigmoid(self.net(z))           # [B, 1]
 
 
+# ─── Stage 3C: Dose-Response Head ─────────────────────────────────────────────
+
+class DoseResponseHead(nn.Module):
+    """
+    Regresses normalised smoke exposure duration/dose (0-1) per cell.
+
+    Novel: every published smoke-cell classifier treats exposure as
+    categorical (smoker/never-smoker or smoke-type only). This head is the
+    first to model exposure as a continuous dose, so MultiTaskLoss can
+    enforce a monotonic dose -> malignancy relationship (see
+    `MultiTaskLoss.dose_response_loss`) — i.e. cells exposed longer must
+    score at least as malignant as cells exposed for less time, within the
+    same smoke type.
+
+    Status: no wired data source currently supplies a real per-cell exposure
+    duration — the previously-cited "Loiselle 2018 / GSE130148" dataset does
+    not exist (verified against GEO directly; GSE130148 is an unrelated lung
+    scRNA-seq study). Every cell is therefore stamped DOSE_UNKNOWN today and
+    this head trains on zero real signal (see dose_response_loss's masking).
+    The architecture and loss are real and tested; only the labelled data is
+    missing. Wiring a real source (e.g. joint-year exposure categories from
+    GSE307690/CANUCK, if a future release exposes them per-sample) would
+    activate it with no further code changes.
+    """
+
+    def __init__(self, embedding_dim: int = 256, dropout: float = 0.2):
+        super().__init__()
+        self.net = _mlp([embedding_dim, 64, 1], dropout=dropout)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.net(z))           # [B, 1]  in [0, 1]
+
+
 # ─── Stage 5+6: Gated Attention MIL ──────────────────────────────────────────
 
 class GatedAttentionMIL(nn.Module):
@@ -182,6 +215,7 @@ class MultiSmokeCancerNet(nn.Module):
         self.encoder         = CellEncoder(input_dim, [1024, 512], embedding_dim, encoder_dropout)
         self.smoke_head      = SmokeTypeHead(embedding_dim, num_smoke, head_dropout)
         self.malignancy_head = MalignancyHead(embedding_dim, head_dropout)
+        self.dose_head       = DoseResponseHead(embedding_dim, head_dropout)
         self.aggregator      = GatedAttentionMIL(
             feat_dim      = embedding_dim + num_smoke + 1 + num_cell_types,
             embed_dim     = embedding_dim,
@@ -255,18 +289,67 @@ class MultiTaskLoss(nn.Module):
         lambda_smoke:     float                   = 0.30,
         lambda_malignancy:float                   = 0.30,
         lambda_subject:   float                   = 0.40,
+        lambda_dose:      float                   = 0.10,
+        dose_margin:      float                   = 0.05,
         smoke_class_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
-        self.λs  = lambda_smoke
-        self.λm  = lambda_malignancy
-        self.λsb = lambda_subject
-        self.ce  = nn.CrossEntropyLoss(weight=smoke_class_weights)
-        self.bce = nn.BCELoss()
+        self.λs   = lambda_smoke
+        self.λm   = lambda_malignancy
+        self.λsb  = lambda_subject
+        self.λd   = lambda_dose
+        self.margin = dose_margin
+        self.ce   = nn.CrossEntropyLoss(weight=smoke_class_weights)
+        self.bce  = nn.BCELoss()
+        self.mse  = nn.MSELoss()
 
     def _ls (self, logits, targets): return self.ce (logits, targets)
     def _lm (self, preds,  targets): return self.bce(preds.view(-1),  targets.float())
     def _lsb(self, prob,   target) : return self.bce(prob.view(-1),   target.view(-1).float())
+
+    def dose_response_loss(
+        self,
+        dose_preds:   torch.Tensor,   # [N, 1] or [N]  predicted dose fraction
+        dose_targets: torch.Tensor,   # [N]  normalised dose, DOSE_UNKNOWN where unlabelled
+        malig_preds:  torch.Tensor,   # [N, 1] or [N]  predicted malignancy, same cells
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Two terms, both restricted to cells with a known exposure dose:
+          1. MSE(dose_pred, dose_target)              — regress the dose itself
+          2. Pairwise monotonic ranking hinge          — cells exposed longer
+             must not score LESS malignant than cells exposed for less time:
+                 for dose_i > dose_j + margin:  hinge(malig_j - malig_i + margin)
+        This is what makes the model dose-response-aware rather than merely
+        dose-blind-categorical, per DoseResponseHead's docstring.
+        Returns zero loss (still a tensor, safe to add into a total) when no
+        cell in the batch has a known dose.
+        """
+        dose_preds   = dose_preds.view(-1)
+        malig_preds  = malig_preds.view(-1)
+        dose_targets = dose_targets.view(-1)
+        known = dose_targets >= 0
+        if known.sum() < 2:
+            zero = dose_preds.sum() * 0.0
+            return zero, {"total": 0.0, "regression": 0.0, "ranking": 0.0, "n_known": int(known.sum())}
+
+        dp, dt, mp = dose_preds[known], dose_targets[known], malig_preds[known]
+        regression = self.mse(dp, dt)
+
+        # Pairwise dose ordering -> malignancy ordering, vectorised.
+        dose_diff  = dt.unsqueeze(0) - dt.unsqueeze(1)         # [n, n]  dose_i - dose_j
+        malig_diff = mp.unsqueeze(0) - mp.unsqueeze(1)         # [n, n]  malig_i - malig_j
+        pair_mask  = dose_diff > self.margin                    # only strictly-ordered pairs
+        ranking = (
+            F.relu(self.margin - malig_diff)[pair_mask].mean()
+            if pair_mask.any() else dp.sum() * 0.0
+        )
+
+        total = regression + ranking
+        return total, {
+            "total": total.item(), "regression": regression.item(),
+            "ranking": ranking.item() if pair_mask.any() else 0.0,
+            "n_known": int(known.sum()),
+        }
 
     def cell_level_loss(
         self,
@@ -340,6 +423,17 @@ if __name__ == "__main__":
     l1, d1 = loss_fn.cell_level_loss(logits, smoke_t, m, malig_t)
     l2, d2 = loss_fn.subject_level_loss(out["cancer_probability"], cancer_t)
     l3, d3 = loss_fn.end_to_end_loss(logits, smoke_t, m, malig_t, out["cancer_probability"], cancer_t)
+
+    # Dose-response head + loss — novel continuous exposure modeling
+    dose_pred = model.dose_head(z)
+    assert dose_pred.shape == (B, 1)
+    dose_t_known   = torch.rand(B)                       # all known
+    dose_t_unknown = torch.full((B,), DOSE_UNKNOWN)       # none known
+    l4, d4 = loss_fn.dose_response_loss(dose_pred, dose_t_known,   m)
+    l5, d5 = loss_fn.dose_response_loss(dose_pred, dose_t_unknown, m)
+    assert l4.requires_grad, "dose loss must be differentiable when doses are known"
+    assert d5["n_known"] == 0 and d5["total"] == 0.0, "unknown doses must contribute zero loss"
+    print(f"dose_response   ✓  known={d4}  unknown={d5}")
 
     assert l1.requires_grad and l2.requires_grad and l3.requires_grad, "losses must be differentiable"
     print(f"cell_level_loss ✓  {d1}")

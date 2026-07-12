@@ -84,8 +84,13 @@ def test_export_cell_dataset_writes_arrays_and_returns_matching_dict():
         result = export_cell_dataset(adata, out_dir=tmp)
         for name in ("gene_matrix.npy", "smoke_labels.npy",
                      "malignancy_labels.npy", "cell_type_ids.npy",
-                     "cell_metadata.csv", "gene_list.csv"):
+                     "exposure_dose.npy", "cell_metadata.csv", "gene_list.csv"):
             assert (Path(tmp) / name).exists()
 
         assert result["gene_matrix"].shape == (n, g)
         assert np.array_equal(np.load(Path(tmp) / "gene_matrix.npy"), result["gene_matrix"])
+
+        # No exposure_dose in obs -> falls back to DOSE_UNKNOWN sentinel for every cell.
+        from constants import DOSE_UNKNOWN
+        assert (result["exposure_dose"] == DOSE_UNKNOWN).all()
+        assert np.array_equal(np.load(Path(tmp) / "exposure_dose.npy"), result["exposure_dose"])

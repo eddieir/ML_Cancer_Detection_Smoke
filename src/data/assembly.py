@@ -10,6 +10,8 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 
+from constants import DOSE_UNKNOWN
+
 
 def merge_sources(*adatas: ad.AnnData) -> ad.AnnData:
     """
@@ -96,16 +98,22 @@ def export_cell_dataset(
     smoke = adata.obs["smoke_type"].values.astype(np.int64)
     malig = adata.obs["malignancy"].values.astype(np.float32)
     ctype = adata.obs["cell_type_id"].values.astype(np.int64)
+    dose  = (adata.obs["exposure_dose"].values.astype(np.float32)
+             if "exposure_dose" in adata.obs.columns
+             else np.full(X.shape[0], DOSE_UNKNOWN, dtype=np.float32))
 
     np.save(out / "gene_matrix.npy",       X)
     np.save(out / "smoke_labels.npy",      smoke)
     np.save(out / "malignancy_labels.npy", malig)
     np.save(out / "cell_type_ids.npy",     ctype)
+    np.save(out / "exposure_dose.npy",     dose)
     adata.obs.to_csv(out / "cell_metadata.csv")
     adata.var.to_csv(out / "gene_list.csv")
 
+    n_known = int((dose >= 0).sum())
     print(f"[assembly] export  {X.shape[0]:,} x {X.shape[1]} → {out}/")
     print(f"           smoke   {dict((i, int((smoke==i).sum())) for i in range(6))}")
     print(f"           malig   {malig.mean():.2%} positive")
+    print(f"           dose    {n_known:,} cells with known exposure duration")
     return {"gene_matrix": X, "smoke_labels": smoke,
-            "malignancy_labels": malig, "cell_type_ids": ctype}
+            "malignancy_labels": malig, "cell_type_ids": ctype, "exposure_dose": dose}

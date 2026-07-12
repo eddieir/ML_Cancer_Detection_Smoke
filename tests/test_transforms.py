@@ -22,6 +22,43 @@ def _base_obs(n, is_pseudo_bulk=False, batch=None):
     return obs
 
 
+def test_harmonize_gene_ids_maps_affy_probes_to_symbols():
+    from data.transforms import harmonize_gene_ids
+    n = 5
+    probes = ["1007_s_at", "1053_at", "117_at", "121_at", "1255_g_at"]
+    X = np.random.rand(n, len(probes)).astype("float32")
+    adata = ad.AnnData(X=X, obs=_base_obs(n), var=pd.DataFrame(index=probes))
+
+    mapping = {"1007_s_at": "DDR1", "1053_at": "RFC2", "117_at": "HSPA6"}
+    out = harmonize_gene_ids(adata, mapping=mapping)
+    assert set(out.var_names) == {"DDR1", "RFC2", "HSPA6"}
+    assert out.n_vars == 3  # unmapped probes (121_at, 1255_g_at) dropped
+
+
+def test_harmonize_gene_ids_maps_ensembl_ids_to_symbols():
+    from data.transforms import harmonize_gene_ids
+    n = 4
+    genes = ["ENSG00000000003", "ENSG00000000419"]
+    X = np.random.rand(n, len(genes)).astype("float32")
+    adata = ad.AnnData(X=X, obs=_base_obs(n), var=pd.DataFrame(index=genes))
+
+    mapping = {"ENSG00000000003": "TSPAN6", "ENSG00000000419": "DPM1"}
+    out = harmonize_gene_ids(adata, mapping=mapping)
+    assert set(out.var_names) == {"TSPAN6", "DPM1"}
+
+
+def test_harmonize_gene_ids_passes_through_gene_symbols_unchanged():
+    """Sources already using gene symbols (no recognised probe pattern) must be untouched."""
+    from data.transforms import harmonize_gene_ids
+    n = 3
+    genes = ["TP53", "EGFR", "MUC5AC"]
+    X = np.random.rand(n, len(genes)).astype("float32")
+    adata = ad.AnnData(X=X, obs=_base_obs(n), var=pd.DataFrame(index=genes))
+
+    out = harmonize_gene_ids(adata, mapping={"should": "never be used"})
+    assert list(out.var_names) == genes
+
+
 def test_qc_filter_removes_low_gene_and_high_mito_cells():
     from data.transforms import qc_filter
     n, g = 50, 30
@@ -99,6 +136,24 @@ def test_batch_correct_skips_single_batch():
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
     out = batch_correct(adata)
     assert "X_pca_harmony" not in out.obsm
+
+
+def test_batch_correct_corrects_two_batches():
+    """
+    Regression test: harmonypy's Z_corr orientation isn't consistent across
+    versions (some return n_pcs x n_cells, others n_cells x n_pcs); blindly
+    transposing crashed AnnData's obsm shape validation on real multi-source
+    data (n_obs=136) even though this exact code path was never exercised by
+    a real >=2-batch dataset in tests before.
+    """
+    from data.transforms import batch_correct
+    n, g = 60, 60
+    batch = ["source_0"] * 30 + ["source_1"] * 30
+    X = np.random.rand(n, g).astype("float32")
+    adata = ad.AnnData(X=X, obs=_base_obs(n, batch=batch),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = batch_correct(adata)
+    assert out.obsm["X_pca_harmony"].shape[0] == n
 
 
 def test_annotate_cell_types_skips_pseudo_bulk():

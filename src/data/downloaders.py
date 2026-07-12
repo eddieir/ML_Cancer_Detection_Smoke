@@ -51,11 +51,11 @@ GEO_DATASETS = {
         "vape",
         "GSE288003_series_matrix.txt.gz",
     ),
-    "GSE130148": (
-        "cannabis/GSE130148",
-        "Loiselle 2018 — BEAS-2B exposed to tobacco and cannabis smoke",
+    "GSE307690": (
+        "cannabis/GSE307690",
+        "CANUCK study — real human airway epithelium, 139 cannabis smokers + 57 never-smokers",
         "cannabis",
-        "GSE130148_series_matrix.txt.gz",
+        "GSE307690_series_matrix.txt.gz",
     ),
 }
 
@@ -139,18 +139,22 @@ def download_geo(accession: str, dest_override: Optional[Path] = None) -> Path:
     Download a GEO series matrix and supplementary files via NCBI FTP.
     Handles both matrix files and raw count files.
     """
-    try:
-        import GEOparse
-    except ImportError:
-        raise ImportError("pip install GEOparse")
-
     subdir, desc, smoke_type, expected_file = GEO_DATASETS[accession]
     dest = _mkdir(dest_override or RAW / subdir)
 
     print(f"\n[GEO] {accession} — {desc}")
 
-    # GEOparse downloads the series matrix and caches it
-    gse = GEOparse.get_GEO(geo=accession, destdir=str(dest), silent=True)
+    # NB: GEOparse.get_GEO() fetches the SOFT metadata file (*_family.soft.gz),
+    # NOT *_series_matrix.txt.gz — converters.py's _parse_series_matrix()
+    # needs the latter, so fetch it directly from the matrix/ FTP path.
+    matrix_ftp = (
+        f"https://ftp.ncbi.nlm.nih.gov/geo/series/"
+        f"{accession[:-3]}nnn/{accession}/matrix/{expected_file}"
+    )
+    try:
+        _download_file(matrix_ftp, dest, expected_file)
+    except Exception as e:
+        print(f"  [warn] series matrix fetch failed: {e}")
 
     # Also grab supplementary files (raw counts for scRNA-seq datasets)
     ncbi_ftp = (

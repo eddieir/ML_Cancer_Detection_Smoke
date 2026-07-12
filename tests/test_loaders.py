@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 import scipy.sparse as sp
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -85,22 +86,15 @@ def test_load_microarray_malignancy_and_subject_id_override():
         assert adata.obs.loc["f2", "subject_id"] == "case2"
 
 
-def test_load_pseudo_bulk_loiselle():
-    from data.loaders import load_pseudo_bulk_loiselle
+def test_other_loaders_default_exposure_dose_to_unknown():
+    """Sources without real exposure duration must not silently look like dose=0."""
+    from data.loaders import load_microarray
+    from constants import DOSE_UNKNOWN
     with tempfile.TemporaryDirectory() as tmp:
-        csv_path = Path(tmp) / "loiselle.csv"
-        pd.DataFrame({
-            "gene_1": [1.0, 2.0, 3.0], "gene_2": [4.0, 5.0, 6.0],
-            "smoke_type": ["cigarette", "cannabis", "unexposed"],
-            "cell_line": ["BEAS-2B", "BEAS-2B", "BEAS-2B"],
-            "week": [12, 2, 0],
-        }).to_csv(csv_path, index=False)
-
-        adata = load_pseudo_bulk_loiselle(str(csv_path))
-        assert adata.n_obs == 3
-        # Cigarette exposure >= 10 weeks is malignant; the other two are not.
-        assert adata.obs["malignancy"].tolist() == [1.0, 0.0, 0.0]
-        assert adata.obs.loc[adata.obs_names[0], "subject_id"] == "BEAS-2B_w12"
+        csv_path = Path(tmp) / "GSE1.csv"
+        pd.DataFrame({"s1": [1, 2], "s2": [3, 4]}, index=["G1", "G2"]).to_csv(csv_path)
+        adata = load_microarray(str(csv_path), "cigarette")
+        assert (adata.obs["exposure_dose"] == DOSE_UNKNOWN).all()
 
 
 def test_load_mouse_scrna_sets_vape():

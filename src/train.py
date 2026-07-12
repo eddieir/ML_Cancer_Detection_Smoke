@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 import yaml
 
-from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES
+from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
 from model import MultiSmokeCancerNet, MultiTaskLoss
 
 
@@ -29,15 +29,20 @@ class CellLevelDataset(Dataset):
 
     def __init__(
         self,
-        gene_matrix:       np.ndarray,   # [N, genes]  float32
-        smoke_labels:      np.ndarray,   # [N]         int64
-        malignancy_labels: np.ndarray,   # [N]         float32
-        cell_type_ids:     np.ndarray,   # [N]         int64
+        gene_matrix:       np.ndarray,             # [N, genes]  float32
+        smoke_labels:      np.ndarray,              # [N]         int64
+        malignancy_labels: np.ndarray,              # [N]         float32
+        cell_type_ids:     np.ndarray,              # [N]         int64
+        exposure_dose:     Optional[np.ndarray] = None,  # [N]  float32, DOSE_UNKNOWN if absent
     ):
         self.X     = torch.FloatTensor(gene_matrix)
         self.smoke = torch.LongTensor(smoke_labels)
         self.malig = torch.FloatTensor(malignancy_labels)
         self.ctype = torch.LongTensor(cell_type_ids)
+        self.dose  = torch.FloatTensor(
+            exposure_dose if exposure_dose is not None
+            else np.full(len(gene_matrix), DOSE_UNKNOWN, dtype=np.float32)
+        )
 
     def __len__(self):  return len(self.X)
 
@@ -47,17 +52,20 @@ class CellLevelDataset(Dataset):
             "smoke_label":     self.smoke[idx],
             "malignancy_label":self.malig[idx],
             "cell_type_id":    self.ctype[idx],
+            "exposure_dose":   self.dose[idx],
         }
 
     @classmethod
     def from_dir(cls, processed_dir: Union[str, Path]) -> "CellLevelDataset":
         """Load directly from the directory written by export_cell_dataset()."""
         d = Path(processed_dir)
+        dose_path = d / "exposure_dose.npy"
         return cls(
             gene_matrix       = np.load(d / "gene_matrix.npy"),
             smoke_labels      = np.load(d / "smoke_labels.npy"),
             malignancy_labels = np.load(d / "malignancy_labels.npy"),
             cell_type_ids     = np.load(d / "cell_type_ids.npy"),
+            exposure_dose     = np.load(dose_path) if dose_path.exists() else None,
         )
 
 
@@ -224,9 +232,11 @@ class Trainer:
             *self.model.encoder.parameters(),
             *self.model.smoke_head.parameters(),
             *self.model.malignancy_head.parameters(),
+            *self.model.dose_head.parameters(),
         ]
         opt     = self._make_optimizer(params, lr)
         sched   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        lambda_dose = self.cfg.get("lambda_dose", 0.10)
         history = []
         best_acc= -1.0
 
@@ -237,9 +247,11 @@ class Trainer:
                 x      = batch["x"].to(self.device)
                 smoke_t= batch["smoke_label"].to(self.device)
                 malig_t= batch["malignancy_label"].to(self.device)
-                _, logits, malig = self.model.forward_cell(x)
+                dose_t = batch["exposure_dose"].to(self.device)
+                z, logits, malig = self.model.forward_cell(x)
                 loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t)
-                self._grad_step(loss, opt, params)
+                dose_loss, _ = loss_fn.dose_response_loss(self.model.dose_head(z), dose_t, malig)
+                self._grad_step(loss + lambda_dose * dose_loss, opt, params)
             sched.step()
 
             # validate
@@ -464,12 +476,19 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}\n")
 
-    # Synthetic datasets
+    # Synthetic datasets — half the cells carry a known exposure dose, so
+    # Phase 1 actually exercises the dose-response head + loss end to end.
+    dose = np.where(
+        np.random.rand(N_CELLS) < 0.5,
+        np.random.rand(N_CELLS).astype("float32"),
+        DOSE_UNKNOWN,
+    ).astype("float32")
     cell_ds = CellLevelDataset(
         gene_matrix       = np.random.randn(N_CELLS, GENES).astype("float32"),
         smoke_labels      = np.random.randint(0, N_SMOKE_CLASSES, N_CELLS),
         malignancy_labels = np.random.randint(0, 2, N_CELLS).astype("float32"),
         cell_type_ids     = np.random.randint(0, N_CELL_TYPES, N_CELLS),
+        exposure_dose     = dose,
     )
     def _bag(n):
         return {

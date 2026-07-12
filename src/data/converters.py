@@ -3,9 +3,8 @@ data/converters.py — raw GEO/NLST downloads → clean formats loaders.py expec
 
 downloaders.py fetches raw files as GEO/GDC publish them (series_matrix.txt.gz,
 10x-style mtx triples, NLST screen/prsn CSVs). loaders.py only knows how to read
-already-clean shapes (genes x samples CSV, h5ad, Loiselle wide CSV). This module
-is the one-time bridge between the two, so neither has to know about the other's
-format quirks.
+already-clean shapes (genes x samples CSV, h5ad). This module is the one-time
+bridge between the two, so neither has to know about the other's format quirks.
 
 Usage:
     python3 src/data/converters.py --all
@@ -33,16 +32,13 @@ def _mkout() -> Path:
 
 # ─── GEO series matrix parsing ────────────────────────────────────────────────
 
-def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list[str]]:
     """
-    Parse a GEO `*_series_matrix.txt.gz` file.
-
-    Returns
-    -------
-    expr  : DataFrame, genes/probes (rows) x GSM sample IDs (cols)
-    meta  : DataFrame, GSM sample IDs (rows) x characteristic fields (cols),
-            parsed from `!Sample_characteristics_ch1` lines of the form
-            "key: value".
+    Shared low-level parse of a GEO `*_series_matrix.txt.gz` file's header
+    section: GSM sample IDs (in column order), their `!Sample_characteristics_ch1`
+    fields as a metadata DataFrame, and the raw table lines (may be empty when
+    the series ships its expression matrix as a separate supplementary file
+    instead of embedding it, e.g. GSE307690/CANUCK).
     """
     opener = gzip.open if gz_path.suffix == ".gz" else open
     sample_ids: list[str] = []
@@ -68,17 +64,32 @@ def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             elif in_table:
                 table_lines.append(line)
 
+    meta = pd.DataFrame(index=sample_ids)
+    for key, vals in char_rows.items():
+        if len(vals) == len(sample_ids):
+            meta[key] = vals
+
+    return sample_ids, meta, table_lines
+
+
+def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Parse a GEO `*_series_matrix.txt.gz` file with an embedded expression table.
+
+    Returns
+    -------
+    expr  : DataFrame, genes/probes (rows) x GSM sample IDs (cols)
+    meta  : DataFrame, GSM sample IDs (rows) x characteristic fields (cols),
+            parsed from `!Sample_characteristics_ch1` lines of the form
+            "key: value".
+    """
+    sample_ids, meta, table_lines = _parse_sample_metadata(gz_path)
     if not table_lines:
         raise ValueError(f"No expression table found in {gz_path}")
 
     from io import StringIO
     expr = pd.read_csv(StringIO("\n".join(table_lines)), sep="\t", index_col=0)
     expr.columns = [c.strip('"') for c in expr.columns]
-
-    meta = pd.DataFrame(index=sample_ids)
-    for key, vals in char_rows.items():
-        if len(vals) == len(sample_ids):
-            meta[key] = vals
 
     return expr, meta
 
@@ -132,75 +143,108 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str) -
     return csv_path
 
 
-def convert_loiselle(accession: str, gz_path: Path) -> Path:
+def convert_canuck(accession: str, gz_path: Path, processed_data_path: Path) -> Path:
     """
-    GSE130148 (Loiselle 2018) series matrix → wide CSV expected by
-    load_pseudo_bulk_loiselle: samples (rows) x [gene columns..., smoke_type,
-    cell_line, week, malignancy].
+    GSE307690 (CANUCK study — Halayko/Tam et al., real human airway epithelial
+    brushings from 139 cannabis smokers + 57 never-smokers) → genes x samples
+    CSV + `_samples_meta.csv` for load_microarray.
 
-    Cell line / week / treatment are recovered from `!Sample_characteristics_ch1`
-    where GEO exposes them; unmatched fields fall back to safe defaults with a
-    printed warning so a reviewer can fix the source CSV by hand if needed.
+    The series matrix's embedded expression table is empty for this
+    accession — GEO stores the real matrix as a separate supplementary file
+    (`processed_data_path`, space-delimited, columns "sample1".."sampleN").
+    Sample order in that file matches the series matrix's GSM column order
+    (both follow GEO submission order), so samples are joined positionally,
+    not by name.
+
+    Per-sample smoke_type is derived from three independent characteristics
+    fields — "cannabis group", "cigarette", "vape" — so a subject using both
+    cannabis and tobacco/vape is correctly labelled dual_use rather than
+    just cannabis.
     """
     out_dir = _mkout()
-    expr, meta = _parse_series_matrix(gz_path)
-    wide = expr.T  # samples x genes
-    wide.index.name = "sample_id"
+    sample_ids, meta, _ = _parse_sample_metadata(gz_path)
 
-    def _find(colnames_contains: str) -> Optional[pd.Series]:
-        col = next((c for c in meta.columns if colnames_contains in c), None)
-        return meta[col] if col is not None else None
+    expr = pd.read_csv(processed_data_path, sep=r"\s+", index_col=0)
+    expr.index = expr.index.str.split(".").str[0]   # strip Ensembl version/dedup suffix
+    if expr.shape[1] != len(sample_ids):
+        raise ValueError(
+            f"{accession}: processed data has {expr.shape[1]} samples, "
+            f"series matrix lists {len(sample_ids)} — cannot align positionally"
+        )
+    expr.columns = sample_ids  # positional join: column order matches GSM order
 
-    def _find_first(*candidates: str) -> Optional[pd.Series]:
-        # NB: can't chain with `or` — truthiness of a multi-row Series raises.
-        for c in candidates:
-            found = _find(c)
-            if found is not None:
-                return found
-        return None
-
-    cell_line = _find("cell line")
-    week      = _find("week")
-    treatment = _find_first("treatment", "agent", "exposure")
-
-    wide["cell_line"] = (cell_line.reindex(wide.index).fillna("BEAS-2B").values
-                          if cell_line is not None else "BEAS-2B")
-    wide["week"] = (
-        pd.to_numeric(week.reindex(wide.index).str.extract(r"(\d+)")[0], errors="coerce")
-        .fillna(0).astype(int).values
-        if week is not None else 0
-    )
-
-    def _smoke_from_treatment(v) -> str:
-        v = str(v).lower()
-        if "cannabis" in v or "weed" in v or "marijuana" in v:
+    def _classify(row) -> str:
+        cannabis = str(row.get("cannabis group", "")).lower().startswith("cannabis")
+        cig      = str(row.get("cigarette", "")).lower() in ("current", "former")
+        vape     = str(row.get("vape", "")).lower() == "yes"
+        if cannabis and (cig or vape):
+            return "dual_use"
+        if cannabis:
             return "cannabis"
-        if "tobacco" in v or "cigarette" in v:
+        if cig:
             return "cigarette"
+        if vape:
+            return "vape"
         return "unexposed"
 
-    wide["smoke_type"] = (
-        treatment.reindex(wide.index).map(_smoke_from_treatment).values
-        if treatment is not None else "unexposed"
-    )
-    wide["malignancy"] = (
-        (wide["smoke_type"] == "cigarette") & (wide["week"] >= 10)
-    ).astype(float)
+    smoke = meta.apply(_classify, axis=1) if not meta.empty else pd.Series("unexposed", index=sample_ids)
 
-    missing = [name for name, s in
-               [("cell line", cell_line), ("week", week), ("treatment", treatment)]
-               if s is None]
-    if missing:
-        print(f"[convert] {accession}  WARNING: GEO metadata missing {missing} — "
-              f"used defaults, verify {out_dir / (accession + '_loiselle.csv')} by hand")
+    csv_path  = out_dir / f"{accession}.csv"
+    meta_path = out_dir / f"{accession}_samples_meta.csv"
+    expr.to_csv(csv_path)
+    pd.DataFrame({"sample_id": expr.columns, "smoke_type": smoke.reindex(expr.columns).values}
+                 ).to_csv(meta_path, index=False)
 
-    out_path = out_dir / f"{accession}_loiselle.csv"
-    wide.to_csv(out_path)
-    print(f"[convert] {accession}  {wide.shape[0]} conditions → {out_path.name}")
-    return out_path
+    counts = smoke.value_counts().to_dict()
+    print(f"[convert] {accession}  {expr.shape[1]} samples x {expr.shape[0]} genes "
+          f"→ {csv_path.name}  {counts}")
+    return csv_path
 
 
 # ─── scRNA (10x-style) conversion ─────────────────────────────────────────────
+
+def _read_mtx_streaming(path: Path, chunk_rows: int = 20_000_000):
+    """
+    Memory-disciplined MatrixMarket reader for very large sparse matrices.
+
+    scipy.io.mmread's pure-Python line parser ballooned to >17GB RSS on a
+    real 692M-nonzero file (GSE136831, ~8GB of actual triplet data),
+    exhausting swap on a 16GB machine. This reads the coordinate list in
+    fixed-size chunks via pandas' C parser, straight into arrays
+    pre-allocated from the MatrixMarket header's known nnz — so peak memory
+    stays close to the matrix's real footprint instead of several multiples
+    of it.
+    """
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as f:
+        line = f.readline()
+        if not line.startswith("%%MatrixMarket"):
+            raise ValueError(f"{path} is not a MatrixMarket file")
+        line = f.readline()
+        while line.startswith("%"):
+            line = f.readline()
+        nrows, ncols, nnz = (int(x) for x in line.split())
+
+        row = np.empty(nnz, dtype=np.int32)
+        col = np.empty(nnz, dtype=np.int32)
+        val = np.empty(nnz, dtype=np.float32)
+        filled = 0
+        for chunk in pd.read_csv(
+            f, sep=r"\s+", header=None, chunksize=chunk_rows,
+            names=["row", "col", "val"],
+            dtype={"row": np.int32, "col": np.int32, "val": np.float32},
+        ):
+            n = len(chunk)
+            row[filled:filled + n] = chunk["row"].values
+            col[filled:filled + n] = chunk["col"].values
+            val[filled:filled + n] = chunk["val"].values
+            filled += n
+
+    row -= 1  # MatrixMarket indices are 1-based
+    col -= 1
+    import scipy.sparse as sp
+    return sp.coo_matrix((val, (row, col)), shape=(nrows, ncols)).tocsr()
+
 
 def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] = None) -> Path:
     """
@@ -228,19 +272,34 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
                 "Download the supplementary files first: "
                 "python3 src/data/downloaders.py --accession " + accession
             )
-        import scipy.io as sio
         import scipy.sparse as sp
 
-        mtx = sio.mmread(str(mtx_files[0])).tocsr()
-        barcode_files = list(src_dir.glob("*barcodes*")) or list(src_dir.glob("*Barcodes*"))
-        feature_files = (list(src_dir.glob("*features*")) or list(src_dir.glob("*genes*"))
-                          or list(src_dir.glob("*Genes*")))
+        mtx = _read_mtx_streaming(mtx_files[0])
+        # Case-insensitive substring match: GEO supplementary files use all
+        # sorts of casing/naming (barcodes.tsv, cellBarcodes.txt, GeneIDs.txt,
+        # features.tsv...) that a fixed-case glob silently misses.
+        def _find_sibling(*keywords: str) -> list[Path]:
+            return [p for p in src_dir.iterdir()
+                    if p != mtx_files[0] and any(k in p.name.lower() for k in keywords)]
 
-        n_obs_from_mtx_rows = mtx.shape[0]
-        barcodes = (_read_id_list(barcode_files[0]) if barcode_files
-                    else [f"cell_{i}" for i in range(n_obs_from_mtx_rows)])
-        genes = (_read_id_list(feature_files[0]) if feature_files
-                 else [f"gene_{i}" for i in range(mtx.shape[1])])
+        barcode_files = _find_sibling("barcode")
+        feature_files = _find_sibling("feature", "gene")
+
+        barcodes = (_read_id_list(barcode_files[0]) if barcode_files else None)
+        genes    = (_read_id_list(feature_files[0]) if feature_files else None)
+
+        # 10x convention is genes x cells (rows x cols); AnnData needs the
+        # opposite (obs=cells x var=genes). Orient by matching mtx dims
+        # against the known barcode/gene counts rather than assuming —
+        # GEO supplementary matrices are not consistently oriented.
+        if barcodes is not None and mtx.shape[1] == len(barcodes) and mtx.shape[0] != len(barcodes):
+            mtx = mtx.T
+        mtx = mtx.tocsr()
+
+        if barcodes is None:
+            barcodes = [f"cell_{i}" for i in range(mtx.shape[0])]
+        if genes is None:
+            genes = [f"gene_{i}" for i in range(mtx.shape[1])]
 
         import anndata as ad
         adata = ad.AnnData(X=sp.csr_matrix(mtx),
@@ -372,9 +431,12 @@ def convert_accession(accession: str) -> Optional[Path]:
     subdir, desc, smoke_type, expected_file = GEO_DATASETS[accession]
     src = RAW / subdir
 
-    if accession == "GSE130148":
+    if accession == "GSE307690":
         gz = src / expected_file
-        return convert_loiselle(accession, gz) if gz.exists() else _missing(accession, gz)
+        processed = src / f"{accession}_processed_data.txt.gz"
+        if not (gz.exists() and processed.exists()):
+            return _missing(accession, processed)
+        return convert_canuck(accession, gz, processed)
 
     if accession in ("GSE136831", "GSE288003"):
         return convert_scrna_10x(accession, src) if src.exists() else _missing(accession, src)

@@ -8,11 +8,97 @@ Given a subject's pool of scRNA-seq cells, the model:
 1. Classifies which smoke type damaged each cell (cigarette, vape/e-cig,
    cigar, cannabis, dual-use, unexposed — 6 classes)
 2. Scores each cell's malignancy risk (continuous, 0–1)
-3. Aggregates across all of a subject's cells via attention-based MIL to
+3. Has a head that regresses a continuous exposure dose and enforces
+   monotonic dose→malignancy ordering (see `DoseResponseHead` below) — no
+   existing smoke-cell model treats exposure as anything but categorical.
+   **This head is architecturally complete but currently untrained on real
+   data** — no public dataset with per-cell/per-sample exposure dose has
+   been identified yet (see the novel-contributions table below)
+4. Aggregates across all of a subject's cells via attention-based MIL to
    produce one subject-level `P(cancer)`
 
 Full design rationale, layer-by-layer specs, data source justification, and
-the novelty case vs. existing literature are in [ARCHITECTURE.md](ARCHITECTURE.md).
+the novelty case vs. existing literature are in [ARCHITECTURE.md](ARCHITECTURE.md#9-novel-contributions-vs-literature).
+
+## Where the data comes from
+
+Every dataset below is public and free. `python3 src/data/downloaders.py --all`
+fetches all of them (except NLST and TCGA, which need extra steps — see below).
+
+| Dataset | What it is | Smoke type | Access |
+|---|---|---|---|
+| [GSE994](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE994) | Bronchial epithelial microarray, 75 subjects | Cigarette (active/former/never) | Free, no login |
+| [GSE123352](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE123352) | Lung tissue RNA-seq, 176 subjects | Cigarette (ever/never) | Free, no login — **not currently merged into training** (Illumina probe IDs aren't mappable to gene symbols yet, see caveat below) |
+| [GSE136831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136831) | Lung scRNA-seq atlas, 312,928 real single cells | Cigarette | Free, no login — largest source (~2GB), needs the streaming mtx parser (`src/data/converters.py::_read_mtx_streaming`) to convert safely on a normal machine |
+| [GSE288003](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE288003) | Mouse lung scRNA-seq, e-cig aerosol exposure | Vape/e-cig | Free, no login — **not currently usable**: its real count matrix ships inside `RAW.tar`, which the downloader doesn't extract yet |
+| [GSE307690](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE307690) (CANUCK study) | Real human airway epithelial brushings, 61 samples (139 cannabis smokers + 57 never-smokers in the full published cohort) | Cannabis, dual-use, cigarette, vape, unexposed | Free, no login |
+| TCGA-LUAD / TCGA-LUSC | Tumor + adjacent-normal tissue, real per-sample malignancy labels | Cigarette (default; TCGA doesn't record smoke type) | Free, but needs a personal [GDC token](https://portal.gdc.cancer.gov/) (register → profile menu → "Download Token") |
+| NLST | ~26,722 subjects, 10-year cancer outcome + smoking history (cigar/dual-use labels) | — (label source, not expression data) | Requires a Data Use Agreement via [cdas.cancer.gov/nlst](https://cdas.cancer.gov/nlst/) (manual, 1–3 business days) — cannot be automated |
+
+```bash
+python3 src/data/downloaders.py --all              # fetches every free GEO source above
+python3 src/data/downloaders.py --tcga --token /path/to/gdc_token.txt   # TCGA-LUAD/LUSC, needs your own token
+python3 src/data/downloaders.py --nlst-instructions # prints the manual NLST steps
+python3 src/data/converters.py --all               # raw downloads → clean CSV/h5ad in data/processed/converted/
+python3 -c "from preprocess import run_pipeline; run_pipeline('configs/default.yaml')"
+```
+
+**A note on data honesty**: an earlier version of this project cited a
+"Loiselle 2018" cannabis/tobacco dataset at accession `GSE130148`. That
+dataset does not exist — `GSE130148` is a real GEO accession, but for an
+unrelated human lung scRNA-seq study with no cannabis or smoke-exposure data
+at all, and no dataset matching that description could be found anywhere in
+GEO. It's been replaced with GSE307690 (CANUCK), a real, verified, published
+cannabis-smoking cohort. If you see any dataset name in this repo you can't
+verify on GEO yourself, treat it as unverified until you check.
+
+## Current results (real data)
+
+As of the last real run (not synthetic), with GSE994 + GSE307690 merged and
+harmonized to a common gene-symbol space (136 real samples total):
+
+| Metric | Value |
+|---|---|
+| Smoke-type accuracy | 77.2% |
+| Smoke-type **macro-F1** | **0.27** |
+| Per-class F1 | cigarette 0.95, dual_use 0.66, vape/cigar/cannabis/unexposed **0.0** |
+| Subject-level cancer `P(cancer)` | **not evaluable yet** — see below |
+
+**Read this honestly, not optimistically.** 77% accuracy sounds good; it
+isn't. The model has collapsed onto the two majority classes (cigarette=83
+samples, dual_use=30 samples) and has learned nothing for vape (7), cannabis
+(6), cigar (1), or unexposed (10) samples — each too small to learn from.
+Macro-F1 (0.27) is the metric that reflects this. This was also evaluated on
+the same data used for training, not a held-out set, so even these numbers
+are optimistic. **There is no subject-level cancer accuracy at all yet**:
+GSE994/GSE307690 are bulk RNA-seq (one expression vector per subject, not
+per cell), so the MIL attention aggregator — which needs many cells per
+subject to attend over — has zero usable bags.
+
+**What would change this**: real per-cell, per-subject data with hundreds of
+cells per subject. That means GSE136831 (312,928 real cells — conversion is
+in progress, see the streaming-parser note above) or TCGA (blocked until a
+GDC token is supplied). Both are prerequisites for any meaningful
+subject-level cancer prediction number; nothing before that point is a real
+model-quality result.
+
+## Novel contributions vs. literature
+
+Every claim below is backed by working code in this repo, not just design intent:
+
+| Claim | Closest existing paper | Gap | Implemented at |
+|---|---|---|---|
+| Multi-smoke-type cell classifier (6 types) | Ma et al. 2024 (cigarette only, 3 states) | No vape/cigar/cannabis/dual-use | [constants.py:15](src/constants.py#L15) `SMOKE_TYPES`, [model.py:74](src/model.py#L74) `SmokeTypeHead` |
+| Per-cell malignancy risk score | Long et al. 2024 (susceptibility genes only) | Not a predictive model | [model.py:96](src/model.py#L96) `MalignancyHead` |
+| MIL aggregation from scRNA-seq to subject | Used in WSI histopathology (ABMIL 2018) | Never applied to scRNA-seq bags | [model.py:145](src/model.py#L145) `GatedAttentionMIL` |
+| Cannabis lung cell cancer model | CDC acknowledges gap officially (2024) | Does not exist anywhere as a per-cell/per-sample ML model | [converters.py:146](src/data/converters.py#L146) `convert_canuck` — real data: GSE307690 (CANUCK study, 61 human airway epithelium samples, 139-cannabis-smoker cohort), wired via [default.yaml](configs/default.yaml) `microarray_sources` |
+| Dual-use cellular signature | Bittoni et al. 2024 (epidemiology only) | No cell-level ML model | [labellers.py:15](src/data/labellers.py#L15) `transfer_nlst_labels` (NLST), plus [converters.py:146](src/data/converters.py#L146) `convert_canuck` (GSE307690 samples with both cannabis + cigarette/vape) |
+| Continuous dose-response modeling (exposure duration → malignancy trajectory) | All existing smoke-cell models are categorical only | No monotonic dose→malignancy ordering at single-cell resolution anywhere | [model.py:112](src/model.py#L112) `DoseResponseHead`, `MultiTaskLoss.dose_response_loss` (pairwise ranking hinge) — architecture + loss are implemented and tested, but **no wired source currently supplies real dose data** (see docstring); this is an honest open gap, not a trained claim |
+| End-to-end smoke→malignancy→cancer pipeline | Not in any paper, preprint, or conference | Confirmed gap across all source types | [preprocess.py](src/preprocess.py) → [train.py](src/train.py) → [evaluate.py](src/evaluate.py) → [inference.py](src/inference.py) |
+
+Full table with citations: [ARCHITECTURE.md §9](ARCHITECTURE.md#9-novel-contributions-vs-literature).
+This table is also reproduced automatically in the generated demo report — see
+[Running the full demo](#running-the-full-demo).
 
 ## Pipeline
 
@@ -42,8 +128,8 @@ src/
   inference.py            Predictor — predict_subject / predict_batch / predict_h5ad, plus CLI
 configs/
   default.yaml           data / model / train config used by model.py and train.py
-tests/                  pytest stubs, one file per src/data module (not yet implemented)
-notebooks/              stubs for data download, preprocessing, training, evaluation walkthroughs
+tests/                  one file per src/data module + model/pipeline integration tests
+notebooks/              data download, preprocessing, training, evaluation walkthroughs
 requirements.txt
 ```
 
@@ -57,9 +143,13 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (35 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py` |
+| `tests/*` | All modules covered (51 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
-| Real data wiring (GEO/NLST/TCGA sources in `configs/default.yaml`) | Wired — `configs/default.yaml` points at converted files, including TCGA-LUAD/LUSC malignancy + outcome labels; download + convert still required before a real run |
+| Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |
+| Real data — GSE136831 (312,928 real cells) | Downloadable; conversion needs the streaming mtx parser (large file, in progress as of this writing) |
+| Real data — GSE123352, GSE288003 | Downloadable but not yet usable — see caveats in [Where the data comes from](#where-the-data-comes-from) |
+| Real data — TCGA-LUAD/LUSC | Wired in code; blocked on a personal GDC token (not obtained yet) |
+| Real data — NLST | Wired in code; blocked on a Data Use Agreement (not obtained yet) |
 
 Every implemented `src/*.py` module (`preprocess.py`, `model.py`, `train.py`,
 `evaluate.py`, `inference.py`) has a `__main__` smoke test that runs it
@@ -111,13 +201,24 @@ Unit tests for every `src/data/*` module (loaders, transforms, labellers,
 assembly, converters), plus integration tests running `run_pipeline()` and
 `MultiSmokeCancerNet` together on synthetic data.
 
-## Wiring real data sources
+## How the pieces fit together
 
-Raw GEO/TCGA/NLST files don't arrive in the shape `src/data/loaders.py` expects
-(GEO series matrices carry metadata headers, GSE136831/GSE288003 are 10x-style
-sparse triples, TCGA ships one HTSeq count file per case plus a GDC file
-manifest, NLST outcomes use different column names). `src/data/converters.py`
-bridges that gap; `configs/default.yaml` already points at its output paths.
+See [Where the data comes from](#where-the-data-comes-from) for what to
+download and why. Mechanically:
+
+Raw GEO/TCGA/NLST files don't arrive in the shape `src/data/loaders.py`
+expects (GEO series matrices carry metadata headers, GSE136831/GSE288003 are
+10x-style sparse matrices, TCGA ships one HTSeq count file per case plus a
+GDC file manifest, NLST outcomes use different column names). Different
+sources also use different gene-ID namespaces — Affymetrix probes (GSE994),
+Illumina probes (GSE123352), Ensembl IDs (GSE307690) — none of which overlap
+directly, so merging sources with zero shared genes is a real failure mode,
+not an edge case. `src/data/converters.py` bridges the format gap;
+`src/data/transforms.py::harmonize_gene_ids` bridges the gene-ID gap
+(Affymetrix + Ensembl → gene symbols via BioMart; Illumina isn't BioMart-
+queryable, so GSE123352 is left out of `configs/default.yaml` until that's
+solved separately). `configs/default.yaml` already points at converters'
+output paths.
 
 TCGA-LUAD/LUSC supply per-cell malignancy labels (tumor vs. solid-tissue-normal)
 and subject-level cancer-positive outcomes — `convert_tcga()` reads the
@@ -129,21 +230,14 @@ history in this pipeline, so smoke_type defaults to `cigarette` — documented
 approximation, consistent with the cigar/dual-use label-transfer caveats in
 [ARCHITECTURE.md](ARCHITECTURE.md#3a-smoke-type-classification-head-head-a).
 
-```bash
-python3 src/data/downloaders.py --all              # fetch raw GEO + TCGA files
-python3 src/data/downloaders.py --tcga --token /path/to/gdc_token.txt  # TCGA needs a GDC token
-python3 src/data/downloaders.py --nlst-instructions # NLST requires manual DUA approval
-python3 src/data/converters.py --all               # → data/processed/converted/*.h5ad, *.csv
-python3 -c "from preprocess import run_pipeline; run_pipeline('configs/default.yaml')"
-```
-
 Or walk through the same steps interactively in
 [notebooks/01_data_download.ipynb](notebooks/01_data_download.ipynb) and
 [notebooks/02_preprocessing.ipynb](notebooks/02_preprocessing.ipynb).
 
 (`python3 src/preprocess.py` with no arguments only runs its synthetic-data
 smoke test — it does not read `configs/default.yaml`. Call `run_pipeline()`
-directly, as above, to process real data.)
+directly, as shown in [Where the data comes from](#where-the-data-comes-from),
+to process real data.)
 
 Any source missing at conversion time is skipped with a message rather than
 failing the whole pipeline — run with whatever subset you already have.
@@ -167,6 +261,13 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Run `downloaders.py --all` + `--tcga` + `converters.py --all` against the
-  real GEO/TCGA/NLST sources and confirm `preprocess.py` produces sane cell
-  counts per smoke class and malignancy rate
+- Finish converting GSE136831 (312,928 real cells) and re-run `run_pipeline()`
+  with it included — this is the first source with enough real cells per
+  subject to produce an actual subject-level cancer-prediction number
+- Extract GSE288003's real count matrix from `RAW.tar` (currently unhandled
+  by `downloaders.py`) so its e-cig/vape data becomes usable
+- Map GSE123352's Illumina probe IDs to gene symbols (BioMart doesn't expose
+  that array; needs GEO's own GPL platform annotation file instead) so it can
+  rejoin `microarray_sources`
+- Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
+  labels) and NLST (real cancer outcomes + cigar/dual-use history)
