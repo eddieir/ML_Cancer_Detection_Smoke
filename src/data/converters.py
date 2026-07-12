@@ -285,8 +285,8 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
         barcode_files = _find_sibling("barcode")
         feature_files = _find_sibling("feature", "gene")
 
-        barcodes = (_read_id_list(barcode_files[0]) if barcode_files else None)
-        genes    = (_read_id_list(feature_files[0]) if feature_files else None)
+        barcodes = (_read_id_list(barcode_files[0], expected_len=mtx.shape[1]) if barcode_files else None)
+        genes    = (_read_id_list(feature_files[0], expected_len=mtx.shape[0]) if feature_files else None)
 
         # 10x convention is genes x cells (rows x cols); AnnData needs the
         # opposite (obs=cells x var=genes). Orient by matching mtx dims
@@ -321,10 +321,18 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
     return out_path
 
 
-def _read_id_list(path: Path) -> list[str]:
+def _read_id_list(path: Path, expected_len: Optional[int] = None) -> list[str]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as f:
-        return [line.split("\t")[0].strip() for line in f if line.strip()]
+        ids = [line.split("\t")[0].strip().strip('"') for line in f if line.strip()]
+    # Some GEO supplementary files ship a header row (e.g. GSE136831's
+    # GeneIDs.txt has `"Ensembl_GeneID"	"HGNC_EnsemblAlt_GeneID"` on line 1);
+    # detect it by comparing against the matrix's known dimension rather than
+    # assuming every file either always or never has one.
+    if expected_len is not None and len(ids) == expected_len + 1:
+        print(f"[convert] {path.name}  dropping header row ({len(ids)} -> {expected_len})")
+        ids = ids[1:]
+    return ids
 
 
 # ─── TCGA conversion ──────────────────────────────────────────────────────────
