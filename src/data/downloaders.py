@@ -233,6 +233,18 @@ def download_tcga(project: str, token_file: Optional[str] = None) -> Path:
         for hit in hits:
             f.write(f"{hit['file_id']}\t{hit['file_name']}\t\t\t\n")
 
+    # case_id / sample_type aren't part of the gdc-client manifest format, but
+    # convert_tcga() (data/converters.py) needs them to build subject_id and
+    # malignancy labels — save them separately instead of discarding.
+    meta_path = dest / "file_meta.csv"
+    with open(meta_path, "w") as f:
+        f.write("file_id,file_name,case_id,sample_type\n")
+        for hit in hits:
+            case = hit.get("cases", [{}])[0]
+            case_id = case.get("case_id", "")
+            sample_type = case.get("samples", [{}])[0].get("sample_type", "")
+            f.write(f"{hit['file_id']},{hit['file_name']},{case_id},{sample_type}\n")
+
     # Download via gdc-client (fastest method for large TCGA files)
     if shutil.which("gdc-client"):
         token = Path(token_file).read_text().strip()

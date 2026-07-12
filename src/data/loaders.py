@@ -66,9 +66,15 @@ def load_microarray(csv_path: str, smoke_type: str) -> ad.AnnData:
     Each sample becomes one row (pseudo-bulk cell).
 
     If a sibling `<name>_samples_meta.csv` exists (written by
-    data/converters.py from GEO sample characteristics), per-sample smoke_type
-    overrides the blanket `smoke_type` default — e.g. GSE994 contains both
-    smokers and never-smokers in one series matrix.
+    data/converters.py), per-sample columns override the blanket defaults:
+      smoke_type  — e.g. GSE994 contains both smokers and never-smokers
+                    in one series matrix.
+      malignancy  — e.g. TCGA tumor/NAT samples (convert_tcga), which have
+                    a real per-sample malignancy label instead of the 0.0
+                    default.
+      subject_id  — e.g. TCGA case_id, needed so tumor/NAT samples from the
+                    same patient share one MIL bag instead of each sample
+                    becoming its own "subject".
     """
     df    = pd.read_csv(csv_path, index_col=0)       # genes x samples
     X     = df.T.values.astype(np.float32)
@@ -79,14 +85,26 @@ def load_microarray(csv_path: str, smoke_type: str) -> ad.AnnData:
 
     meta_path = Path(csv_path).with_name(Path(csv_path).stem + "_samples_meta.csv")
     if meta_path.exists():
-        meta = pd.read_csv(meta_path).set_index("sample_id")["smoke_type"]
-        per_sample = adata.obs_names.map(meta).fillna(smoke_type)
-        adata.obs["smoke_type_name"] = per_sample.values
-        adata.obs["smoke_type"] = per_sample.map(
-            lambda s: SMOKE_TYPE_MAP.get(str(s).lower(), 5)
-        ).values
-        n_over = (per_sample != smoke_type).sum()
-        print(f"[loader] microarray  {n_over} samples relabelled from {meta_path.name}")
+        meta = pd.read_csv(meta_path).set_index("sample_id")
+
+        if "smoke_type" in meta.columns:
+            per_sample = adata.obs_names.map(meta["smoke_type"]).fillna(smoke_type)
+            adata.obs["smoke_type_name"] = per_sample.values
+            adata.obs["smoke_type"] = per_sample.map(
+                lambda s: SMOKE_TYPE_MAP.get(str(s).lower(), 5)
+            ).values
+            n_over = (per_sample != smoke_type).sum()
+            print(f"[loader] microarray  {n_over} samples relabelled from {meta_path.name}")
+
+        if "malignancy" in meta.columns:
+            adata.obs["malignancy"] = (
+                adata.obs_names.map(meta["malignancy"]).fillna(0.0).astype(np.float32).values
+            )
+            print(f"[loader] microarray  malignancy labels loaded from {meta_path.name}")
+
+        if "subject_id" in meta.columns:
+            override = adata.obs_names.to_series().map(meta["subject_id"])
+            adata.obs["subject_id"] = override.fillna(sid).values
 
     print(f"[loader] microarray {adata.n_obs:>7,} samples  {smoke_type}  {Path(csv_path).name}")
     return adata
@@ -121,10 +139,13 @@ def load_pseudo_bulk_loiselle(csv_path: str) -> ad.AnnData:
     if "malignancy" in df.columns:
         adata.obs["malignancy"] = df["malignancy"].values.astype(np.float32)
     else:
+        # NB: `.values` matters — adata.obs's index is coerced to strings by
+        # AnnData, so assigning the Series directly would align on index
+        # (int vs "int") and silently produce all-NaN instead of raising.
         adata.obs["malignancy"] = (
             (df["smoke_type"].str.lower().isin(["cigarette", "tobacco"])) &
             (df["week"] >= 10)
-        ).astype(np.float32)
+        ).astype(np.float32).values
 
     print(f"[loader] loiselle   {adata.n_obs:>7,} conditions  cannabis+tobacco")
     return adata

@@ -25,3 +25,6 @@ env/
 
 # OS
 .DS_Store
+
+# pybiomart's local query cache (created by map_mouse_to_human)
+.pybiomart.sqlite
