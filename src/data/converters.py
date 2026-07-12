@@ -151,9 +151,17 @@ def convert_loiselle(accession: str, gz_path: Path) -> Path:
         col = next((c for c in meta.columns if colnames_contains in c), None)
         return meta[col] if col is not None else None
 
+    def _find_first(*candidates: str) -> Optional[pd.Series]:
+        # NB: can't chain with `or` — truthiness of a multi-row Series raises.
+        for c in candidates:
+            found = _find(c)
+            if found is not None:
+                return found
+        return None
+
     cell_line = _find("cell line")
     week      = _find("week")
-    treatment = _find("treatment") or _find("agent") or _find("exposure")
+    treatment = _find_first("treatment", "agent", "exposure")
 
     wide["cell_line"] = (cell_line.reindex(wide.index).fillna("BEAS-2B").values
                           if cell_line is not None else "BEAS-2B")
