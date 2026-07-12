@@ -3,12 +3,75 @@ data/transforms.py — pure data transformation. No I/O, no label logic.
 Each function takes AnnData, returns AnnData.
 """
 
+import re
 from typing import Optional
 import numpy as np
 import anndata as ad
 import scanpy as sc
 
 from constants import ALL_SMOKE_MARKERS
+
+
+# ─── Gene ID harmonization ────────────────────────────────────────────────────
+
+# Platform-specific probe/gene ID patterns -> BioMart attribute name that maps
+# them to human gene symbols. Detected by sniffing var_names, so callers don't
+# need to know each source's platform ahead of time.
+_ID_PATTERNS: dict[str, "re.Pattern"] = {
+    "affy_hg_u133a_2": re.compile(r"^\d+(_[a-z]+)?_at$", re.I),
+    "ensembl_gene_id": re.compile(r"^ENSG\d+(\.\d+)?$"),
+}
+
+
+def _detect_platform(var_names) -> Optional[str]:
+    sample = list(var_names[:20])
+    if not sample:
+        return None
+    for platform, pattern in _ID_PATTERNS.items():
+        if all(pattern.match(str(v)) for v in sample):
+            return platform
+    return None
+
+
+def harmonize_gene_ids(adata: ad.AnnData, mapping: Optional[dict] = None) -> ad.AnnData:
+    """
+    Maps platform-specific probe/gene IDs (Affymetrix HG-U133A probes,
+    Ensembl gene IDs) to human gene symbols via BioMart, so merge_sources()
+    can find real overlap across heterogeneous sources instead of the zero
+    overlap you get when one source uses "1007_s_at" and another uses
+    "ENSG00000000003" for the same gene.
+
+    Auto-detects platform from var_names; sources already using gene symbols
+    (no pattern match) pass through unchanged. Illumina HumanHT-12 probes
+    (e.g. GSE123352's "ILMN_...") are NOT covered — Ensembl's BioMart doesn't
+    expose that array as a queryable attribute, so those sources need GEO's
+    own GPL platform annotation file instead and are deliberately left out of
+    auto-detection here rather than silently mismapped.
+
+    `mapping` lets tests (and repeat calls across sources on the same
+    platform) skip the live BioMart query.
+    """
+    platform = _detect_platform(adata.var_names)
+    if platform is None:
+        return adata  # already gene symbols, or an unrecognised/unsupported platform
+
+    if mapping is None:
+        try:
+            from pybiomart import Dataset
+            ds = Dataset(name="hsapiens_gene_ensembl", host="http://www.ensembl.org")
+            df = ds.query(attributes=[platform, "external_gene_name"]).dropna()
+            mapping = dict(zip(df.iloc[:, 0], df.iloc[:, 1]))
+        except Exception as e:
+            print(f"[transform] gene ID mapping unavailable ({e}) — skipping harmonization")
+            return adata
+
+    new_names = [mapping.get(g, "") for g in adata.var_names]
+    valid = [i for i, n in enumerate(new_names) if n]
+    adata = adata[:, valid].copy()
+    adata.var_names = [new_names[i] for i in valid]
+    adata.var_names_make_unique()
+    print(f"[transform] {platform}  {len(valid):,}/{len(new_names):,} probes → gene symbols")
+    return adata
 
 
 def map_mouse_to_human(adata: ad.AnnData) -> ad.AnnData:
@@ -116,7 +179,11 @@ def batch_correct(adata: ad.AnnData, batch_key: str = "batch") -> ad.AnnData:
     ho = hm.run_harmony(
         adata.obsm["X_pca"], adata.obs, batch_key, max_iter_harmony=20
     )
-    adata.obsm["X_pca_harmony"] = ho.Z_corr.T
+    # harmonypy's Z_corr orientation has flipped across versions (some
+    # return n_pcs x n_cells, others n_cells x n_pcs) — orient against the
+    # known n_obs rather than assuming a fixed convention.
+    z_corr = ho.Z_corr if ho.Z_corr.shape[0] == adata.n_obs else ho.Z_corr.T
+    adata.obsm["X_pca_harmony"] = z_corr
     print(f"[transform] harmony  {adata.obs[batch_key].nunique()} batches corrected")
     return adata
 

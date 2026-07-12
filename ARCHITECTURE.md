@@ -118,8 +118,8 @@ Input: z in R^256
 | 0 | cigarette | GEO GSE994, GSE123352, GSE136831 | True scRNA-seq / microarray |
 | 1 | vape / e-cig | GEO GSE288003 + human bronchial cell datasets | GSE288003 is mouse — requires human ortholog mapping via biomaRt |
 | 2 | cigar | NLST cigar-reported subjects, cells from GSE136831 re-labelled by smoking history metadata | No dedicated cigar scRNA-seq exists; label transferred from clinical metadata |
-| 3 | cannabis | Loiselle 2018 (BioProject) | Bulk RNA-seq on BEAS-2B cell lines, not true scRNA-seq; used as pseudo-bulk |
-| 4 | dual-use | NLST dual-reported subjects (cigarette + vape), cells re-labelled from GSE136831 | Approximated from clinical annotation |
+| 3 | cannabis | GSE307690 (CANUCK study) | Real human airway epithelial brushings, 139 cannabis smokers vs. 57 never-smokers — bulk RNA-seq, used as pseudo-bulk |
+| 4 | dual-use | NLST dual-reported subjects (cigarette + vape); GSE307690 samples with both `cannabis group: Cannabis` and `cigarette: current/former` or `vape: Yes` | Approximated from clinical/GEO annotation |
 | 5 | unexposed | Never-smoker controls from all above datasets | — |
 
 **Loss:** `CrossEntropyLoss(weight=class_weights)`  
@@ -153,6 +153,61 @@ Input: z in R^256
 | 0.0 (benign) | Never-smoker controls | Negative class |
 
 **Loss:** `BCELoss()`
+
+---
+
+### Stage 3C: Dose-Response Head (Head C) — novel
+
+**Purpose:** Given cell embedding z, regress a normalised smoke exposure
+dose (0-1) for cells whose source records one. Every existing smoke-cell
+classifier (Ma et al. 2024 included) treats exposure as categorical only —
+smoker vs. never-smoker, or smoke type without intensity. Nothing published
+models exposure as a continuous variable at single-cell resolution, or ties
+it to malignancy trajectory.
+
+```
+Input: z in R^256
+  |
+  FC(256 -> 64) + GELU + Dropout(0.2)
+  |
+  FC(64 -> 1)
+  |
+  Sigmoid -> dose_score in [0, 1]
+```
+
+**Training labels:** honest status — **no wired source currently supplies a
+real per-cell exposure dose.** The "Loiselle 2018 / GSE130148" dataset this
+head originally cited does not exist (verified directly against GEO;
+GSE130148 is an unrelated human lung scRNA-seq study with no cannabis or
+dose-response data). Every cell is stamped `DOSE_UNKNOWN` (-1) by
+`_attach_standard_obs()` (`src/data/loaders.py`) and excluded from this
+head's loss — the architecture and loss function are real, tested, and
+wired end-to-end (see `tests/test_model.py`), but they currently train on
+zero real signal. Wiring a genuine continuous exposure-dose source (none
+identified yet — GSE307690/CANUCK only exposes categorical joint-year bins
+in its public GEO metadata, not per-sample) would activate this head with
+no further code changes.
+
+**Loss — two terms, masked to cells with a known dose:**
+
+```
+L_dose = MSE( dose_pred, dose_target )
+       + mean_over_pairs( ReLU( margin - (malignancy_i - malignancy_j) ) )
+         for every pair (i, j) with dose_i > dose_j + margin
+```
+
+The second term is a pairwise monotonic-ranking hinge: a cell exposed longer
+must not be scored *less* malignant than a cell exposed for less time (same
+smoke type, by construction of the pairing within a batch). This is the
+piece that makes the model dose-response-aware rather than dose-blind — it
+directly operationalises the "no cannabis/dual-use dose-response model
+exists" gap in §9 as a differentiable training signal, not just a labeled
+class.
+
+Implemented in `model.py::DoseResponseHead` and
+`MultiTaskLoss.dose_response_loss`; wired into Phase 1 training in
+`train.py::Trainer.phase1` with weight `lambda_dose` (default 0.10,
+`configs/default.yaml`).
 
 ---
 
@@ -249,17 +304,20 @@ Input: Z_subject in R^256
 L_total = lambda_smoke     * L_CE( smoke_type_logits, smoke_labels )
         + lambda_malignancy * L_BCE( malignancy_scores, malignancy_labels )
         + lambda_subject    * L_BCE( cancer_prob, cancer_label )
+        + lambda_dose       * L_dose( dose_scores, dose_labels, malignancy_scores )   -- Phase 1 only
 ```
 
 **Lambda values:**
 
-| Phase | lambda_smoke | lambda_malignancy | lambda_subject |
-|-------|-------------|------------------|---------------|
-| Phase 1 (cell pre-train) | 0.50 | 0.50 | 0.00 |
-| Phase 2 (aggregator train) | 0.00 | 0.00 | 1.00 |
-| Phase 3 (end-to-end) | 0.30 | 0.30 | 0.40 |
+| Phase | lambda_smoke | lambda_malignancy | lambda_subject | lambda_dose |
+|-------|-------------|------------------|---------------|------------|
+| Phase 1 (cell pre-train) | 0.50 | 0.50 | 0.00 | 0.10 |
+| Phase 2 (aggregator train) | 0.00 | 0.00 | 1.00 | 0.00 |
+| Phase 3 (end-to-end) | 0.30 | 0.30 | 0.40 | 0.00 |
 
 Subject prediction carries 0.40 weight in Phase 3 because it's the primary clinical objective.
+`L_dose` is Phase-1-only: it needs per-cell exposure duration, which only
+exists at cell-level pretraining time (see Stage 3C).
 
 ---
 
@@ -335,7 +393,7 @@ Stop:        Early stop if no improvement for 5 consecutive epochs
 | GEO GSE123352 | Lung tissue RNA-seq | 176 subjects | Cigarette (ever/never) | Free |
 | GEO GSE136831 | scRNA-seq, lung atlas | 312,928 cells | Cigarette | Free |
 | GEO GSE288003 | Lung cells, e-cig aerosol | Mouse model | Vape / e-cig | Free — map mouse genes to human orthologs via biomaRt before use |
-| Loiselle 2018 (BioProject) | BEAS-2B + NCI-H1975 | Cell lines (bulk RNA-seq, not scRNA-seq) | Cigarette + Cannabis | Free — pseudo-bulk; one vector per condition not per cell |
+| GSE307690 (CANUCK study) | Real human airway epithelial brushings | 61 samples (139 cannabis smokers + 57 never-smokers in the full cohort; public GEO release covers a subset) | Cannabis, dual-use (cannabis+cigarette/vape), cigarette, vape, unexposed | Free — bulk RNA-seq, pseudo-bulk; one vector per sample not per cell |
 | TCGA-LUAD | Tumor + NAT cells | ~541 patients | Malignancy labels | Free (TCIA) |
 | TCGA-LUSC | Tumor + NAT cells | ~512 patients | Malignancy labels | Free (TCIA) |
 
@@ -387,6 +445,7 @@ Stop:        Early stop if no improvement for 5 consecutive epochs
 | MIL aggregation from scRNA-seq to subject | Used in WSI histopathology (ABMIL 2018) | Never applied to scRNA-seq bags |
 | Cannabis lung cell cancer model | CDC acknowledges gap officially (2024) | Does not exist anywhere |
 | Dual-use cellular signature | Bittoni et al. 2024 (epidemiology only) | No cell-level ML model |
+| Continuous dose-response modeling (exposure duration -> malignancy trajectory) | All existing smoke-cell models are categorical only (smoker/never-smoker) | No model regresses exposure dose or enforces a monotonic dose->malignancy ordering at single-cell resolution |
 | End-to-end smoke->malignancy->cancer pipeline | Not in any paper, preprint, or conference | Confirmed gap across all source types |
 
 ---

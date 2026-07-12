@@ -6,12 +6,16 @@ data:
   # yet, so this is safe to check in with real paths even before download.
   scrna_sources:
     - [data/processed/converted/GSE136831.h5ad, cigarette, donor_id]
+  # GSE123352 (Illumina HumanHT-12 probes) is deliberately left out: its
+  # probe IDs aren't a queryable BioMart attribute, so harmonize_gene_ids()
+  # (transforms.py) can't map them to gene symbols yet — including it here
+  # would silently exclude it from merge_sources()'s common-gene intersection
+  # anyway. Needs a GEO GPL platform annotation file instead; separate task.
   microarray_sources:
     - [data/processed/converted/GSE994.csv, cigarette]
-    - [data/processed/converted/GSE123352.csv, cigarette]
     - [data/processed/converted/TCGA-LUAD.csv, cigarette]
     - [data/processed/converted/TCGA-LUSC.csv, cigarette]
-  loiselle_path: data/processed/converted/GSE130148_loiselle.csv
+    - [data/processed/converted/GSE307690.csv, cannabis]
   gse288003_path: data/processed/converted/GSE288003.h5ad
   nlst_csv: data/raw/subjects/NLST/screen.csv
   nlst_outcomes_csv: data/processed/converted/nlst_outcomes.csv
@@ -36,6 +40,7 @@ train:
   phase1_epochs: 15
   phase1_lr: 1.0e-3
   phase1_batch_size: 512
+  lambda_dose: 0.10  # weight of the dose-response loss during Phase 1 (see model.py DoseResponseHead)
   phase2_epochs: 12
   phase2_lr: 5.0e-4
   phase3_epochs: 8

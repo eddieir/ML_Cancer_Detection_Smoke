@@ -58,6 +58,34 @@ def pytest_summary_line(log_text: str) -> str:
     return m.group(0).strip("= ").strip() if m else "no summary line found"
 
 
+def load_novel_contributions():
+    """
+    Parses the "Novel Contributions vs. Literature" markdown table straight
+    out of ARCHITECTURE.md, so the report and the architecture doc never
+    drift out of sync.
+    """
+    path = ROOT / "ARCHITECTURE.md"
+    if not path.exists():
+        return None
+    text = path.read_text()
+    m = re.search(
+        r"^## \d+\. Novel Contributions vs\. Literature\s*\n(.*?)(?=\n## |\Z)",
+        text, re.DOTALL | re.MULTILINE,
+    )
+    if not m:
+        return None
+    lines = [ln.strip() for ln in m.group(1).strip().splitlines() if ln.strip().startswith("|")]
+    if len(lines) < 2:
+        return None
+    rows = []
+    for ln in lines:
+        if set(ln.replace("|", "").strip()) <= set("-: "):
+            continue  # markdown header separator row
+        cells = [c.strip() for c in ln.strip("|").split("|")]
+        rows.append(cells)
+    return rows  # rows[0] is the header
+
+
 def collect_plots(plots_dir: Path):
     if not plots_dir or not plots_dir.exists():
         return []
@@ -112,7 +140,7 @@ def build_sections(run_dir: Path):
     return sections
 
 
-def build_docx(run_dir: Path, sections, eval_report, plots, info, out_path: Path):
+def build_docx(run_dir: Path, sections, eval_report, plots, novel_contributions, info, out_path: Path):
     from docx import Document
     from docx.shared import Pt, RGBColor, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -189,6 +217,24 @@ def build_docx(run_dir: Path, sections, eval_report, plots, info, out_path: Path
             doc.add_heading(plot["caption"], level=2)
             doc.add_picture(str(plot["path"]), width=Inches(6))
 
+    if novel_contributions:
+        doc.add_heading("Novel Contributions vs. Literature", level=1)
+        doc.add_paragraph(
+            "Reproduced from ARCHITECTURE.md — how this project's claims compare "
+            "to the closest existing published work."
+        )
+        header, *rows = novel_contributions
+        nc_table = doc.add_table(rows=1, cols=len(header))
+        nc_table.style = "Light Grid Accent 1"
+        for cell, text in zip(nc_table.rows[0].cells, header):
+            cell.text = text
+            for run in cell.paragraphs[0].runs:
+                run.bold = True
+        for row in rows:
+            cells = nc_table.add_row().cells
+            for cell, text in zip(cells, row):
+                cell.text = text
+
     doc.add_heading("Step-by-step logs", level=1)
     for sec in sections:
         doc.add_heading(sec["title"], level=2)
@@ -206,7 +252,7 @@ def build_docx(run_dir: Path, sections, eval_report, plots, info, out_path: Path
     doc.save(str(out_path))
 
 
-def build_pdf(run_dir: Path, sections, eval_report, plots, info, out_path: Path):
+def build_pdf(run_dir: Path, sections, eval_report, plots, novel_contributions, info, out_path: Path):
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
@@ -302,6 +348,27 @@ def build_pdf(run_dir: Path, sections, eval_report, plots, info, out_path: Path)
             story.append(Image(str(plot["path"]), width=img_w * scale, height=img_h * scale))
             story.append(Spacer(1, 0.15 * inch))
 
+    if novel_contributions:
+        story.append(PageBreak())
+        story.append(Paragraph("Novel Contributions vs. Literature", styles["Heading1"]))
+        story.append(Paragraph(
+            "Reproduced from ARCHITECTURE.md — how this project's claims compare "
+            "to the closest existing published work.", body))
+        story.append(Spacer(1, 0.1 * inch))
+        cell_style = ParagraphStyle("nc_cell", parent=body, fontSize=7.5, leading=9)
+        header, *rows = novel_contributions
+        nc_data = [[Paragraph(f"<b>{c}</b>", cell_style) for c in header]]
+        for row in rows:
+            nc_data.append([Paragraph(c, cell_style) for c in row])
+        nc_table = Table(nc_data, colWidths=[1.7 * inch, 1.9 * inch, 2.1 * inch])
+        nc_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f4f6f")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(nc_table)
+
     story.append(PageBreak())
     story.append(Paragraph("Step-by-step logs", styles["Heading1"]))
     for sec in sections:
@@ -331,15 +398,16 @@ def main():
     sections = build_sections(run_dir)
     eval_report = load_eval_report()
     plots = collect_plots(args.plots_dir)
+    novel_contributions = load_novel_contributions()
     info = {**git_info(), "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
     docx_path = run_dir / "report.docx"
     pdf_path = run_dir / "report.pdf"
 
-    build_docx(run_dir, sections, eval_report, plots, info, docx_path)
+    build_docx(run_dir, sections, eval_report, plots, novel_contributions, info, docx_path)
     print(f"Wrote {docx_path}")
 
-    build_pdf(run_dir, sections, eval_report, plots, info, pdf_path)
+    build_pdf(run_dir, sections, eval_report, plots, novel_contributions, info, pdf_path)
     print(f"Wrote {pdf_path}")
 
     any_failed = any(not sec["passed"] for sec in sections)

@@ -49,3 +49,8 @@ ALL_SMOKE_MARKERS: list[str] = [
 N_SMOKE_CLASSES = 6
 N_CELL_TYPES    = 4
 N_HVGS_DEFAULT  = 2000
+
+# Dose-response modeling (exposure duration -> malignancy trajectory).
+# No wired source currently supplies a real per-cell exposure duration, so
+# every cell is stamped DOSE_UNKNOWN today — see model.py::DoseResponseHead.
+DOSE_UNKNOWN      = -1.0

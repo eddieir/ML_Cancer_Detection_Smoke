@@ -59,7 +59,8 @@ def add_malignancy_labels(
 ) -> ad.AnnData:
     """
     Assign per-cell malignancy labels.
-    Priority: tumor_barcodes list > Loiselle values already in obs > 0.0 default.
+    Priority: tumor_barcodes list > values a loader already set in obs
+    (e.g. TCGA tumor/NAT via convert_tcga's samples_meta.csv) > 0.0 default.
     """
     if "malignancy" not in adata.obs.columns:
         adata.obs["malignancy"] = 0.0

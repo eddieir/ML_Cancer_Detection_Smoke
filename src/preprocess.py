@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from data.loaders    import load_scrna, load_microarray, load_pseudo_bulk_loiselle, load_mouse_scrna
-from data.transforms import map_mouse_to_human, qc_filter, normalize, smoke_aware_hvg, batch_correct, annotate_cell_types
+from data.loaders    import load_scrna, load_microarray, load_mouse_scrna
+from data.transforms import map_mouse_to_human, harmonize_gene_ids, qc_filter, normalize, smoke_aware_hvg, batch_correct, annotate_cell_types
 from data.labellers  import transfer_nlst_labels, add_malignancy_labels, compute_smoke_class_weights
 from data.assembly   import merge_sources, assemble_subject_bags, export_cell_dataset
 from constants       import N_HVGS_DEFAULT
@@ -39,7 +39,6 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     -----------
     scrna_sources      list[(h5ad_path, smoke_type, subject_col)]
     microarray_sources list[(csv_path, smoke_type)]
-    loiselle_path      str | None
     gse288003_path     str | None   mouse e-cig → triggers ortholog mapping
     nlst_csv           str | None   cigar/dual-use label transfer
     nlst_outcomes_csv  str | None   subject_id + cancer_label for Phase 2/3
@@ -55,6 +54,7 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     bags        list  →  SubjectLevelDataset (Phase 2/3)
     """
     cfg    = load_config(config)
+    cfg    = cfg.get("data", cfg)  # configs/default.yaml nests these under "data:"
     adatas = []
 
     def _exists(path: str) -> bool:
@@ -65,14 +65,11 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
 
     for path, stype, scol in cfg.get("scrna_sources", []):
         if _exists(path):
-            adatas.append(normalize(qc_filter(load_scrna(path, stype, scol))))
+            adatas.append(normalize(qc_filter(harmonize_gene_ids(load_scrna(path, stype, scol)))))
 
     for path, stype in cfg.get("microarray_sources", []):
         if _exists(path):
-            adatas.append(normalize(load_microarray(path, stype)))
-
-    if cfg.get("loiselle_path") and _exists(cfg["loiselle_path"]):
-        adatas.append(load_pseudo_bulk_loiselle(cfg["loiselle_path"]))
+            adatas.append(normalize(harmonize_gene_ids(load_microarray(path, stype))))
 
     if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
         a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
