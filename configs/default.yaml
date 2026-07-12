@@ -9,10 +9,15 @@ data:
   microarray_sources:
     - [data/processed/converted/GSE994.csv, cigarette]
     - [data/processed/converted/GSE123352.csv, cigarette]
+    - [data/processed/converted/TCGA-LUAD.csv, cigarette]
+    - [data/processed/converted/TCGA-LUSC.csv, cigarette]
   loiselle_path: data/processed/converted/GSE130148_loiselle.csv
   gse288003_path: data/processed/converted/GSE288003.h5ad
   nlst_csv: data/raw/subjects/NLST/screen.csv
   nlst_outcomes_csv: data/processed/converted/nlst_outcomes.csv
+  extra_outcomes_csvs:
+    - data/processed/converted/TCGA-LUAD_outcomes.csv
+    - data/processed/converted/TCGA-LUSC_outcomes.csv
   tumor_barcodes: null
   n_hvgs: 2000
   min_cells_per_subject: 50

@@ -268,6 +268,81 @@ def _read_id_list(path: Path) -> list[str]:
         return [line.split("\t")[0].strip() for line in f if line.strip()]
 
 
+# ─── TCGA conversion ──────────────────────────────────────────────────────────
+
+def convert_tcga(project: str, src_dir: Path) -> Optional[Path]:
+    """
+    TCGA HTSeq/STAR gene-count files (one per case, downloaded via gdc-client
+    into `src_dir/<file_id>/<filename>`) → genes x samples CSV for
+    load_microarray, + sibling `_samples_meta.csv` carrying the malignancy
+    and subject_id fields load_microarray needs (extended alongside
+    smoke_type — see loaders.py).
+
+    Malignancy label: 1.0 for "Primary Tumor" samples, 0.0 for solid tissue
+    normal (NAT), read from downloaders.py's file_meta.csv (case_id +
+    sample_type — the GDC fields the manifest itself doesn't carry).
+
+    Smoke type: TCGA-LUAD/LUSC don't carry per-patient smoking history in
+    this pipeline, and >85% of these cohorts are smokers (per TCGA clinical
+    characteristics) — defaulted to "cigarette" as a documented approximation,
+    consistent with the cigar/dual-use label-transfer caveats already in
+    ARCHITECTURE.md section 3A.
+    """
+    out_dir  = _mkout()
+    meta_csv = src_dir / "file_meta.csv"
+    if not meta_csv.exists():
+        print(f"[convert] {project}  no file_meta.csv in {src_dir} — "
+              f"re-download with: python3 src/data/downloaders.py --tcga")
+        return None
+
+    file_meta = pd.read_csv(meta_csv, dtype=str).fillna("")
+    columns, malignancy, subject_id = {}, {}, {}
+
+    for _, row in file_meta.iterrows():
+        matches = list(src_dir.glob(f"{row['file_id']}/*"))
+        matches = [p for p in matches if p.is_file() and p.name != "annotations.txt"]
+        if not matches:
+            continue
+        counts = pd.read_csv(matches[0], sep="\t", header=None,
+                              names=["gene_id", "count"], dtype={"gene_id": str})
+        counts = counts[~counts["gene_id"].str.startswith("__")]
+        counts["gene_id"] = counts["gene_id"].str.split(".").str[0]  # drop Ensembl version
+        sample_id = row["file_id"]
+        columns[sample_id]   = counts.set_index("gene_id")["count"]
+        malignancy[sample_id]= 1.0 if "Tumor" in row["sample_type"] else 0.0
+        subject_id[sample_id]= row["case_id"] or sample_id
+
+    if not columns:
+        print(f"[convert] {project}  no downloaded count files found under {src_dir} — "
+              f"run: python3 src/data/downloaders.py --tcga --token /path/to/token.txt")
+        return None
+
+    expr = pd.DataFrame(columns).fillna(0)
+    csv_path  = out_dir / f"{project}.csv"
+    meta_path = out_dir / f"{project}_samples_meta.csv"
+    expr.to_csv(csv_path)
+    pd.DataFrame({
+        "sample_id":  expr.columns,
+        "smoke_type": "cigarette",
+        "malignancy": [malignancy[s] for s in expr.columns],
+        "subject_id": [subject_id[s] for s in expr.columns],
+    }).to_csv(meta_path, index=False)
+
+    n_tumor = sum(v == 1.0 for v in malignancy.values())
+    print(f"[convert] {project}  {expr.shape[1]} samples x {expr.shape[0]} genes → {csv_path.name}"
+          f"  ({n_tumor} tumor / {expr.shape[1] - n_tumor} normal)")
+
+    outcomes_path = out_dir / f"{project}_outcomes.csv"
+    outcomes = (
+        pd.DataFrame({"subject_id": list(subject_id.values()), "cancer_label": list(malignancy.values())})
+        .groupby("subject_id", as_index=False)["cancer_label"].max()
+    )
+    outcomes["cancer_label"] = outcomes["cancer_label"].astype(int)
+    outcomes.to_csv(outcomes_path, index=False)
+    print(f"[convert] {project}  {len(outcomes):,} subjects → {outcomes_path.name}")
+    return csv_path
+
+
 # ─── NLST outcomes ─────────────────────────────────────────────────────────────
 
 def convert_nlst_outcomes(prsn_csv: Path) -> Path:
@@ -315,9 +390,17 @@ def _missing(accession: str, path: Path) -> None:
 
 
 def convert_all() -> None:
-    from data.downloaders import GEO_DATASETS
+    from data.downloaders import GEO_DATASETS, TCGA_DATASETS
     for accession in GEO_DATASETS:
         convert_accession(accession)
+
+    for project, cfg in TCGA_DATASETS.items():
+        src = RAW / cfg["subdir"]
+        if src.exists():
+            convert_tcga(project, src)
+        else:
+            print(f"[convert] {project}  source not found at {src} — "
+                  "run: python3 src/data/downloaders.py --tcga --token /path/to/token.txt")
 
     nlst_prsn = RAW / "subjects" / "NLST" / "prsn.csv"
     if nlst_prsn.exists():
@@ -331,6 +414,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert raw downloads to clean loader formats")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--accession", type=str)
+    parser.add_argument("--tcga", type=str, help="Convert one TCGA project, e.g. TCGA-LUAD")
     parser.add_argument("--nlst", action="store_true", help="Convert NLST prsn.csv outcomes only")
     args = parser.parse_args()
 
@@ -338,6 +422,12 @@ if __name__ == "__main__":
         convert_all()
     elif args.accession:
         convert_accession(args.accession)
+    elif args.tcga:
+        from data.downloaders import TCGA_DATASETS
+        if args.tcga not in TCGA_DATASETS:
+            print(f"[convert] unknown TCGA project {args.tcga}")
+        else:
+            convert_tcga(args.tcga, RAW / TCGA_DATASETS[args.tcga]["subdir"])
     elif args.nlst:
         nlst_prsn = RAW / "subjects" / "NLST" / "prsn.csv"
         if nlst_prsn.exists():

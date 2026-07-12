@@ -68,7 +68,7 @@ def test_model_forward_after_pipeline():
     import torch
     with tempfile.TemporaryDirectory() as tmp:
         h5ad = str(Path(tmp) / "test.h5ad")
-        _synthetic_h5ad(h5ad, n=60, g=200)
+        _synthetic_h5ad(h5ad, n=60, g=500)  # qc_filter's default min_genes=200 needs headroom above it
         cell_data, bags = run_pipeline({
             "scrna_sources": [(h5ad, "cigarette", "donor_id")],
             "n_hvgs": 50,

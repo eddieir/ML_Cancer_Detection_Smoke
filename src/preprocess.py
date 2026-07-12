@@ -43,6 +43,8 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     gse288003_path     str | None   mouse e-cig → triggers ortholog mapping
     nlst_csv           str | None   cigar/dual-use label transfer
     nlst_outcomes_csv  str | None   subject_id + cancer_label for Phase 2/3
+    extra_outcomes_csvs list | None additional subject_id + cancer_label sources
+                                    (e.g. TCGA tumor/NAT outcomes from converters.py)
     tumor_barcodes     list | None
     n_hvgs             int          default 2000
     out_dir            str
@@ -96,9 +98,22 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
 
     cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
 
-    outcomes: Optional[pd.DataFrame] = None
+    outcome_sources = []
     if cfg.get("nlst_outcomes_csv") and Path(cfg["nlst_outcomes_csv"]).exists():
-        outcomes = pd.read_csv(cfg["nlst_outcomes_csv"])
+        outcome_sources.append(pd.read_csv(cfg["nlst_outcomes_csv"]))
+    for path in cfg.get("extra_outcomes_csvs", []):
+        if _exists(path):
+            outcome_sources.append(pd.read_csv(path))
+
+    outcomes: Optional[pd.DataFrame] = None
+    if outcome_sources:
+        # A subject appearing in more than one source (e.g. NLST + TCGA) is
+        # a cancer positive if any source says so.
+        outcomes = (
+            pd.concat(outcome_sources, ignore_index=True)
+            .astype({"subject_id": str})
+            .groupby("subject_id", as_index=False)["cancer_label"].max()
+        )
 
     bags = assemble_subject_bags(
         merged, outcomes,

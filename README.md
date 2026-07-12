@@ -57,9 +57,9 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | Stubs only, no assertions yet |
-| `notebooks/*` | Empty stubs |
-| Real data wiring (GEO/NLST/TCGA sources in `configs/default.yaml`) | Wired — `configs/default.yaml` points at converted files; download + convert still required before a real run |
+| `tests/*` | All modules covered (35 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py` |
+| `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
+| Real data wiring (GEO/NLST/TCGA sources in `configs/default.yaml`) | Wired — `configs/default.yaml` points at converted files, including TCGA-LUAD/LUSC malignancy + outcome labels; download + convert still required before a real run |
 
 Every implemented `src/*.py` module (`preprocess.py`, `model.py`, `train.py`,
 `evaluate.py`, `inference.py`) has a `__main__` smoke test that runs it
@@ -86,19 +86,45 @@ python3 src/evaluate.py     # cell + subject metrics, interpretability report �
 python3 src/inference.py    # untrained-model predict_subject/predict_batch/save_results smoke test
 ```
 
+## Running the test suite
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+Unit tests for every `src/data/*` module (loaders, transforms, labellers,
+assembly, converters), plus integration tests running `run_pipeline()` and
+`MultiSmokeCancerNet` together on synthetic data.
+
 ## Wiring real data sources
 
-Raw GEO/NLST files don't arrive in the shape `src/data/loaders.py` expects
+Raw GEO/TCGA/NLST files don't arrive in the shape `src/data/loaders.py` expects
 (GEO series matrices carry metadata headers, GSE136831/GSE288003 are 10x-style
-sparse triples, NLST outcomes use different column names). `src/data/converters.py`
+sparse triples, TCGA ships one HTSeq count file per case plus a GDC file
+manifest, NLST outcomes use different column names). `src/data/converters.py`
 bridges that gap; `configs/default.yaml` already points at its output paths.
+
+TCGA-LUAD/LUSC supply per-cell malignancy labels (tumor vs. solid-tissue-normal)
+and subject-level cancer-positive outcomes — `convert_tcga()` reads the
+`sample_type`/`case_id` fields `downloaders.py` saves to `file_meta.csv`
+alongside the GDC manifest, and writes both a `_samples_meta.csv` (malignancy +
+subject_id, consumed by `load_microarray`) and an `_outcomes.csv` (merged with
+NLST outcomes in `run_pipeline`). TCGA cohorts don't carry per-patient smoking
+history in this pipeline, so smoke_type defaults to `cigarette` — documented
+approximation, consistent with the cigar/dual-use label-transfer caveats in
+[ARCHITECTURE.md](ARCHITECTURE.md#3a-smoke-type-classification-head-head-a).
 
 ```bash
 python3 src/data/downloaders.py --all              # fetch raw GEO + TCGA files
+python3 src/data/downloaders.py --tcga --token /path/to/gdc_token.txt  # TCGA needs a GDC token
 python3 src/data/downloaders.py --nlst-instructions # NLST requires manual DUA approval
 python3 src/data/converters.py --all               # → data/processed/converted/*.h5ad, *.csv
 python3 -c "from preprocess import run_pipeline; run_pipeline('configs/default.yaml')"
 ```
+
+Or walk through the same steps interactively in
+[notebooks/01_data_download.ipynb](notebooks/01_data_download.ipynb) and
+[notebooks/02_preprocessing.ipynb](notebooks/02_preprocessing.ipynb).
 
 (`python3 src/preprocess.py` with no arguments only runs its synthetic-data
 smoke test — it does not read `configs/default.yaml`. Call `run_pipeline()`
@@ -126,7 +152,6 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Run `downloaders.py --all` + `converters.py --all` against the real GEO/NLST
-  sources and confirm `preprocess.py` produces sane cell counts per smoke class
-- Fill in `tests/*` with real assertions (including `tests/test_converters.py`)
-- Populate `notebooks/*` walkthroughs
+- Run `downloaders.py --all` + `--tcga` + `converters.py --all` against the
+  real GEO/TCGA/NLST sources and confirm `preprocess.py` produces sane cell
+  counts per smoke class and malignancy rate

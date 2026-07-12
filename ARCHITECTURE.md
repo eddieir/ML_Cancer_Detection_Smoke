@@ -395,13 +395,20 @@ Stop:        Early stop if no improvement for 5 consecutive epochs
 
 ```
 Step 1 (this file):  Architecture specification         [DONE]
-Step 2:              src/preprocess.py                  [ ]
-Step 3:              src/model.py                       [ ]
-Step 4:              src/train.py                       [ ]
-Step 5:              src/evaluate.py                    [ ]
-Step 6:              src/inference.py                   [ ]
-Step 7:              notebooks/01_data_download.ipynb   [ ]
-Step 8:              notebooks/02_preprocessing.ipynb   [ ]
-Step 9:              notebooks/03_training.ipynb        [ ]
-Step 10:             notebooks/04_evaluation.ipynb      [ ]
+Step 2:              src/preprocess.py                  [DONE]
+Step 3:              src/model.py                       [DONE]
+Step 4:              src/train.py                       [DONE]
+Step 5:              src/evaluate.py                    [DONE]
+Step 6:              src/inference.py                   [DONE]
+Step 7:              notebooks/01_data_download.ipynb   [DONE]
+Step 8:              notebooks/02_preprocessing.ipynb   [DONE]
+Step 9:              notebooks/03_training.ipynb        [DONE]
+Step 10:             notebooks/04_evaluation.ipynb      [DONE]
 ```
+
+TCGA-LUAD/LUSC (section 6) is wired end-to-end: `data/downloaders.py --tcga`
+→ `data/converters.py` (`convert_tcga`) → `data/loaders.py::load_microarray`
+(malignancy + subject_id overrides) → `configs/default.yaml`. Tumor/NAT
+samples supply per-cell malignancy labels (Stage 3B) and TCGA cases with a
+Primary Tumor sample count as subject-level cancer positives (Stage 6),
+merged with NLST outcomes in `preprocess.py::run_pipeline`.
