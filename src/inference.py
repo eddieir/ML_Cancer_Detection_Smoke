@@ -23,6 +23,7 @@ import yaml
 
 from constants import CELL_TYPES, N_CELL_TYPES, SMOKE_TYPES
 from model import MultiSmokeCancerNet
+from train import load_checkpoint_into
 
 
 # ─── DRY output formatter ─────────────────────────────────────────────────────
@@ -77,18 +78,23 @@ class Predictor:
         model:                  MultiSmokeCancerNet,
         device:                 str = "cpu",
         preprocessing_artifact: "Optional[object]" = None,
+        unsafe_legacy_mode:     bool = False,
     ):
         """
         preprocessing_artifact, if given (a data.preprocessing.PreprocessingArtifact),
-        is used to validate that any raw AnnData passed to predict_h5ad() has
-        the exact gene panel/order the model was trained on before running
-        inference — see data/preprocessing.py::verify_compatible. Without it,
-        a caller can silently feed a mismatched gene panel and get a
-        confident-looking but meaningless prediction.
+        is used by predict_h5ad() to reorder/subset genes to the exact panel
+        the model was trained on and apply the same train-fit mean/std
+        scaling (data/preprocessing.py::apply_preprocessing) before running
+        inference. Without it, predict_h5ad() refuses to run unless
+        unsafe_legacy_mode=True is explicitly passed — feeding a
+        differently-ordered, differently-scaled, or mismatched-panel gene
+        matrix to the model produces a confident-looking but meaningless
+        prediction, and that failure mode must not be silent.
         """
         self.model  = model.to(device).eval()
         self.device = device
         self.preprocessing_artifact = preprocessing_artifact
+        self.unsafe_legacy_mode = unsafe_legacy_mode
 
     @classmethod
     def from_config(
@@ -96,12 +102,13 @@ class Predictor:
         config: Union[dict, str, Path],
         phase:  int = 3,
         device: str = "cpu",
+        unsafe_legacy_mode: bool = False,
     ) -> "Predictor":
         """
         Load best checkpoint from a given training phase. If
         checkpoint_dir/preprocessing_artifact.json exists (see
         data/preprocessing.py::PreprocessingArtifact.save), it's loaded too
-        so predict_h5ad() can validate incoming data's gene panel.
+        so predict_h5ad() can reorder/scale incoming data to match training.
         """
         if device == "cuda" and not torch.cuda.is_available():
             print("[inference] WARNING: CUDA not available — falling back to CPU")
@@ -114,9 +121,7 @@ class Predictor:
         if not ckpt_dir.is_absolute():
             ckpt_dir = Path(__file__).parents[1] / ckpt_dir
         ckpt = ckpt_dir / f"phase{phase}_best.pt"
-        model.load_state_dict(
-            torch.load(ckpt, map_location=device, weights_only=True)
-        )
+        load_checkpoint_into(model, ckpt, device)
         print(f"[inference] loaded phase {phase} checkpoint  ({ckpt})")
 
         artifact = None
@@ -125,8 +130,12 @@ class Predictor:
             from data.preprocessing import PreprocessingArtifact
             artifact = PreprocessingArtifact.load(artifact_path)
             print(f"[inference] loaded preprocessing artifact  ({artifact_path})")
+        elif not unsafe_legacy_mode:
+            print("[inference] WARNING: no preprocessing_artifact.json found next to the "
+                  "checkpoint — predict_h5ad() will refuse raw/unlabelled input unless "
+                  "unsafe_legacy_mode=True is explicitly set.")
 
-        return cls(model, device, preprocessing_artifact=artifact)
+        return cls(model, device, preprocessing_artifact=artifact, unsafe_legacy_mode=unsafe_legacy_mode)
 
     # ── Core prediction — all other methods call this ─────────────────────────
 
@@ -177,32 +186,90 @@ class Predictor:
 
     def predict_h5ad(
         self,
-        h5ad_path:     Union[str, Path],
-        subject_col:   str = "subject_id",
-        cell_type_col: str = "cell_type_id",
+        h5ad_path:            Union[str, Path],
+        subject_col:          str = "subject_id",
+        cell_type_col:        str = "cell_type_id",
+        already_preprocessed: bool = False,
     ) -> List[Dict]:
         """
-        Predict cancer risk directly from a preprocessed H5AD file.
+        Predict cancer risk directly from an H5AD file.
+
+        already_preprocessed distinguishes the two supported input modes:
+          False (default) — RAW/unprocessed expression. Genes are reordered
+            and subset to self.preprocessing_artifact.gene_list and the
+            train-fit mean/std scaling is applied
+            (data/preprocessing.py::apply_preprocessing) before inference.
+            Requires a preprocessing_artifact unless unsafe_legacy_mode=True
+            was explicitly set on this Predictor.
+          True — the caller asserts .X is ALREADY scaled/HVG-selected
+            exactly as training data was. This is checked, not trusted:
+            var_names must match self.preprocessing_artifact.gene_list
+            exactly, in order (data/preprocessing.py::verify_input_matrix) —
+            a silent reorder/rescale never happens for data declared
+            already-preprocessed.
+
+        Either way, the final input width is verified against
+        self.model.input_dim before any forward pass — a shape mismatch
+        would otherwise fail deep inside the model with a confusing error,
+        or (worse, if dimensions coincidentally matched some other layer)
+        silently produce a meaningless prediction.
 
         Expects the AnnData to have:
-          .X               : scaled gene expression [N_cells, N_genes]
           .obs[subject_col]: subject identifier per cell
           .obs[cell_type_col]: integer cell type (0-3)
 
         Groups cells by subject_id and runs predict_batch.
-        Raises ValueError if required obs columns are missing.
+        Raises ValueError if required obs columns are missing, if raw input
+        has no preprocessing_artifact and unsafe_legacy_mode is not set, or
+        if the final gene count doesn't match the model's input_dim.
         """
         import anndata as ad
+        import scipy.sparse as sp
         adata = ad.read_h5ad(h5ad_path)
         self._validate_h5ad(adata, subject_col, cell_type_col)
-        if self.preprocessing_artifact is not None:
-            from data.preprocessing import verify_compatible
-            verify_compatible(self.preprocessing_artifact, adata.var_names)
 
-        X = np.array(
-            adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray(),
-            dtype=np.float32,
-        )
+        if already_preprocessed:
+            if self.preprocessing_artifact is not None:
+                from data.preprocessing import verify_input_matrix
+                verify_input_matrix(self.preprocessing_artifact, list(adata.var_names))
+            elif not self.unsafe_legacy_mode:
+                raise ValueError(
+                    "predict_h5ad(already_preprocessed=True) has no preprocessing_artifact "
+                    "to verify gene order against — cannot confirm this input actually "
+                    "matches training. Pass unsafe_legacy_mode=True on the Predictor to "
+                    "bypass this check (not recommended for scientific results)."
+                )
+            X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
+            X = X.astype(np.float32)
+        else:
+            if self.preprocessing_artifact is None:
+                if not self.unsafe_legacy_mode:
+                    raise ValueError(
+                        "predict_h5ad() received raw/unprocessed input but this Predictor has "
+                        "no preprocessing_artifact, so genes cannot be safely reordered/scaled "
+                        "to match training. Load a Predictor with an artifact (see "
+                        "Predictor.from_config), or pass already_preprocessed=True if the input "
+                        "genuinely already matches training preprocessing exactly, or set "
+                        "unsafe_legacy_mode=True to bypass this at your own risk."
+                    )
+                print("[inference] WARNING: unsafe_legacy_mode — running RAW input through the "
+                      "model with NO gene reordering/scaling. Predictions are not scientifically "
+                      "valid unless this input independently already matches training exactly.")
+                X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
+                X = X.astype(np.float32)
+            else:
+                from data.preprocessing import apply_preprocessing
+                adata = apply_preprocessing(adata, self.preprocessing_artifact)
+                assert list(adata.var_names) == self.preprocessing_artifact.gene_list
+                X = adata.X.astype(np.float32)
+
+        if X.shape[1] != self.model.input_dim:
+            raise ValueError(
+                f"predict_h5ad: final input has {X.shape[1]} genes but the model expects "
+                f"input_dim={self.model.input_dim}. This would otherwise silently feed "
+                "mismatched features into the model."
+            )
+
         subjects = []
         for sid in adata.obs[subject_col].unique():
             mask = (adata.obs[subject_col] == sid).values
@@ -212,7 +279,8 @@ class Predictor:
                 "cell_type_ids": adata.obs[cell_type_col].values[mask].astype(int),
             })
 
-        print(f"[inference] {len(subjects)} subjects from {Path(h5ad_path).name}")
+        print(f"[inference] {len(subjects)} subjects from {Path(h5ad_path).name}"
+              f"  (already_preprocessed={already_preprocessed})")
         return self.predict_batch(subjects)
 
     # ── Save results ──────────────────────────────────────────────────────────
