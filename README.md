@@ -112,19 +112,46 @@ class equally regardless of its size, so it can't be inflated by collapsing
 onto the majority class — see `train.py`'s Phase 1 checkpoint selection and
 `evaluate.py::_smoke_metrics`.
 
-**Subject-level splitting** (`src/data/splitting.py`, new). Every prior
+**Subject-level splitting is now real and unavoidable end-to-end**
+(`src/data/splitting.py`, `src/train.py`, `src/preprocess.py`). Every prior
 result in this repo — including the 77.2%/0.27 table above — was computed by
 training and evaluating on the same cells, with no subject held out at all.
 A subject's cells share genetic background and batch/technical variation, so
 even a naive train/test split *by cell* would leak: a model that's seen 80%
-of a subject's cells trivially recognizes the other 20%. `splitting.py` now
+of a subject's cells trivially recognizes the other 20%. `splitting.py`
 provides `subject_train_val_test_split()` and `grouped_kfold()`, both
-grouped by `subject_id` with reproducible JSON manifests
+grouped by `subject_id`, with reproducible JSON manifests
 (`data/processed/split_manifest.json` by default, see `configs/default.yaml`'s
-`split:` block) and leakage assertions covered by 16 tests. **No model in
-this repo has yet been retrained/re-evaluated against one of these splits on
-real data** — the tooling is in place and tested; the experiment hasn't been
-run (would need a real training run, out of scope for this pass — see
+`split:` block) and a SHA-256 dataset fingerprint (subjects + effective
+labels + split config) — `load_or_create_split()` now **raises** rather than
+silently reusing or regenerating a manifest if the current data/config no
+longer matches it (a subject added/removed, a label changed, a different
+seed/fraction/rare-class policy); pass `force_regenerate=True` to
+deliberately discard it.
+
+Earlier, `Trainer` computed the split itself: `phase1`/`phase2`/`phase3`
+called `random_split()` internally on whatever dataset was handed to them,
+so a subject's cells could still land in both the internal "train" and
+"validation" partition even though `splitting.py` existed. This is fixed:
+`Trainer.phase1/phase2/phase3` now take **explicit, pre-split**
+`train_*_dataset`/`val_*_dataset` arguments and never split anything
+internally; `CellLevelDataset` carries a required `subject_ids` array (real
+training data must supply real, non-"unknown" subject IDs — a
+`diagnostic_mode=True` escape hatch exists only for synthetic smoke tests)
+plus a `subset_by_subjects()` method and a module-level
+`assert_disjoint_subjects()` guard that every phase calls before training
+anything. `preprocess.py::run_pipeline_split_aware()` returns explicit
+`train_cell_dataset`/`val_cell_dataset`/`test_cell_dataset` and
+`train_bags`/`val_bags`/`test_bags` built directly from the split manifest,
+so a caller never has to manually filter one combined array (the
+old `cell_data`/`bags` keys are kept for backward compatibility only). A
+dedicated `Trainer.final_test_evaluation()` is the one sanctioned place test
+data is used — after checkpoint selection is done, evaluated once, and
+labelled `is_held_out=True` in its output so it can't be confused with a
+validation or training-set number. **No model in this repo has yet been
+retrained on real data against one of these splits** — the plumbing is in
+place and tested (leakage-guard tests included); running it against the
+real merged dataset is a real training run, out of scope for this pass (see
 [Next steps](#next-steps)).
 
 **Unknown cancer outcomes are no longer treated as negative.**
@@ -149,44 +176,90 @@ malignancy loss to known cells only, and `evaluate.py` restricts malignancy
 metrics to known cells and reports known-positive/known-negative/unknown
 counts instead of an AUC partly computed against fabricated labels.
 
-**Preprocessing leakage fix.** `merge_sources()` z-scored, and
-`smoke_aware_hvg()` selected highly-variable genes across, the *entire*
-merged dataset — before any split existed, so validation/test cells
-influenced which genes became features and how they were scaled.
-`src/data/preprocessing.py` adds a `PreprocessingArtifact` (versioned,
-JSON-serialisable) fit on train-split cells only
-(`fit_preprocessing`/`apply_preprocessing`), and
-`preprocess.py::run_pipeline_split_aware()` wires it end-to-end: split
-first, fit on train, apply unchanged to val/test. The original
-`run_pipeline()` is unchanged and still has this leakage — it's kept only
-for backward compatibility and synthetic smoke-testing, with an explicit
-warning in its docstring. **Batch correction (Harmony) is a documented
-exception that is *not* leakage-free**: Harmony has no train-only-fit /
-apply-to-new-data mode, so it is still fit across the full merged dataset
-even in the split-aware path — see `PreprocessingArtifact.notes`.
+**Preprocessing leakage fix, and label order corrected.**
+`merge_sources()` z-scored, and `smoke_aware_hvg()` selected highly-variable
+genes across, the *entire* merged dataset — before any split existed, so
+validation/test cells influenced which genes became features and how they
+were scaled. `src/data/preprocessing.py` adds a `PreprocessingArtifact`
+(versioned, JSON-serialisable) fit on train-split cells only
+(`fit_preprocessing`/`apply_preprocessing`), automatically persisted next to
+the split manifest AND the training checkpoint directory so inference can
+find it. `preprocess.py::run_pipeline_split_aware()`'s step order is now:
+load sources → attach final smoke labels (including NLST transfer) and
+malignancy provenance → apply the rare-class policy to that final label →
+compute the subject-level split **on the final effective label** → fit
+scaling/HVG on train only → apply to everyone. Previously the split was
+computed *before* NLST label transfer, so the split (and its report) could
+reflect a label that was about to change. The original label is preserved
+unmutated as `obs["smoke_type_raw"]` (exported in `cell_metadata.csv`); the
+NLST-join count (or its absence) is logged in `label_provenance_report`
+rather than only printed. The original `run_pipeline()` is unchanged and
+still has this leakage — it's kept only for backward compatibility and
+synthetic smoke-testing, with an explicit warning in its docstring.
+**Batch correction (Harmony) is a documented, now-configurable exception
+that is *not* leakage-free**: Harmony has no train-only-fit /
+apply-to-new-data mode, so running it uses held-out expression values to
+compute the correction embedding — a transductive step. `run_pipeline_split_aware()`
+now **skips Harmony by default** (`preprocessing.batch_correction.allow_transductive_harmony: false`
+in `configs/default.yaml`); enabling it requires an explicit opt-in, prints a
+prominent warning, and the returned `transductive_batch_correction` flag
+records the fact so it can be carried into evaluation/checkpoint metadata.
 
-**Rare smoke-type classes** (`src/data/rare_class.py`, new). The cigar class
-has ~1 independent subject in the real merged data — not enough to learn or
-evaluate as its own class by any reasonable statistical standard.
-`apply_rare_class_policy()` makes this an explicit, configurable, auditable
-decision (`keep_with_warning` / `merge_into_dual_use_or_other` /
-`exclude_from_training_and_evaluation`, set via `configs/default.yaml`'s
-`rare_class:` block) instead of a class that's silently never predicted.
-Raw labels are never mutated; every action is recorded in a report dict.
+**Rare smoke-type classes are now actually wired in**
+(`src/data/rare_class.py`). The cigar class has ~1 independent subject in
+the real merged data — not enough to learn or evaluate as its own class by
+any reasonable statistical standard. `apply_rare_class_policy()` existed as
+a tested utility but nothing called it; `run_pipeline_split_aware()` now
+applies the configured policy (`keep_with_warning` /
+`merge_into_dual_use_or_other` / `exclude_from_training_and_evaluation`, set
+via `configs/default.yaml`'s `rare_class:` block) to the final label *before*
+the subject-level split, so the effective label the policy produces is what
+splitting, training, evaluation, and bag assembly all consistently see. Raw
+labels are never mutated — `smoke_type_raw` always preserves the original —
+and every action is recorded in the returned `rare_class_report`.
+
+**Structured, reproducible checkpoints.** `Trainer._save()` used to write a
+bare `model.state_dict()`. It now saves a structured checkpoint containing
+the state dict plus model/training config, split-manifest path, preprocessing-
+artifact path, effective label mapping, rare-class policy, random seed,
+metric name/value, epoch/phase, input dimension, and git commit SHA (when
+available) — the metadata needed to know what a checkpoint actually is
+without re-deriving it. A shared `train.load_checkpoint_into()` loads both
+this format and legacy bare-state-dict checkpoints (with a printed warning
+for the latter); `Evaluator.from_checkpoint()`, `Predictor.from_config()`,
+and `Trainer._load_best()` all use it.
+
+**Safe H5AD inference.** `Predictor.predict_h5ad()` used to call
+`verify_compatible()` (checks required genes exist) and then forward the
+*original, unreordered, unscaled* matrix — silently wrong for any input
+whose gene order didn't already exactly match the artifact. It now applies
+`data/preprocessing.py::apply_preprocessing()` (reorder → subset → train-fit
+scale) for raw input, verifies exact gene-order equality via
+`verify_input_matrix()` for input explicitly declared `already_preprocessed=True`,
+verifies the final width against `model.input_dim`, and refuses to run raw
+input with no `preprocessing_artifact` unless `unsafe_legacy_mode=True` is
+explicitly set.
 
 **What this pass does *not* include** (explicitly out of scope, not
 silently skipped): a real training run against a held-out split (so there
 is no new "real held-out macro-F1" number to report — see the table above);
 a baseline-model comparison runner (logistic regression / random forest /
 XGBoost / small MLP vs. the neural model); a grouped-cross-validation
-experiment runner (the primitive exists in `splitting.py::grouped_kfold`,
-tested for leakage, but no training loop consumes it yet); a
-hyperparameter-search runner; MIL pooling-baseline comparisons or attention-
-stability analysis; probability calibration / validation-selected threshold
-tooling (the model still reports risk at a fixed 0.70 cutoff in
-`train.py::predict` and `inference.py`, which is **not** a clinically
-validated threshold — treat it as an arbitrary placeholder). Each of these
-is a legitimate, separately-scoped follow-up, not an oversight.
+experiment *runner* (the primitive `splitting.py::grouped_kfold` is
+leakage-tested and now reports per-fold class coverage/stratification, but
+no training loop consumes it yet); a hyperparameter-search runner; MIL
+pooling-baseline comparisons (mean/max pooling vs. gated attention) or
+attention-stability analysis; subject-aware/subject-capped sampling (class
+weights are now correctly computed from the train split only, but there is
+no per-epoch max-cells-per-subject sampler yet); explicit bulk-vs-single-
+cell-vs-MIL experiment-mode separation; species-provenance / cross-species-
+merge guards (GSE288003's mouse→human ortholog mapping still runs
+unconditionally, with no recorded mapped/unmapped gene counts); probability
+calibration / validation-selected threshold tooling (the model still
+reports risk at a fixed 0.70 cutoff in `train.py::predict` and
+`inference.py`, which is **not** a clinically validated threshold — treat
+it as an arbitrary placeholder). Each of these is a legitimate,
+separately-scoped follow-up, not an oversight.
 
 **No clinical claim.** Nothing in this repository has been clinically
 validated. `P(cancer)` is a research-model output on unlabelled or
@@ -257,7 +330,8 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (117 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_evaluate.py`, `test_inference.py` |
+| `tests/*` | All modules covered (152 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_evaluate.py`, `test_inference.py` |
+| CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |
 | Real data — GSE136831 (312,928 real cells) | Downloaded and converted with real per-cell donor IDs — not yet re-trained on, see [Next steps](#next-steps) |
@@ -398,3 +472,12 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
   head instead of the current fixed, non-clinical 0.70 cutoff
 - Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
   labels) and NLST (real cancer outcomes + cigar/dual-use history)
+- Add a subject-aware/subject-capped sampler (bound max cells sampled per
+  subject per epoch) so a handful of subjects with very large cell counts
+  can't dominate a training epoch — class weights are now train-split-only,
+  but no per-epoch subject-balancing sampler exists yet
+- Add explicit bulk-vs-single-cell-vs-MIL experiment-mode separation and
+  species-provenance tracking (GSE288003's mouse→human ortholog mapping
+  still runs unconditionally with no recorded mapped/unmapped gene counts)
+- Add MIL pooling baselines (mean/max pooling vs. the current gated
+  attention) and attention-stability analysis under repeated cell subsampling

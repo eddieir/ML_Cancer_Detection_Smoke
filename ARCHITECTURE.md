@@ -323,6 +323,12 @@ exists at cell-level pretraining time (see Stage 3C).
 
 ## 5. Three-Phase Training Curriculum
 
+Every phase below takes **explicit, pre-split** train/val datasets built
+from a `SplitManifest` (`data/splitting.py`) — `Trainer.phase1/2/3` do not
+split anything internally, and reject overlapping train/val subject IDs
+before training starts. See §11 for the full rationale; the per-phase specs
+below (optimizer, schedule, batch size) are otherwise unchanged.
+
 ### Phase 1 — Cell-Level Pre-training
 
 **Goal:** Teach the encoder to produce discriminative cell embeddings for smoke type and malignancy.
@@ -484,30 +490,66 @@ merged with NLST outcomes in `preprocess.py::run_pipeline`.
 ## 11. Scientific Validity: Splitting, Leakage, and Label Provenance
 
 Everything in sections 1–10 above describes the model architecture and is
-unchanged. Separately, on branch `improve/valid-evaluation-and-training`,
-four correctness/leakage issues in the pipeline that fed that architecture
-were fixed. Full detail and rationale live in README.md's
+unchanged. Separately, on branch `improve/valid-evaluation-and-training`, a
+set of correctness/leakage issues in the pipeline that feeds that
+architecture were fixed. Full detail and rationale live in README.md's
 [Scientific rigor and known limitations](README.md#scientific-rigor-and-known-limitations)
 section; summarized here for architectural completeness:
 
-1. **No split existed at all before this pass.** Every reported result
-   (§8, the README results table) was computed by training and evaluating
-   on the same cells. `data/splitting.py` adds subject-grouped
-   train/val/test splitting and grouped K-fold CV, with reproducible
-   manifests and leakage tests — but no model has yet been retrained
-   against one of these splits on real data.
-2. **Preprocessing leakage**: gene scaling and HVG selection (Stage 1,
-   §3.1) were fit across the entire merged dataset, including cells that
-   should have been held out. `data/preprocessing.py` fits both on the
-   train split only via a versioned `PreprocessingArtifact`; Harmony batch
-   correction remains a documented exception (no train-only-fit mode
-   exists for it).
+1. **Subject-level splitting is now real and unavoidable end-to-end**, not
+   just an available utility. `data/splitting.py` provides subject-grouped
+   train/val/test splitting and grouped K-fold CV with reproducible,
+   fingerprinted manifests (`load_or_create_split()` raises rather than
+   silently reusing a stale split if subjects/labels/config changed).
+   Critically, `Trainer.phase1/2/3` (§5) previously called `random_split()`
+   internally regardless of any manifest, so a subject's cells could still
+   land in both the "train" and "validation" partition passed to a phase.
+   This is fixed: every phase now takes explicit, pre-split
+   `train_*_dataset`/`val_*_dataset` arguments, calls
+   `assert_disjoint_subjects()` before training anything, and never accepts
+   a test dataset — `Trainer.final_test_evaluation()` is the one sanctioned
+   place test data is used, after checkpoint selection, evaluated once, and
+   labelled `is_held_out=True`. `preprocess.py::run_pipeline_split_aware()`
+   builds the per-split `CellLevelDataset`/bag lists directly from the
+   manifest via `CellLevelDataset.subset_by_subjects()`, rather than
+   returning one combined array for the caller to filter. No model has yet
+   been retrained against one of these splits on real data.
+2. **Preprocessing leakage + label order**: gene scaling and HVG selection
+   (Stage 1, §3.1) were fit across the entire merged dataset, including
+   cells that should have been held out. `data/preprocessing.py` fits both
+   on the train split only via a versioned `PreprocessingArtifact`,
+   automatically persisted next to the split manifest and the checkpoint
+   directory. Separately, `run_pipeline_split_aware()` used to compute the
+   subject-level split *before* NLST label transfer, so the split could be
+   based on a label that was about to change — label assignment (including
+   NLST transfer) now happens first, the rare-class policy (point 5) is
+   applied to that final label, and only then is the split computed.
+   Harmony batch correction remains a transductive exception (no
+   train-only-fit mode exists for it): `run_pipeline_split_aware()` skips it
+   by default and requires an explicit `allow_transductive_harmony: true`
+   opt-in, which sets a `transductive_batch_correction` flag on the result.
 3. **Unknown cancer outcomes were defaulted to 0** (cancer-negative)
    instead of being excluded from Stage 6 supervision — fixed via
-   `cancer_label_known` and `train.py::check_mil_eligibility`.
+   `cancer_label_known` and `train.py::check_mil_eligibility`, now checked
+   separately on train and val before Phase 2/3 train.
 4. **Unknown malignancy labels were defaulted to 0.0** and trained against
    directly in Stage 3B — fixed via a `malignancy_known` provenance mask
    applied to `MultiTaskLoss`'s malignancy BCE term.
+5. **Rare smoke-type classes (e.g. cigar, ~1 independent subject) now
+   actually go through the configured policy** (`data/rare_class.py`)
+   instead of the utility existing but nothing calling it.
+   `run_pipeline_split_aware()` applies `keep_with_warning` /
+   `merge_into_dual_use_or_other` / `exclude_from_training_and_evaluation`
+   to the final label before splitting; the raw label survives unmutated as
+   `smoke_type_raw`.
+6. **Checkpoints are now structured**, not a bare `state_dict` — they carry
+   split-manifest path, preprocessing-artifact path, effective label
+   mapping, rare-class policy, seed, metric, epoch, input dim, and git SHA.
+   `Predictor.predict_h5ad()` was validating gene *presence* but not
+   actually reordering/scaling incoming data to match training; it now
+   applies the fitted `PreprocessingArtifact` (or requires an explicit
+   `already_preprocessed=True` declaration with exact gene-order
+   verification) before every forward pass.
 
 None of these are architecture changes — Stages 1–6 as specified above are
 unchanged. They are pipeline-around-the-architecture fixes that any real
