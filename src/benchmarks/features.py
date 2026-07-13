@@ -47,6 +47,37 @@ def cap_cells_per_subject(
     return keep
 
 
+def cap_cell_dataset(cell_dataset, max_cells_per_subject: int, seed: int = 42):
+    """
+    Apply cap_cells_per_subject to a CellLevelDataset, returning a new
+    dataset containing only the kept cells. Used to deterministically cap
+    per-subject cell counts inside cell-level CV/training (see
+    cross_validation.py) so a subject with many more cells than others
+    cannot dominate a single .fit()/epoch. Must be called separately on the
+    train split and the val split — each split's cap is computed from ONLY
+    that split's own cell counts, never using the other split's data to
+    decide what to keep.
+    """
+    keep = cap_cells_per_subject(cell_dataset.subject_ids, max_cells_per_subject, seed=seed)
+    return _apply_bool_mask(cell_dataset, keep)
+
+
+def _apply_bool_mask(cell_dataset, mask: np.ndarray):
+    """Boolean-mask subset of a CellLevelDataset (subset_by_subjects only
+    supports subject-list masks, not an arbitrary per-cell keep-mask)."""
+    return type(cell_dataset)(
+        gene_matrix       = cell_dataset.X[mask].numpy(),
+        smoke_labels      = cell_dataset.smoke[mask].numpy(),
+        malignancy_labels = cell_dataset.malig[mask].numpy(),
+        cell_type_ids     = cell_dataset.ctype[mask].numpy(),
+        exposure_dose      = cell_dataset.dose[mask].numpy(),
+        malignancy_known   = cell_dataset.malig_known[mask].numpy(),
+        subject_ids        = cell_dataset.subject_ids[mask],
+        dataset_source      = cell_dataset.dataset_source[mask],
+        diagnostic_mode     = cell_dataset.diagnostic_mode,
+    )
+
+
 def _majority_label(labels: np.ndarray, num_classes: int) -> int:
     return int(np.bincount(labels.astype(int), minlength=num_classes).argmax())
 

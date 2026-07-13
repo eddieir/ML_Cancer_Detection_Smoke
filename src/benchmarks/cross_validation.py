@@ -36,7 +36,7 @@ from train import (
 )
 
 from .baselines import CANCER_BASELINES, SMOKE_BASELINES, positive_class_proba
-from .features import build_cancer_subject_features, build_smoke_subject_summary_features
+from .features import build_cancer_subject_features, build_smoke_subject_summary_features, cap_cell_dataset
 from .fold_preprocessing import (
     artifact_fingerprint,
     bags_from_fold_cell_dataset,
@@ -100,11 +100,17 @@ def _fold_context(context, artifact, train_cell_dataset, val_cell_dataset):
 def run_smoke_cv(
     context, model_names: Sequence[str], n_folds: int = 5,
     seeds: Sequence[int] = DEFAULT_SEEDS, device: str = "cpu",
+    max_cells_per_subject: Optional[int] = None,
 ) -> Dict:
     normalized_adata = require_normalized_adata(context)
     num_classes = context.num_smoke_classes
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
     n_hvgs = context.preprocessing_artifact.n_hvgs
+    max_cells_per_subject = (
+        max_cells_per_subject
+        if max_cells_per_subject is not None
+        else context.config.get("benchmarks", {}).get("max_cells_per_subject_cv", 200)
+    )
 
     pool_subjects = sorted(set(context.subjects_for("train")) | set(context.subjects_for("val")))
     label_by_subject = _majority_label_by_subject(normalized_adata, pool_subjects, num_classes)
@@ -131,15 +137,26 @@ def run_smoke_cv(
                                 "fit_subject_ids": sorted(str(s) for s in fold["train"]),
                                 "gene_list_n": len(artifact.gene_list)}
                 if name == "neural":
-                    fold_context = _fold_context(context, artifact, train_ds, val_ds)
+                    # Cap each split's per-subject cell count independently
+                    # (never using the other split's data to decide what to
+                    # keep) so a subject with far more cells than others
+                    # cannot dominate a Phase 1 epoch. Deterministic given
+                    # seed — same fold + same seed always keeps the same cells.
+                    train_ds_capped = cap_cell_dataset(train_ds, max_cells_per_subject, seed=seed)
+                    val_ds_capped = cap_cell_dataset(val_ds, max_cells_per_subject, seed=seed)
+                    fold_context = _fold_context(context, artifact, train_ds_capped, val_ds_capped)
                     adapter = NeuralSmokeAdapter(fold_context.config, device=device)
-                    adapter.fit(fold_context, train_ds, val_ds, seed=seed)
-                    preds = adapter.predict(val_ds)
-                    cell_report = full_smoke_metrics_report(val_ds.smoke.numpy(), preds, num_classes)
+                    adapter.fit(fold_context, train_ds_capped, val_ds_capped, seed=seed)
+                    preds = adapter.predict(val_ds_capped)
+                    cell_report = full_smoke_metrics_report(val_ds_capped.smoke.numpy(), preds, num_classes)
                     subj_report = subject_weighted_smoke_metrics(
-                        val_ds.smoke.numpy(), preds, val_ds.subject_ids, num_classes,
+                        val_ds_capped.smoke.numpy(), preds, val_ds_capped.subject_ids, num_classes,
                     )
                     fold_record["hyperparameters"] = adapter.metadata()
+                    fold_record["feature_mode"] = "cell_capped"
+                    fold_record["max_cells_per_subject"] = max_cells_per_subject
+                    fold_record["n_cells_before_cap"] = {"train": len(train_ds), "val": len(val_ds)}
+                    fold_record["n_cells_after_cap"] = {"train": len(train_ds_capped), "val": len(val_ds_capped)}
                 else:
                     model = SMOKE_BASELINES[name]()
                     model.fit(Xtr, ytr, seed=seed)
@@ -151,6 +168,7 @@ def run_smoke_cv(
                     subj_report = cell_report
                     fold_record["hyperparameters"] = model.metadata()
                     fold_record["evaluation_mode"] = "subject_summary"
+                    fold_record["feature_mode"] = "subject_summary"
 
                 fold_record["cell_weighted_macro_f1"] = cell_report["macro_f1"] if name == "neural" else None
                 fold_record["cell_weighted_macro_f1_not_applicable"] = name != "neural"
