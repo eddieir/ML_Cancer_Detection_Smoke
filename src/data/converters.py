@@ -118,15 +118,65 @@ def _infer_smoke_column(meta: pd.DataFrame, default: str) -> pd.Series:
     return meta[status_col].map(_classify)
 
 
-def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str) -> Path:
+def _load_probe_to_symbol_map(annot_path: Path) -> dict[str, str]:
+    """
+    Parses a GEO platform annotation file (`GPL*.annot.gz`) into a
+    {probe_id: gene_symbol} dict. Format is a `!platform_table_begin` /
+    `!platform_table_end`-delimited TSV table with "ID" and "Gene symbol"
+    columns — used for platforms like GSE123352's Illumina HumanHT-12
+    (ILMN_ probe IDs) that BioMart doesn't expose as a queryable attribute,
+    so harmonize_gene_ids() (transforms.py) can't map them; this is the
+    documented alternative referenced in that function's docstring.
+    Probes with no annotated symbol are dropped (empty string maps to
+    nothing meaningful, and it's a single value that would collapse many
+    genes into one row).
+    """
+    lines = []
+    in_table = False
+    opener = gzip.open if annot_path.suffix == ".gz" else open
+    with opener(annot_path, "rt", errors="replace") as f:
+        for line in f:
+            if line.startswith("!platform_table_begin"):
+                in_table = True
+                continue
+            if line.startswith("!platform_table_end"):
+                break
+            if in_table:
+                lines.append(line.rstrip("\n"))
+
+    from io import StringIO
+    table = pd.read_csv(StringIO("\n".join(lines)), sep="\t", dtype=str)
+    table = table.dropna(subset=["ID", "Gene symbol"])
+    table = table[table["Gene symbol"].str.strip() != ""]
+    return dict(zip(table["ID"], table["Gene symbol"]))
+
+
+def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
+                        platform_annot_path: Optional[Path] = None) -> Path:
     """
     GEO series matrix → (genes x samples CSV for load_microarray) +
     (sibling `_samples_meta.csv` with per-sample smoke_type, used by
     load_microarray to override the blanket default where GEO metadata
     lets us tell smokers from never-smokers within one series).
+
+    platform_annot_path: optional GPL*.annot.gz to map probe IDs (e.g.
+    GSE123352's ILMN_... Illumina probes) to gene symbols before writing
+    the CSV. Probes with no mapped symbol are dropped; probes that share a
+    symbol (multiple probes per gene is normal on array platforms) are
+    collapsed via mean expression, matching how harmonize_gene_ids()
+    (transforms.py) already resolves BioMart's many-probes-to-one-gene case.
     """
     out_dir = _mkout()
     expr, meta = _parse_series_matrix(gz_path)
+
+    if platform_annot_path is not None:
+        n_probes = len(expr)
+        probe_to_symbol = _load_probe_to_symbol_map(platform_annot_path)
+        expr = expr.loc[expr.index.isin(probe_to_symbol)]
+        expr.index = expr.index.map(probe_to_symbol)
+        expr = expr.groupby(expr.index).mean()
+        print(f"[convert] {accession}  platform annotation  {n_probes} probes → "
+              f"{len(expr)} gene symbols ({Path(platform_annot_path).name})")
 
     csv_path  = out_dir / f"{accession}.csv"
     meta_path = out_dir / f"{accession}_samples_meta.csv"
@@ -609,7 +659,22 @@ def convert_accession(accession: str) -> Optional[Path]:
         return convert_gse288003(accession, src) if src.exists() else _missing(accession, src)
 
     gz = src / expected_file
-    return convert_microarray(accession, gz, smoke_type) if gz.exists() else _missing(accession, gz)
+    if not gz.exists():
+        return _missing(accession, gz)
+
+    from data.downloaders import GEO_PLATFORM_ANNOTATIONS
+    gpl = GEO_PLATFORM_ANNOTATIONS.get(accession)
+    platform_annot_path = None
+    if gpl:
+        candidate = src / f"{gpl}.annot.gz"
+        if candidate.exists():
+            platform_annot_path = candidate
+        else:
+            print(f"[convert] {accession}  WARNING: no {gpl}.annot.gz in {src} — "
+                  f"probe IDs will stay unmapped. Re-run: "
+                  f"python3 src/data/downloaders.py --accession {accession}")
+
+    return convert_microarray(accession, gz, smoke_type, platform_annot_path=platform_annot_path)
 
 
 def _missing(accession: str, path: Path) -> None:

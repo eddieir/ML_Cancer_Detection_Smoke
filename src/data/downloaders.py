@@ -59,6 +59,15 @@ GEO_DATASETS = {
     ),
 }
 
+# GSE123352's Illumina HumanHT-12 V4.0 probe IDs (ILMN_...) aren't a queryable
+# BioMart attribute (see transforms.py::harmonize_gene_ids docstring) — GEO's
+# own platform annotation file (GPL10558.annot.gz, ID -> Gene symbol) is the
+# only way to map them. Accessions here get that file fetched alongside their
+# series matrix in download_geo().
+GEO_PLATFORM_ANNOTATIONS = {
+    "GSE123352": "GPL10558",
+}
+
 # ─── TCGA dataset registry ────────────────────────────────────────────────────
 TCGA_DATASETS = {
     "TCGA-LUAD": {
@@ -182,6 +191,17 @@ def download_geo(accession: str, dest_override: Optional[Path] = None) -> Path:
                     _extract_tar(downloaded, dest)
     except Exception as e:
         print(f"  [warn] supplementary FTP fetch failed: {e}")
+
+    gpl = GEO_PLATFORM_ANNOTATIONS.get(accession)
+    if gpl:
+        annot_url = (
+            f"https://ftp.ncbi.nlm.nih.gov/geo/platforms/"
+            f"{gpl[:-3]}nnn/{gpl}/annot/{gpl}.annot.gz"
+        )
+        try:
+            _download_file(annot_url, dest, f"{gpl}.annot.gz")
+        except Exception as e:
+            print(f"  [warn] platform annotation fetch failed: {e}")
 
     print(f"  [done] {accession} → {dest}/")
     return dest

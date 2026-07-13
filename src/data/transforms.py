@@ -43,10 +43,12 @@ def harmonize_gene_ids(adata: ad.AnnData, mapping: Optional[dict] = None) -> ad.
 
     Auto-detects platform from var_names; sources already using gene symbols
     (no pattern match) pass through unchanged. Illumina HumanHT-12 probes
-    (e.g. GSE123352's "ILMN_...") are NOT covered — Ensembl's BioMart doesn't
-    expose that array as a queryable attribute, so those sources need GEO's
-    own GPL platform annotation file instead and are deliberately left out of
-    auto-detection here rather than silently mismapped.
+    (e.g. GSE123352's "ILMN_...") are NOT covered here — Ensembl's BioMart
+    doesn't expose that array as a queryable attribute, so that mapping
+    happens earlier, at conversion time, via GEO's own GPL platform
+    annotation file (converters.py::_load_probe_to_symbol_map,
+    GSE123352.csv already ships real gene symbols by the time it reaches
+    this pipeline) rather than being silently mismapped here.
 
     `mapping` lets tests (and repeat calls across sources on the same
     platform) skip the live BioMart query.

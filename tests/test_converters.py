@@ -74,6 +74,58 @@ def test_convert_microarray_infers_per_sample_smoke_type(tmp_paths):
     assert meta.loc["GSM2", "smoke_type"] == "unexposed"
 
 
+def _write_gpl_annot(path, probe_to_symbol):
+    """
+    Minimal synthetic GPL platform annotation file — enough of the real
+    `!platform_table_begin/end`-delimited TSV format for
+    _load_probe_to_symbol_map() to parse.
+    """
+    lines = [
+        "!Annotation_platform = GPLTEST",
+        "!platform_table_begin",
+        "ID\tGene title\tGene symbol\tGene ID",
+    ]
+    for probe, symbol in probe_to_symbol.items():
+        lines.append(f"{probe}\tsome gene title\t{symbol}\t123")
+    lines.append("!platform_table_end")
+    with gzip.open(path, "wt") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def test_convert_microarray_maps_illumina_probes_to_gene_symbols(tmp_paths):
+    """
+    GSE123352 ships Illumina HumanHT-12 probe IDs (ILMN_...) that BioMart
+    can't resolve — GEO's own GPL annotation file is the only way to map
+    them to gene symbols. Two probes for the same gene (ILMN_A, ILMN_C
+    both -> GAPDH) must collapse via mean, and an unannotated probe
+    (ILMN_D, no symbol) must be dropped rather than kept as a bogus gene.
+    """
+    tmp, converted = tmp_paths
+    gz = tmp / "GSE123352_series_matrix.txt.gz"
+    _write_series_matrix(
+        gz,
+        sample_ids=["GSM1", "GSM2"],
+        characteristics={"smoking status": ["ever smoker", "never smoker"]},
+        expr={
+            "ILMN_A": [10.0, 20.0],   # -> GAPDH
+            "ILMN_B": [1.0, 2.0],     # -> EEF1A1
+            "ILMN_C": [30.0, 40.0],   # -> GAPDH (same gene, different probe)
+            "ILMN_D": [5.0, 5.0],     # unannotated -> dropped
+        },
+    )
+    annot = tmp / "GPLTEST.annot.gz"
+    _write_gpl_annot(annot, {"ILMN_A": "GAPDH", "ILMN_B": "EEF1A1", "ILMN_C": "GAPDH"})
+
+    csv_path = converters.convert_microarray("GSE123352", gz, "cigarette",
+                                              platform_annot_path=annot)
+    expr = pd.read_csv(csv_path, index_col=0)
+
+    assert set(expr.index) == {"GAPDH", "EEF1A1"}
+    assert expr.loc["GAPDH", "GSM1"] == 20.0   # mean(10, 30)
+    assert expr.loc["GAPDH", "GSM2"] == 30.0   # mean(20, 40)
+    assert expr.loc["EEF1A1", "GSM1"] == 1.0
+
+
 def test_convert_canuck_classifies_smoke_type_from_three_fields(tmp_paths):
     """
     GSE307690 (CANUCK) ships its real expression matrix as a separate
