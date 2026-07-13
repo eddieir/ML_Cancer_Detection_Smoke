@@ -20,6 +20,7 @@ own fold — see generate_out_of_fold_predictions for the one sanctioned way to
 turn an upstream model's prediction into a downstream feature.
 """
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -100,22 +101,43 @@ def build_smoke_subject_summary_features(
     return np.vstack(rows).astype(np.float32), np.array(y, dtype=np.int64), subject_ids, feature_names
 
 
+# Ground-truth malignancy is a labellers.py-assigned per-cell signal that,
+# for outcome-linked sources (e.g. TCGA tumor/solid-tissue-normal), can
+# directly reveal or closely proxy the cancer outcome itself, and is not
+# necessarily available at real inference time either way. It must never be
+# a Task B predictor — see OOFMalignancyPrediction below for the only
+# sanctioned way a malignancy signal can enter these features.
+_FORBIDDEN_GROUND_TRUTH_GROUPS = {"malignancy_known_mean"}
+
+
 def build_cancer_subject_features(
     bags: List[dict], num_cell_types: int,
-    feature_groups: Sequence[str] = ("gene_mean", "cell_type_prop", "malignancy_known_mean", "n_cells"),
+    feature_groups: Sequence[str] = ("gene_mean", "cell_type_prop", "n_cells"),
     oof_malignancy: Optional[Dict[str, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
     """
     One row per subject with a KNOWN cancer outcome (bags without one carry
     no label to train/evaluate against — see SubjectLevelDataset). No
-    feature here is derived from cancer_label itself.
+    feature here is derived from cancer_label itself, and ground-truth
+    malignancy is never a feature (see _FORBIDDEN_GROUND_TRUTH_GROUPS).
 
     oof_malignancy: optional {subject_id: out-of-fold predicted malignancy}
     — if given, adds a "malignancy_oof_pred" feature built from an upstream
     model's prediction generated WITHOUT using this subject in its training
-    fold (see generate_out_of_fold_predictions). Passing an in-fold
-    prediction here would be exactly the leakage this framework forbids.
+    fold. Must be validated via validate_oof_predictions() first — this
+    function does not itself check fold-membership, only that a dict was
+    supplied.
     """
+    forbidden = _FORBIDDEN_GROUND_TRUTH_GROUPS & set(feature_groups)
+    if forbidden:
+        raise ValueError(
+            f"build_cancer_subject_features: {sorted(forbidden)} would use ground-truth "
+            "malignancy labels as a cancer-outcome predictor — this can directly proxy the "
+            "outcome for outcome-linked sources and is forbidden. Use `oof_malignancy` "
+            "(an out-of-fold prediction from an upstream model, validated by "
+            "validate_oof_predictions()) instead."
+        )
+
     known_bags = [b for b in bags if b.get("cancer_label_known")]
     if not known_bags:
         raise ValueError("build_cancer_subject_features: no bags with a known cancer outcome")
@@ -129,15 +151,16 @@ def build_cancer_subject_features(
         if "cell_type_prop" in feature_groups:
             counts = np.bincount(b["cell_type_ids"], minlength=num_cell_types).astype(np.float64)
             row.append(counts / counts.sum())
-        if "malignancy_known_mean" in feature_groups:
-            known_mask = b["malig_known"]
-            mean_malig = float(b["malig_labels"][known_mask].mean()) if known_mask.any() else 0.0
-            has_known = float(known_mask.any())
-            row.append(np.array([mean_malig, has_known]))
         if "n_cells" in feature_groups:
             row.append(np.array([float(len(b["gene_matrix"]))]))
         if oof_malignancy is not None:
-            row.append(np.array([oof_malignancy.get(str(b["subject_id"]), 0.0)]))
+            if str(b["subject_id"]) not in oof_malignancy:
+                raise ValueError(
+                    f"build_cancer_subject_features: subject {b['subject_id']} has no "
+                    "out-of-fold malignancy prediction — every subject must have exactly "
+                    "one, never a silent 0.0 fill (see validate_oof_predictions())."
+                )
+            row.append(np.array([oof_malignancy[str(b["subject_id"])]]))
         rows.append(np.concatenate(row))
         y.append(int(b["cancer_label"]))
         subject_ids.append(str(b["subject_id"]))
@@ -147,8 +170,6 @@ def build_cancer_subject_features(
         feature_names += [f"gene_mean_{i}" for i in range(n_genes)]
     if "cell_type_prop" in feature_groups:
         feature_names += [f"cell_type_prop_{i}" for i in range(num_cell_types)]
-    if "malignancy_known_mean" in feature_groups:
-        feature_names += ["malignancy_known_mean", "malignancy_has_known"]
     if "n_cells" in feature_groups:
         feature_names += ["n_cells"]
     if oof_malignancy is not None:
@@ -189,3 +210,54 @@ def generate_out_of_fold_predictions(
         missing = int(np.isnan(oof).sum())
         raise RuntimeError(f"generate_out_of_fold_predictions: {missing} row(s) never got a fold assignment")
     return oof
+
+
+@dataclass
+class OOFMalignancyPrediction:
+    """
+    One subject's out-of-fold malignancy prediction, with enough provenance
+    to verify it was never produced by a model that saw this subject during
+    fitting — the only sanctioned way ground-truth-adjacent malignancy
+    information can enter a Task B feature (see
+    _FORBIDDEN_GROUND_TRUTH_GROUPS above).
+    """
+    subject_id: str
+    prediction: float
+    upstream_model_id: str          # e.g. "random_forest" or a checkpoint path
+    training_subject_ids: List[str]  # exact fold-train subjects the upstream model saw
+    preprocessing_fingerprint: str
+    seed: int
+
+
+def validate_oof_predictions(
+    predictions: List[OOFMalignancyPrediction], required_subject_ids: Sequence[str],
+) -> Dict[str, float]:
+    """
+    Enforces: exactly one prediction per required subject (no missing, no
+    duplicates), and that subject never appears in its own prediction's
+    training_subject_ids (no in-fold/self-prediction). Returns
+    {subject_id: prediction} ready for build_cancer_subject_features's
+    oof_malignancy — never silently drops or zero-fills a bad entry.
+    """
+    required = {str(s) for s in required_subject_ids}
+    by_subject: Dict[str, OOFMalignancyPrediction] = {}
+    for p in predictions:
+        sid = str(p.subject_id)
+        if sid in by_subject:
+            raise ValueError(f"validate_oof_predictions: duplicate prediction for subject {sid!r}")
+        if sid in {str(t) for t in p.training_subject_ids}:
+            raise ValueError(
+                f"validate_oof_predictions: prediction for subject {sid!r} was produced by a "
+                f"model trained on that same subject (in-fold leakage) — its "
+                "training_subject_ids includes its own id."
+            )
+        by_subject[sid] = p
+
+    missing = required - set(by_subject)
+    if missing:
+        raise ValueError(f"validate_oof_predictions: missing prediction(s) for {sorted(missing)}")
+    extra = set(by_subject) - required
+    if extra:
+        raise ValueError(f"validate_oof_predictions: unexpected prediction(s) for {sorted(extra)} not in required set")
+
+    return {sid: p.prediction for sid, p in by_subject.items()}

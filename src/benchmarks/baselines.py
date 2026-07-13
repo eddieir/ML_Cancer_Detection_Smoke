@@ -22,6 +22,8 @@ from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 class Baseline:
@@ -51,12 +53,73 @@ class Baseline:
         }
 
 
+def positive_class_proba(model: Baseline, X: np.ndarray) -> np.ndarray:
+    """
+    P(class 1), robust to a training fold that only ever saw one class — a
+    real, expected outcome of small grouped-CV folds (see
+    check_task_b_eligibility / MILEligibilityError), not a bug to crash on.
+    sklearn's predict_proba() only has as many columns as classes_ has
+    entries, in classes_'s (sorted) order — blindly indexing column 1
+    assumes both classes were seen AND that class 1 sorts second, which is
+    usually true for {0, 1} labels but not guaranteed and outright wrong
+    with one class. Returns all-zeros if the model never saw class 1,
+    all-ones if it never saw class 0.
+    """
+    proba = model.predict_proba(X)
+    classes = list(model.classes_)
+    if 1 not in classes:
+        return np.zeros(len(X), dtype=float)
+    if 0 not in classes:
+        return np.ones(len(X), dtype=float)
+    return proba[:, classes.index(1)]
+
+
 def _sklearn_fit(baseline: Baseline, model_cls, X, y, seed, **extra_params):
+    if len(set(y.tolist())) < 2:
+        # A fold/subset with only one training class isn't a bug — it's an
+        # expected outcome of small grouped-CV folds — but LogisticRegression/
+        # HistGradientBoostingClassifier/MLPClassifier all raise ValueError
+        # outright on single-class y. Fall back to a constant predictor for
+        # the one class actually seen, recorded explicitly so this is never
+        # confused with the real model having been fit.
+        baseline.model = DummyClassifier(strategy="constant", constant=y[0])
+        baseline.model.fit(X, y)
+        baseline.classes_ = baseline.model.classes_
+        baseline.hyperparams = dict(baseline.hyperparams, fallback="single_class_constant")
+        return baseline
     params = dict(baseline.hyperparams)
     params.update(extra_params)
     if "random_state" in model_cls().get_params():
         params["random_state"] = seed
     baseline.model = model_cls(**params)
+    baseline.model.fit(X, y)
+    baseline.classes_ = baseline.model.classes_
+    return baseline
+
+
+def _scaled_sklearn_fit(baseline: Baseline, model_cls, X, y, seed, **extra_params):
+    """
+    Like _sklearn_fit, but wraps the estimator in a Pipeline(StandardScaler,
+    model) fit as one unit — the scaler's mean/variance are computed only
+    from whatever X this call receives (the caller's fold-train rows, never
+    validation/test; see cross_validation.py), so per-fold scaling is
+    automatic here, not something callers must remember to do separately.
+    Used for models sensitive to feature magnitude (logistic regression,
+    small MLP) where an unscaled `n_cells` feature could otherwise dominate
+    purely by scale. Tree-based models (random forest, gradient boosting)
+    don't need this and aren't wrapped.
+    """
+    if len(set(y.tolist())) < 2:
+        baseline.model = DummyClassifier(strategy="constant", constant=y[0])
+        baseline.model.fit(X, y)
+        baseline.classes_ = baseline.model.classes_
+        baseline.hyperparams = dict(baseline.hyperparams, fallback="single_class_constant")
+        return baseline
+    params = dict(baseline.hyperparams)
+    params.update(extra_params)
+    if "random_state" in model_cls().get_params():
+        params["random_state"] = seed
+    baseline.model = Pipeline([("scaler", StandardScaler()), ("model", model_cls(**params))])
     baseline.model.fit(X, y)
     baseline.classes_ = baseline.model.classes_
     return baseline
@@ -81,7 +144,7 @@ class SmokeLogisticRegression(Baseline):
         super().__init__(C=C, class_weight=class_weight)
 
     def fit(self, X, y, seed=42):
-        return _sklearn_fit(
+        return _scaled_sklearn_fit(
             self, lambda **p: LogisticRegression(max_iter=2000, **p), X, y, seed,
         )
 
@@ -118,7 +181,7 @@ class SmokeSmallMLP(Baseline):
         super().__init__(hidden_layer_sizes=hidden_layer_sizes, alpha=alpha, max_iter=max_iter)
 
     def fit(self, X, y, seed=42):
-        return _sklearn_fit(
+        return _scaled_sklearn_fit(
             self, MLPClassifier, X, y, seed, early_stopping=True, n_iter_no_change=10,
         )
 
@@ -153,7 +216,7 @@ class CancerLogisticRegression(Baseline):
         super().__init__(C=C, class_weight=class_weight)
 
     def fit(self, X, y, seed=42):
-        return _sklearn_fit(self, lambda **p: LogisticRegression(max_iter=2000, **p), X, y, seed)
+        return _scaled_sklearn_fit(self, lambda **p: LogisticRegression(max_iter=2000, **p), X, y, seed)
 
 
 class CancerRandomForest(Baseline):
@@ -186,7 +249,7 @@ class CancerSmallMLP(Baseline):
         super().__init__(hidden_layer_sizes=hidden_layer_sizes, alpha=alpha, max_iter=max_iter)
 
     def fit(self, X, y, seed=42):
-        return _sklearn_fit(
+        return _scaled_sklearn_fit(
             self, MLPClassifier, X, y, seed, early_stopping=True, n_iter_no_change=10,
         )
 
