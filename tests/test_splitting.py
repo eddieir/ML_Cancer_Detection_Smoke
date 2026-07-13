@@ -11,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from data.splitting import (
     SplitManifest,
+    StaleManifestError,
     build_split_report,
+    compute_dataset_fingerprint,
     grouped_kfold,
     load_or_create_split,
     subject_train_val_test_split,
@@ -125,6 +127,22 @@ def test_grouped_kfold_reduces_folds_for_rare_class():
     assert len(folds) >= 2
 
 
+def test_grouped_kfold_rejects_fewer_than_two_subjects():
+    with pytest.raises(ValueError):
+        grouped_kfold(["only_one"] * 3, [0, 0, 0], n_folds=5)
+
+
+def test_grouped_kfold_reports_classes_absent_from_val_when_unstratified():
+    # class "rare" has only 1 subject, so it can appear in at most 1 of the
+    # >=2 folds — every other fold must report it absent from validation.
+    subject_ids = [f"common_{i}" for i in range(20) for _ in range(3)] + ["rare_0"] * 3
+    labels = [0] * 60 + [1] * 3
+    folds = grouped_kfold(subject_ids, labels, n_folds=5, seed=1)
+    assert any(fold["classes_absent_from_val"] for fold in folds)
+    assert all("stratified" in fold and "n_folds_used" in fold for fold in folds)
+    assert any(fold["stratified"] is False for fold in folds)
+
+
 # ─── Grouped K-fold leakage + coverage ───────────────────────────────────────
 
 def test_grouped_kfold_no_leakage_per_fold():
@@ -156,14 +174,83 @@ def test_manifest_save_and_load_roundtrip(tmp_path):
     assert loaded.report == manifest.report
 
 
-def test_load_or_create_split_reuses_existing_manifest(tmp_path):
+def test_load_or_create_split_reuses_existing_manifest_when_unchanged(tmp_path):
     subject_ids, labels = _synthetic_cells()
     path = tmp_path / "manifest.json"
     m1 = load_or_create_split(path, subject_ids, labels, seed=11)
-    # Call again with a DIFFERENT seed — should still load the existing file, not re-split
-    m2 = load_or_create_split(path, subject_ids, labels, seed=999)
+    # Same subjects/labels/config → same fingerprint → the existing manifest is reused verbatim.
+    m2 = load_or_create_split(path, subject_ids, labels, seed=11)
     assert m1.train_subjects == m2.train_subjects
     assert m2.seed == 11
+
+
+def test_load_or_create_split_rejects_stale_manifest_on_seed_change(tmp_path):
+    """A saved split manifest must not be silently reused (or silently
+    regenerated) once the requesting config no longer matches it — the
+    default must be a loud error, never a quiet reuse of a stale split."""
+    subject_ids, labels = _synthetic_cells()
+    path = tmp_path / "manifest.json"
+    load_or_create_split(path, subject_ids, labels, seed=11)
+    with pytest.raises(StaleManifestError):
+        load_or_create_split(path, subject_ids, labels, seed=999)
+
+
+def test_load_or_create_split_rejects_stale_manifest_on_new_subject(tmp_path):
+    subject_ids, labels = _synthetic_cells()
+    path = tmp_path / "manifest.json"
+    load_or_create_split(path, subject_ids, labels, seed=11)
+    subject_ids2 = subject_ids + ["sub_new"] * 5
+    labels2 = labels + [0] * 5
+    with pytest.raises(StaleManifestError):
+        load_or_create_split(path, subject_ids2, labels2, seed=11)
+
+
+def test_load_or_create_split_rejects_stale_manifest_on_label_change(tmp_path):
+    subject_ids, labels = _synthetic_cells()
+    path = tmp_path / "manifest.json"
+    load_or_create_split(path, subject_ids, labels, seed=11)
+    changed_labels = [(l + 1) % 6 for l in labels]
+    with pytest.raises(StaleManifestError):
+        load_or_create_split(path, subject_ids, changed_labels, seed=11)
+
+
+def test_load_or_create_split_force_regenerate_overrides_stale_check(tmp_path):
+    subject_ids, labels = _synthetic_cells()
+    path = tmp_path / "manifest.json"
+    load_or_create_split(path, subject_ids, labels, seed=11)
+    m2 = load_or_create_split(path, subject_ids, labels, seed=999, force_regenerate=True)
+    assert m2.seed == 999
+
+
+def test_load_or_create_split_rejects_stale_manifest_on_rare_class_policy_change(tmp_path):
+    subject_ids, labels = _synthetic_cells()
+    path = tmp_path / "manifest.json"
+    load_or_create_split(path, subject_ids, labels, seed=11, rare_class_policy="keep_with_warning")
+    with pytest.raises(StaleManifestError):
+        load_or_create_split(path, subject_ids, labels, seed=11,
+                              rare_class_policy="merge_into_dual_use_or_other")
+
+
+def test_load_or_create_split_rejects_stale_manifest_on_fraction_change(tmp_path):
+    subject_ids, labels = _synthetic_cells()
+    path = tmp_path / "manifest.json"
+    load_or_create_split(path, subject_ids, labels, seed=11)
+    with pytest.raises(StaleManifestError):
+        load_or_create_split(path, subject_ids, labels, seed=11, train_frac=0.5, val_frac=0.3, test_frac=0.2)
+
+
+def test_dataset_fingerprint_matches_for_identical_inputs():
+    subject_ids, labels = _synthetic_cells()
+    fp1 = compute_dataset_fingerprint(subject_ids, labels, seed=1)
+    fp2 = compute_dataset_fingerprint(subject_ids, labels, seed=1)
+    assert fp1 == fp2
+
+
+def test_dataset_fingerprint_differs_for_different_seed():
+    subject_ids, labels = _synthetic_cells()
+    fp1 = compute_dataset_fingerprint(subject_ids, labels, seed=1)
+    fp2 = compute_dataset_fingerprint(subject_ids, labels, seed=2)
+    assert fp1 != fp2
 
 
 # ─── Split report ────────────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ as JSON manifests so an experiment can be exactly reproduced or audited later
 without re-running the random split.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,43 @@ import numpy as np
 
 
 MIN_SUBJECTS_FOR_STRATIFICATION = 3  # need >=1 subject per split to stratify a class
+
+
+class StaleManifestError(ValueError):
+    """Raised when an on-disk split manifest no longer matches the current data/config."""
+
+
+def compute_dataset_fingerprint(
+    subject_ids:   Sequence,
+    labels:        Optional[Sequence] = None,
+    train_frac:    float = 0.70,
+    val_frac:      float = 0.15,
+    test_frac:     float = 0.15,
+    seed:          int = 42,
+    rare_class_policy: Optional[str] = None,
+    extra:         Optional[Dict] = None,
+) -> str:
+    """
+    Deterministic hash of everything that determines a split's validity:
+    the subject set, each subject's final effective label, split fractions,
+    seed, and the rare-class policy in effect when the split was made.
+    Any change to these invalidates a saved manifest — reusing it silently
+    would either leak new subjects into no split, keep stale subjects that
+    no longer exist, or apply a split computed under a different label
+    mapping than the one now in use.
+    """
+    subject_labels = _unique_subject_labels(subject_ids, labels)
+    payload = {
+        "subjects":    sorted((sid, str(lab)) for sid, lab in subject_labels.items()),
+        "train_frac":  round(train_frac, 6),
+        "val_frac":    round(val_frac, 6),
+        "test_frac":   round(test_frac, 6),
+        "seed":        seed,
+        "rare_class_policy": rare_class_policy,
+        "extra":       extra or {},
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 # ─── Manifest ──────────────────────────────────────────────────────────────
@@ -35,6 +73,7 @@ class SplitManifest:
     val_subjects:   List[str]
     test_subjects:  List[str]
     report:         Dict = field(default_factory=dict)
+    fingerprint:    Optional[str] = None
 
     def __post_init__(self):
         self.train_subjects = [str(s) for s in self.train_subjects]
@@ -66,6 +105,7 @@ class SplitManifest:
             "val_subjects":   self.val_subjects,
             "test_subjects":  self.test_subjects,
             "report":         self.report,
+            "fingerprint":    self.fingerprint,
         }
 
     def save(self, path: Union[str, Path]) -> None:
@@ -82,7 +122,7 @@ class SplitManifest:
         return cls(
             seed=d["seed"], train_subjects=d["train_subjects"],
             val_subjects=d["val_subjects"], test_subjects=d["test_subjects"],
-            report=d.get("report", {}),
+            report=d.get("report", {}), fingerprint=d.get("fingerprint"),
         )
 
 
@@ -126,6 +166,7 @@ def subject_train_val_test_split(
     seed:           int = 42,
     cell_counts:    Optional[Dict[str, int]] = None,
     manifest_path:  Optional[Union[str, Path]] = None,
+    rare_class_policy: Optional[str] = None,
 ) -> SplitManifest:
     """
     Group-aware train/val/test split by subject_id.
@@ -194,26 +235,70 @@ def subject_train_val_test_split(
     report["unstratified_classes"] = [str(c) for c in unstratified_classes]
     report["seed"] = seed
 
+    fingerprint = compute_dataset_fingerprint(
+        subject_ids, labels, train_frac, val_frac, test_frac, seed, rare_class_policy,
+    )
     manifest = SplitManifest(seed=seed, train_subjects=train, val_subjects=val,
-                              test_subjects=test, report=report)
+                              test_subjects=test, report=report, fingerprint=fingerprint)
     if manifest_path:
         manifest.save(manifest_path)
     return manifest
 
 
 def load_or_create_split(
-    manifest_path: Union[str, Path],
-    subject_ids:   Sequence,
-    labels:        Optional[Sequence] = None,
+    manifest_path:     Union[str, Path],
+    subject_ids:       Sequence,
+    labels:            Optional[Sequence] = None,
+    train_frac:        float = 0.70,
+    val_frac:          float = 0.15,
+    test_frac:         float = 0.15,
+    seed:              int = 42,
+    rare_class_policy: Optional[str] = None,
+    force_regenerate:  bool = False,
     **kwargs,
 ) -> SplitManifest:
-    """Load an existing manifest if present, else create and save a new one."""
+    """
+    Load an existing manifest if present and still valid for the current
+    data/config, else create and save a new one.
+
+    Validity is checked via compute_dataset_fingerprint: the manifest's
+    fingerprint must match a fingerprint recomputed from the CURRENT
+    subject_ids/labels/split fractions/seed/rare_class_policy. A mismatch
+    (a subject added/removed, an effective label changed, a different seed
+    or split fraction, a different rare-class policy) means the on-disk
+    split no longer describes this dataset — silently reusing it risks an
+    unassigned or stale subject, silently regenerating it would quietly
+    throw away a previously-audited split. Both are wrong by default, so
+    this raises StaleManifestError; pass force_regenerate=True to
+    deliberately discard the old manifest and write a fresh one.
+
+    A manifest saved before fingerprinting existed (fingerprint=None) is
+    treated as unverifiable and also raises, since there's no way to know
+    whether it still matches — regenerate it once with force_regenerate=True
+    to adopt fingerprinting going forward.
+    """
     path = Path(manifest_path)
-    if path.exists():
-        print(f"[splitting] loading existing manifest ← {path}")
-        return SplitManifest.load(path)
+    expected_fp = compute_dataset_fingerprint(
+        subject_ids, labels, train_frac, val_frac, test_frac, seed, rare_class_policy,
+    )
+    if path.exists() and not force_regenerate:
+        existing = SplitManifest.load(path)
+        if existing.fingerprint != expected_fp:
+            raise StaleManifestError(
+                f"Split manifest at {path} no longer matches the current dataset/config "
+                "(subjects, effective labels, split fractions, seed, or rare-class policy "
+                "changed since it was created). Refusing to silently reuse or regenerate it. "
+                "Pass force_regenerate=True to deliberately create a fresh split, or "
+                "investigate why the underlying data/config changed."
+            )
+        print(f"[splitting] loading existing manifest ← {path}  (fingerprint verified)")
+        return existing
+    if path.exists() and force_regenerate:
+        print(f"[splitting] force_regenerate=True — discarding existing manifest at {path}")
     return subject_train_val_test_split(
-        subject_ids, labels=labels, manifest_path=path, **kwargs
+        subject_ids, labels=labels, train_frac=train_frac, val_frac=val_frac,
+        test_frac=test_frac, seed=seed, rare_class_policy=rare_class_policy,
+        manifest_path=path, **kwargs
     )
 
 
@@ -228,22 +313,35 @@ def grouped_kfold(
     """
     Grouped (subject-level), approximately-stratified K-fold split.
 
-    Returns a list of {"train": [...], "val": [...]} subject-id dicts, one
-    per fold. n_folds is reduced automatically (down to a floor of 2) if any
-    label class has fewer subjects than requested folds, since a class
-    can't be represented in every fold otherwise — reported in fold[0] via
-    the returned `n_folds_used` alongside each dict is impractical, so the
-    actual fold count actually used is simply len(result).
+    Returns a list of {"train": [...], "val": [...], "classes_absent_from_val": [...],
+    "n_folds_used": int, "stratified": bool} dicts, one per fold. n_folds is
+    reduced automatically (down to a floor of 2) if any label class has
+    fewer subjects than requested folds, since a class can't be represented
+    in every fold otherwise. Each fold also records which classes have zero
+    subjects in its validation set, so callers don't silently compute a
+    per-class metric on a fold that never saw that class.
+
+    Raises ValueError if fewer than 2 independent subjects are present —
+    K-fold CV is undefined with 0 or 1 subject.
     """
     subject_labels = _unique_subject_labels(subject_ids, labels)
+    if len(subject_labels) < 2:
+        raise ValueError(
+            f"grouped_kfold requires >=2 independent subjects, got {len(subject_labels)}."
+        )
     buckets = _class_buckets(subject_labels)
 
     smallest_class = min((len(v) for v in buckets.values()), default=0)
     effective_folds = max(2, min(n_folds, smallest_class)) if smallest_class else n_folds
-    effective_folds = min(effective_folds, n_folds)
+    effective_folds = min(effective_folds, n_folds, len(subject_labels))
+    stratified = smallest_class >= effective_folds
     if effective_folds < n_folds:
         print(f"[splitting] grouped_kfold: reducing n_folds {n_folds} → {effective_folds} "
               f"(smallest class has {smallest_class} subjects)")
+    if not stratified:
+        print("[splitting] grouped_kfold: WARNING — approximate/non-stratified folds "
+              "(not every class fits >=1 subject per fold); see per-fold "
+              "'classes_absent_from_val' for which classes are missing where.")
 
     rng = np.random.RandomState(seed)
     fold_assignment: Dict[str, int] = {}
@@ -255,11 +353,21 @@ def grouped_kfold(
 
     folds = []
     all_subjects = sorted(subject_labels.keys())
+    all_classes = {str(lab) for lab in buckets.keys()}
     for f in range(effective_folds):
         val_subs   = [s for s in all_subjects if fold_assignment[s] == f]
         train_subs = [s for s in all_subjects if fold_assignment[s] != f]
         assert not (set(val_subs) & set(train_subs))
-        folds.append({"train": train_subs, "val": val_subs})
+        assert train_subs, f"fold {f}: empty training set"
+        assert val_subs, f"fold {f}: empty validation set"
+        val_classes = {str(subject_labels[s]) for s in val_subs}
+        folds.append({
+            "train": train_subs,
+            "val": val_subs,
+            "classes_absent_from_val": sorted(all_classes - val_classes),
+            "n_folds_used": effective_folds,
+            "stratified": stratified,
+        })
     return folds
 
 
