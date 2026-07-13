@@ -22,6 +22,7 @@ import torch
 import yaml
 
 from constants import CELL_TYPES, N_CELL_TYPES, SMOKE_TYPES
+from metrics import validate_cell_type_ids
 from model import MultiSmokeCancerNet
 from train import load_checkpoint_into
 
@@ -149,6 +150,9 @@ class Predictor:
         Predict cancer risk for one subject.
         gene_matrix must be preprocessed (log-normalised, HVG-selected, scaled).
         """
+        cell_type_ids = validate_cell_type_ids(
+            cell_type_ids, self.model.num_cell_types, n_expected=len(gene_matrix),
+        )
         with torch.no_grad():
             out = self.model.forward_subject(
                 torch.FloatTensor(gene_matrix).to(self.device),
@@ -270,13 +274,17 @@ class Predictor:
                 "mismatched features into the model."
             )
 
+        all_cell_type_ids = validate_cell_type_ids(
+            adata.obs[cell_type_col].values, self.model.num_cell_types, n_expected=X.shape[0],
+        )
+
         subjects = []
         for sid in adata.obs[subject_col].unique():
             mask = (adata.obs[subject_col] == sid).values
             subjects.append({
                 "subject_id":    str(sid),
                 "gene_matrix":   X[mask],
-                "cell_type_ids": adata.obs[cell_type_col].values[mask].astype(int),
+                "cell_type_ids": all_cell_type_ids[mask],
             })
 
         print(f"[inference] {len(subjects)} subjects from {Path(h5ad_path).name}"

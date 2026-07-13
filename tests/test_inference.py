@@ -160,6 +160,57 @@ def test_predict_h5ad_rejects_wrong_model_input_width():
             predictor.predict_h5ad(str(path))
 
 
+def test_predict_h5ad_rejects_out_of_range_cell_type_id():
+    genes = [f"G{i}" for i in range(GENES)]
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=8, attention_dim=4)
+    artifact = _artifact(genes)
+    predictor = Predictor(model, preprocessing_artifact=artifact)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bad_ct.h5ad"
+        n = 10
+        obs = pd.DataFrame({
+            "subject_id":   ["s1"] * n,
+            "cell_type_id": [0, 1, 2, 3, 99, 0, 0, 0, 0, 0],  # 99 is out of range
+        }, index=[f"c{i}" for i in range(n)])
+        a = ad.AnnData(X=np.random.randn(n, GENES).astype("float32"), obs=obs,
+                        var=pd.DataFrame(index=genes))
+        a.write_h5ad(path)
+        with pytest.raises(ValueError):
+            predictor.predict_h5ad(str(path))
+
+
+def test_predict_h5ad_rejects_negative_cell_type_id():
+    genes = [f"G{i}" for i in range(GENES)]
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=8, attention_dim=4)
+    artifact = _artifact(genes)
+    predictor = Predictor(model, preprocessing_artifact=artifact)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "neg_ct.h5ad"
+        n = 5
+        obs = pd.DataFrame({
+            "subject_id":   ["s1"] * n,
+            "cell_type_id": [0, -1, 2, 0, 0],
+        }, index=[f"c{i}" for i in range(n)])
+        a = ad.AnnData(X=np.random.randn(n, GENES).astype("float32"), obs=obs,
+                        var=pd.DataFrame(index=genes))
+        a.write_h5ad(path)
+        with pytest.raises(ValueError):
+            predictor.predict_h5ad(str(path))
+
+
+def test_predict_subject_rejects_fractional_cell_type_id():
+    genes = [f"G{i}" for i in range(GENES)]
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=8, attention_dim=4)
+    predictor = Predictor(model, unsafe_legacy_mode=True)
+    with pytest.raises(ValueError):
+        predictor.predict_subject(
+            np.random.randn(4, GENES).astype("float32"),
+            np.array([0.0, 1.5, 2.0, 0.0]),
+        )
+
+
 def test_predict_h5ad_handles_sparse_input():
     import scipy.sparse as sp
     genes = [f"G{i}" for i in range(GENES)]
