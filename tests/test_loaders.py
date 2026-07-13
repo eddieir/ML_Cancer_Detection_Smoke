@@ -105,3 +105,24 @@ def test_load_mouse_scrna_sets_vape():
         adata = load_mouse_scrna(path)
         assert (adata.obs["smoke_type"] == SMOKE_TYPE_MAP["vape"]).all()
         assert (adata.obs["data_modality"] == "mouse_scrna").all()
+
+
+def test_load_mouse_scrna_keeps_real_per_cell_condition():
+    """
+    GSE288003 has both an unexposed control mouse and an e-cig-exposed
+    mouse under one accession. convert_gse288003 (converters.py) tags each
+    cell's real condition via obs['smoke_type_name'] before writing the
+    h5ad — load_mouse_scrna must not blanket-overwrite that with "vape"
+    for the control cells, or the control sample's label becomes wrong.
+    """
+    from data.loaders import load_mouse_scrna
+    adata = _synthetic_scrna(n=6)
+    adata.obs["smoke_type_name"] = (["unexposed"] * 3) + (["vape"] * 3)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "mouse.h5ad")
+        adata.write_h5ad(path)
+        loaded = load_mouse_scrna(path)
+        assert list(loaded.obs["smoke_type_name"]) == (["unexposed"] * 3) + (["vape"] * 3)
+        assert list(loaded.obs["smoke_type"]) == (
+            [SMOKE_TYPE_MAP["unexposed"]] * 3 + [SMOKE_TYPE_MAP["vape"]] * 3
+        )

@@ -34,9 +34,31 @@ def _try_auto_download(path: Path) -> None:
 def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
                           subject_id_series: pd.Series,
                           modality: str, is_pseudo_bulk: bool) -> ad.AnnData:
-    """DRY helper: stamps required obs columns onto any AnnData."""
-    adata.obs["smoke_type"]      = SMOKE_TYPE_MAP.get(smoke_type.lower(), 5)
-    adata.obs["smoke_type_name"] = smoke_type.lower()
+    """
+    DRY helper: stamps required obs columns onto any AnnData.
+
+    smoke_type is a blanket default for every cell in this source — correct
+    for single-condition sources (e.g. GSE994 is real smokers) but wrong
+    for multi-condition ones (e.g. GSE288003 has both e-cig-exposed AND
+    unexposed control mice under one accession). If the converter already
+    wrote a real per-cell 'smoke_type_name' (converters.py does this for
+    GSE288003's Con/E-cigs split), keep it instead of overwriting every
+    cell with the single blanket label — same per-sample-override pattern
+    load_microarray() already uses via its _samples_meta.csv sidecar.
+    """
+    if "smoke_type_name" in adata.obs.columns:
+        per_cell = adata.obs["smoke_type_name"].astype(str)
+        n_over = (per_cell.str.lower() != smoke_type.lower()).sum()
+        if n_over:
+            print(f"[loader] {modality}  {n_over:,}/{adata.n_obs:,} cells kept "
+                  f"real per-cell smoke_type (differs from default '{smoke_type}')")
+        adata.obs["smoke_type_name"] = per_cell.str.lower().values
+        adata.obs["smoke_type"] = per_cell.str.lower().map(
+            lambda s: SMOKE_TYPE_MAP.get(s, 5)
+        ).values
+    else:
+        adata.obs["smoke_type"]      = SMOKE_TYPE_MAP.get(smoke_type.lower(), 5)
+        adata.obs["smoke_type_name"] = smoke_type.lower()
     adata.obs["data_modality"]   = modality
     adata.obs["is_pseudo_bulk"]  = is_pseudo_bulk
     adata.obs["subject_id"]      = subject_id_series.values

@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, Dataset, random_split
 import yaml
 
@@ -67,6 +68,25 @@ class CellLevelDataset(Dataset):
             cell_type_ids     = np.load(d / "cell_type_ids.npy"),
             exposure_dose     = np.load(dose_path) if dose_path.exists() else None,
         )
+
+    def smoke_class_weights(self, num_classes: int = N_SMOKE_CLASSES) -> torch.Tensor:
+        """
+        Inverse-frequency class weights for CrossEntropyLoss, so majority
+        classes (e.g. cigarette=83, dual_use=30 samples in the current real
+        merge) don't drown out minority ones (vape=7, cannabis=6, cigar=1,
+        unexposed=10) — the collapse documented in README.md's "Current
+        results" table (macro-F1 0.27 despite 77% accuracy).
+
+        weight[c] = n_samples / (num_classes * count[c]), the standard
+        sklearn/PyTorch balanced-weight formula. Classes absent from this
+        dataset get weight 0 (nothing to learn, and 1/0 would be inf).
+        """
+        counts = np.bincount(self.smoke.numpy(), minlength=num_classes).astype(np.float64)
+        n = counts.sum()
+        weights = np.zeros(num_classes, dtype=np.float32)
+        present = counts > 0
+        weights[present] = n / (num_classes * counts[present])
+        return torch.FloatTensor(weights)
 
 
 class SubjectLevelDataset(Dataset):
@@ -213,6 +233,13 @@ class Trainer:
         """
         Train encoder + both heads on labeled single cells.
         Aggregator is NOT updated.
+
+        smoke_class_weights defaults to inverse-frequency weights computed
+        from cell_dataset itself (CellLevelDataset.smoke_class_weights) —
+        pass an explicit tensor only to override that. Unweighted CE lets
+        the loss minimize by predicting only the majority class(es), which
+        is exactly the collapse README.md documents (77% accuracy, 0.27
+        macro-F1, zero F1 on vape/cannabis/cigar/unexposed).
         """
         self._log("\n=== Phase 1 — Cell-Level Pre-training ===")
 
@@ -220,13 +247,18 @@ class Trainer:
         lr         = self.cfg.get("phase1_lr",         1e-3)
         batch_size = self.cfg.get("phase1_batch_size", 512)
 
+        if smoke_class_weights is None:
+            smoke_class_weights = cell_dataset.smoke_class_weights()
+            self._log(f"  smoke class weights (auto, inverse-freq): "
+                       f"{[round(w, 3) for w in smoke_class_weights.tolist()]}")
+
         train_ds, val_ds = self._split(cell_dataset, 0.15)
         train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
         val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
 
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.50, lambda_malignancy=0.50,
-            smoke_class_weights=smoke_class_weights,
+            smoke_class_weights=smoke_class_weights.to(self.device),
         )
         params  = [
             *self.model.encoder.parameters(),
@@ -238,7 +270,7 @@ class Trainer:
         sched   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
         lambda_dose = self.cfg.get("lambda_dose", 0.10)
         history = []
-        best_acc= -1.0
+        best_f1 = -1.0
 
         for epoch in range(1, epochs + 1):
             # train
@@ -264,17 +296,21 @@ class Trainer:
                     targets.extend(batch["smoke_label"].tolist())
 
             acc = sum(p == t for p, t in zip(preds, targets)) / len(targets)
-            history.append({"epoch": epoch, "smoke_acc": acc})
-            self._log(f"  epoch {epoch:02d}/{epochs}  smoke_acc={acc:.3f}")
+            f1  = f1_score(targets, preds, average="macro", zero_division=0)
+            history.append({"epoch": epoch, "smoke_acc": acc, "smoke_macro_f1": f1})
+            self._log(f"  epoch {epoch:02d}/{epochs}  smoke_acc={acc:.3f}  smoke_macro_f1={f1:.3f}")
 
-            if acc > best_acc:
-                best_acc = acc
-                self._save(1, acc)
+            # Select on macro-F1, not accuracy: accuracy rewards collapsing
+            # onto majority classes (see README's "Current results" table),
+            # macro-F1 doesn't.
+            if f1 > best_f1:
+                best_f1 = f1
+                self._save(1, f1)
 
         self._load_best(1)
         self._save_history({"phase1": history}, "phase1")
-        self._log(f"Phase 1 done.  best smoke_acc={best_acc:.3f}")
-        return {"history": history, "best_smoke_acc": best_acc}
+        self._log(f"Phase 1 done.  best smoke_macro_f1={best_f1:.3f}")
+        return {"history": history, "best_smoke_macro_f1": best_f1}
 
     # ── Phase 2: Aggregator training (encoder frozen) ─────────────────────────
 
@@ -359,7 +395,10 @@ class Trainer:
         sub_dl   = DataLoader(train_sub,    batch_size=1,   shuffle=True, collate_fn=subject_collate_fn)
         val_dl   = DataLoader(val_sub,      batch_size=1,   shuffle=False, collate_fn=subject_collate_fn)
 
-        loss_fn = MultiTaskLoss(lambda_smoke=0.30, lambda_malignancy=0.30, lambda_subject=0.40)
+        loss_fn = MultiTaskLoss(
+            lambda_smoke=0.30, lambda_malignancy=0.30, lambda_subject=0.40,
+            smoke_class_weights=cell_dataset.smoke_class_weights().to(self.device),
+        )
         params  = list(self.model.parameters())
         opt     = self._make_optimizer(params, lr, wd=1e-5)
         stopper = _EarlyStopper(patience=self.cfg.get("patience", 5))

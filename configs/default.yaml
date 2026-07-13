@@ -6,13 +6,13 @@ data:
   # yet, so this is safe to check in with real paths even before download.
   scrna_sources:
     - [data/processed/converted/GSE136831.h5ad, cigarette, donor_id]
-  # GSE123352 (Illumina HumanHT-12 probes) is deliberately left out: its
-  # probe IDs aren't a queryable BioMart attribute, so harmonize_gene_ids()
-  # (transforms.py) can't map them to gene symbols yet — including it here
-  # would silently exclude it from merge_sources()'s common-gene intersection
-  # anyway. Needs a GEO GPL platform annotation file instead; separate task.
+  # GSE123352 (Illumina HumanHT-12 probes) now converts through GPL10558's
+  # platform annotation file (converters.py::_load_probe_to_symbol_map),
+  # so its probe IDs are real gene symbols before they ever reach
+  # harmonize_gene_ids() / merge_sources() — no more BioMart dependency.
   microarray_sources:
     - [data/processed/converted/GSE994.csv, cigarette]
+    - [data/processed/converted/GSE123352.csv, cigarette]
     - [data/processed/converted/TCGA-LUAD.csv, cigarette]
     - [data/processed/converted/TCGA-LUSC.csv, cigarette]
     - [data/processed/converted/GSE307690.csv, cannabis]

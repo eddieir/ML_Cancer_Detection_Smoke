@@ -28,9 +28,9 @@ fetches all of them (except NLST and TCGA, which need extra steps — see below)
 | Dataset | What it is | Smoke type | Access |
 |---|---|---|---|
 | [GSE994](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE994) | Bronchial epithelial microarray, 75 subjects | Cigarette (active/former/never) | Free, no login |
-| [GSE123352](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE123352) | Lung tissue RNA-seq, 176 subjects | Cigarette (ever/never) | Free, no login — **not currently merged into training** (Illumina probe IDs aren't mappable to gene symbols yet, see caveat below) |
-| [GSE136831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136831) | Lung scRNA-seq atlas, 312,928 real single cells | Cigarette | Free, no login — largest source (~2GB), needs the streaming mtx parser (`src/data/converters.py::_read_mtx_streaming`) to convert safely on a normal machine |
-| [GSE288003](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE288003) | Mouse lung scRNA-seq, e-cig aerosol exposure | Vape/e-cig | Free, no login — **not currently usable**: its real count matrix ships inside `RAW.tar`, which the downloader doesn't extract yet |
+| [GSE123352](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE123352) | Lung tissue RNA-seq, 176 subjects (118 ever-smokers, 58 never-smokers) | Cigarette (ever/never) | Free, no login — Illumina probe IDs mapped to real gene symbols via GEO's own GPL10558 platform annotation file, merged into `microarray_sources` |
+| [GSE136831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136831) | Lung scRNA-seq atlas, 312,928 real single cells | Cigarette (documented approximation — see caveat below) | Free, no login — largest source (~2GB), converted via the streaming mtx parser (`src/data/converters.py::_read_mtx_streaming`), with real per-cell donor IDs from GEO's own metadata table |
+| [GSE288003](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE288003) | Mouse lung scRNA-seq, e-cig aerosol exposure — 23,595 real cells (10,467 unexposed control + 13,128 e-cig exposed) | Vape/e-cig (per-sample, real condition) | Free, no login — its real count matrix ships inside `RAW.tar`, which the downloader now extracts; each of the two GSM samples keeps its real exposure condition instead of a blanket label |
 | [GSE307690](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE307690) (CANUCK study) | Real human airway epithelial brushings, 61 samples (139 cannabis smokers + 57 never-smokers in the full published cohort) | Cannabis, dual-use, cigarette, vape, unexposed | Free, no login |
 | TCGA-LUAD / TCGA-LUSC | Tumor + adjacent-normal tissue, real per-sample malignancy labels | Cigarette (default; TCGA doesn't record smoke type) | Free, but needs a personal [GDC token](https://portal.gdc.cancer.gov/) (register → profile menu → "Download Token") |
 | NLST | ~26,722 subjects, 10-year cancer outcome + smoking history (cigar/dual-use labels) | — (label source, not expression data) | Requires a Data Use Agreement via [cdas.cancer.gov/nlst](https://cdas.cancer.gov/nlst/) (manual, 1–3 business days) — cannot be automated |
@@ -51,6 +51,17 @@ at all, and no dataset matching that description could be found anywhere in
 GEO. It's been replaced with GSE307690 (CANUCK), a real, verified, published
 cannabis-smoking cohort. If you see any dataset name in this repo you can't
 verify on GEO yourself, treat it as unverified until you check.
+
+**A note on GSE136831's smoke_type label**: this accession is the
+Vanderbilt/Habermann interstitial lung disease atlas — its real per-cell
+metadata (`Disease_Identity`) is COPD, IPF, or Control, not a direct
+smoking-status field. `cigarette` is applied as a documented approximation
+(COPD is strongly smoking-associated, and no better per-subject label
+exists for this accession), the same pattern already used for TCGA-LUAD/
+LUSC below. Donor IDs and the disease label itself are real, joined
+per-cell from GEO's own `*_AllCells.Samples.CellType.MetadataTable.txt.gz`
+(exact barcode match, not a prefix guess — see
+[converters.py](src/data/converters.py) `_load_gse136831_cell_metadata`).
 
 ## Current results (real data)
 
@@ -143,11 +154,12 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (51 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py` |
+| `tests/*` | All modules covered (61 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |
-| Real data — GSE136831 (312,928 real cells) | Downloadable; conversion needs the streaming mtx parser (large file, in progress as of this writing) |
-| Real data — GSE123352, GSE288003 | Downloadable but not yet usable — see caveats in [Where the data comes from](#where-the-data-comes-from) |
+| Real data — GSE136831 (312,928 real cells) | Downloaded and converted with real per-cell donor IDs — not yet re-trained on, see [Next steps](#next-steps) |
+| Real data — GSE123352 (176 subjects) | Downloaded, probe IDs mapped to real gene symbols, merged into `microarray_sources` |
+| Real data — GSE288003 (23,595 real mouse cells) | Downloaded, `RAW.tar` extracted, both conditions (Con/E-cigs) correctly labelled |
 | Real data — TCGA-LUAD/LUSC | Wired in code; blocked on a personal GDC token (not obtained yet) |
 | Real data — NLST | Wired in code; blocked on a Data Use Agreement (not obtained yet) |
 
@@ -214,10 +226,13 @@ sources also use different gene-ID namespaces — Affymetrix probes (GSE994),
 Illumina probes (GSE123352), Ensembl IDs (GSE307690) — none of which overlap
 directly, so merging sources with zero shared genes is a real failure mode,
 not an edge case. `src/data/converters.py` bridges the format gap;
-`src/data/transforms.py::harmonize_gene_ids` bridges the gene-ID gap
-(Affymetrix + Ensembl → gene symbols via BioMart; Illumina isn't BioMart-
-queryable, so GSE123352 is left out of `configs/default.yaml` until that's
-solved separately). `configs/default.yaml` already points at converters'
+`src/data/transforms.py::harmonize_gene_ids` bridges the gene-ID gap for
+Affymetrix + Ensembl IDs via BioMart. Illumina isn't BioMart-queryable, so
+that mapping happens earlier instead — `convert_microarray()` resolves
+GSE123352's probe IDs to real gene symbols at conversion time via GEO's own
+GPL10558 platform annotation file (`converters.py::_load_probe_to_symbol_map`),
+so GSE123352.csv already carries gene symbols by the time it reaches
+`harmonize_gene_ids`. `configs/default.yaml` already points at converters'
 output paths.
 
 TCGA-LUAD/LUSC supply per-cell malignancy labels (tumor vs. solid-tissue-normal)
@@ -261,13 +276,12 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Finish converting GSE136831 (312,928 real cells) and re-run `run_pipeline()`
-  with it included — this is the first source with enough real cells per
-  subject to produce an actual subject-level cancer-prediction number
-- Extract GSE288003's real count matrix from `RAW.tar` (currently unhandled
-  by `downloaders.py`) so its e-cig/vape data becomes usable
-- Map GSE123352's Illumina probe IDs to gene symbols (BioMart doesn't expose
-  that array; needs GEO's own GPL platform annotation file instead) so it can
-  rejoin `microarray_sources`
+- Re-run `run_pipeline()` and Phase 1 training with GSE136831 now converted
+  (312,928 real cells, real per-cell donor IDs) — this is the first source
+  with enough real cells per subject to produce an actual subject-level
+  cancer-prediction number
+- Re-run smoke-type training with the inverse-frequency class weighting
+  (`CellLevelDataset.smoke_class_weights`, `train.py`) and confirm macro-F1
+  actually improves on real data, not just on the unit tests
 - Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
   labels) and NLST (real cancer outcomes + cigar/dual-use history)
