@@ -13,7 +13,7 @@ subject_level and interpretability — not two.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -25,11 +25,50 @@ from model import MultiSmokeCancerNet
 from train import CellLevelDataset, SubjectLevelDataset, subject_collate_fn
 
 
+def describe_split(
+    split_name:        str,
+    manifest,
+    is_held_out:        bool = True,
+    data_modality:       str = "single_cell",
+    rare_class_policy:   Optional[str] = None,
+) -> Dict:
+    """
+    Provenance metadata for an evaluation output (not a metric itself): which
+    split, how many subjects/cells, label distribution, whether it's
+    genuinely held out, and whether the underlying data is bulk or single-
+    cell. Attach this to any saved evaluation_report.json so a number can't
+    be mistaken for held-out test performance when it's actually training-
+    set accuracy computed on data the model has seen.
+    """
+    split_report = manifest.report.get("splits", {}).get(split_name, {})
+    return {
+        "split_name":         split_name,
+        "is_held_out":        is_held_out,
+        "data_modality":      data_modality,
+        "n_subjects":         split_report.get("n_subjects"),
+        "n_cells":            split_report.get("n_cells"),
+        "n_unknown_label":    split_report.get("n_unknown_label"),
+        "class_distribution": split_report.get("class_distribution"),
+        "rare_class_policy":  rare_class_policy,
+    }
+
+
 # ─── DRY metric helpers ───────────────────────────────────────────────────────
 
 def _smoke_metrics(y_true: List[int], y_pred: List[int]) -> Dict:
-    """Per-class and macro F1 for smoke type classification."""
-    from sklearn.metrics import classification_report
+    """
+    Full smoke-type multiclass metric set — macro-F1 is the primary
+    model-selection metric (see train.py's Phase 1 checkpoint selection),
+    but overall accuracy alone is misleading on an imbalanced 6-class
+    problem (a model that only ever predicts the majority class scores
+    well on accuracy while getting every minority class wrong), so this
+    always reports the full breakdown alongside it.
+    """
+    from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix
+
+    if len(y_true) == 0:
+        return {"n": 0, "note": "no labelled cells — metrics undefined"}
+
     report = classification_report(
         y_true, y_pred,
         labels       = list(range(N_SMOKE_CLASSES)),
@@ -37,11 +76,29 @@ def _smoke_metrics(y_true: List[int], y_pred: List[int]) -> Dict:
         output_dict  = True,
         zero_division= 0,
     )
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(N_SMOKE_CLASSES)))
+    cm_norm = cm.astype(float)
+    row_sums = cm_norm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm_norm, row_sums, out=np.zeros_like(cm_norm), where=row_sums != 0)
+
     return {
-        "accuracy":  round(report["accuracy"], 4),
-        "macro_f1":  round(report["macro avg"]["f1-score"], 4),
-        "per_class": {k: round(v["f1-score"], 4)
-                      for k, v in report.items() if k in SMOKE_TYPES.values()},
+        "n":               len(y_true),
+        "accuracy":        round(report["accuracy"], 4),
+        "balanced_accuracy": round(balanced_accuracy_score(y_true, y_pred), 4),
+        "macro_f1":        round(report["macro avg"]["f1-score"], 4),
+        "weighted_f1":      round(report["weighted avg"]["f1-score"], 4),
+        "per_class": {
+            k: {
+                "precision": round(v["precision"], 4),
+                "recall":    round(v["recall"], 4),
+                "f1":        round(v["f1-score"], 4),
+                "support":   int(v["support"]),
+            }
+            for k, v in report.items() if k in SMOKE_TYPES.values()
+        },
+        "confusion_matrix":            cm.tolist(),
+        "confusion_matrix_normalized": np.round(cm_norm, 4).tolist(),
+        "class_labels":                list(SMOKE_TYPES.values()),
     }
 
 
