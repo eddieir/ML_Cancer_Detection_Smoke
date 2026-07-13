@@ -240,25 +240,95 @@ verifies the final width against `model.input_dim`, and refuses to run raw
 input with no `preprocessing_artifact` unless `unsafe_legacy_mode=True` is
 explicitly set.
 
+**Full cross-task leakage validation.** The per-phase disjointness checks
+above only compared same-modality datasets (train cells vs. val cells, train
+bags vs. val bags) — a subject whose *cells* landed in train but whose *bag*
+landed in val (or vice versa) went undetected, and Phase 3 uses all four
+datasets together. `train.py::validate_experiment_partitions()` unions each
+split's cell-subject-ids and bag-subject-ids and requires the per-split
+unions to be pairwise disjoint (a subject appearing in both its own split's
+cell dataset and that same split's bag dataset is fine; only cross-split
+overlap raises), and `Trainer.phase3` now calls it in addition to the
+same-modality checks.
+
+**Held-out test evaluation is now enforced, not just documented.**
+`Trainer.final_test_evaluation()` previously relied on its docstring saying
+"call this once." It now tracks every subject seen by `_validate_train_val`
+across all phases on that `Trainer` instance and raises `ValueError` if any
+test subject was already used for train or validation; a second call raises
+`RuntimeError` by default (`allow_repeat=True` is required to deliberately
+re-run, and the resulting report is marked `is_pristine: False`). The report
+is written to its own `heldout_test_report.json` /
+`heldout_test_predictions.json` (separate from `evaluation_report.json`,
+which can also be produced from train/val data elsewhere) with explicit
+provenance: split name, held-out flag, checkpoint id, split-manifest path,
+threshold source, UTC timestamp, and run count.
+
+**Consistent macro-F1 between checkpoint selection and reporting.**
+`Trainer.phase1`'s checkpoint-selection metric used to call
+`f1_score(..., average="macro")` with no explicit label list — sklearn
+restricts averaging to classes *observed in that call* when `labels=None`,
+so a validation batch missing one smoke class silently computed macro-F1
+over 5 classes instead of 6, while `evaluate.py::_smoke_metrics` (which
+already passed an explicit label list) would report a different number for
+the same checkpoint. `src/metrics.py::multiclass_f1_report()` is now the one
+place "smoke-type macro-F1" is defined — explicit full class list, classes
+absent from the target set recorded and the result flagged `is_partial` —
+and both `Trainer.phase1` and `evaluate.py::_smoke_metrics` call it.
+
+**Cell-type IDs are now validated before every forward pass.**
+`inference._validate_h5ad()` used to check only that the cell-type column
+existed. `src/metrics.py::validate_cell_type_ids()` now checks length,
+rejects NaN/fractional values, and enforces `0 <= id < num_cell_types`,
+naming the actual bad values and the expected range; it's called by
+`Predictor.predict_subject()`, `Predictor.predict_h5ad()`, and
+`Trainer.predict()`.
+
+**Grouped K-fold no longer crashes on small class counts.**
+`grouped_kfold()`'s per-class fold assignment reset its index to 0 for every
+class bucket, so e.g. two subjects in two different classes could both be
+assigned fold 0 — leaving one fold with an empty training set and another
+with an empty validation set, hitting an `assert`. Fold assignment now uses
+one cursor shared across all class buckets, and the internal `assert`s were
+replaced with explicit `ValueError`/`RuntimeError` (data-dependent failures
+should never be silenced by `python -O`).
+
 **What this pass does *not* include** (explicitly out of scope, not
 silently skipped): a real training run against a held-out split (so there
 is no new "real held-out macro-F1" number to report — see the table above);
-a baseline-model comparison runner (logistic regression / random forest /
-XGBoost / small MLP vs. the neural model); a grouped-cross-validation
-experiment *runner* (the primitive `splitting.py::grouped_kfold` is
-leakage-tested and now reports per-fold class coverage/stratification, but
-no training loop consumes it yet); a hyperparameter-search runner; MIL
-pooling-baseline comparisons (mean/max pooling vs. gated attention) or
-attention-stability analysis; subject-aware/subject-capped sampling (class
-weights are now correctly computed from the train split only, but there is
-no per-epoch max-cells-per-subject sampler yet); explicit bulk-vs-single-
-cell-vs-MIL experiment-mode separation; species-provenance / cross-species-
-merge guards (GSE288003's mouse→human ortholog mapping still runs
-unconditionally, with no recorded mapped/unmapped gene counts); probability
-calibration / validation-selected threshold tooling (the model still
-reports risk at a fixed 0.70 cutoff in `train.py::predict` and
-`inference.py`, which is **not** a clinically validated threshold — treat
-it as an arbitrary placeholder). Each of these is a legitimate,
+the full raw-count→model-ready input-stage inference contract (species
+validation, gene-ID harmonization, library-size normalization, and log
+transform reproduced from scratch for genuinely raw counts — `predict_h5ad`
+still only reorders/subsets/scales via the fitted artifact, which assumes
+the input is already normalized/log-transformed the same way training data
+was); an `ExperimentContext`/`Trainer.from_experiment_data()` that wires
+pipeline output into a Trainer automatically (metadata fields like
+`split_manifest_path` are still set manually after construction); checkpoint
+checksum verification and full resume support (optimizer/scheduler/
+early-stopper state is not yet saved or restorable); a baseline-model
+comparison runner (logistic regression / random forest / XGBoost / small MLP
+vs. the neural model); a grouped-cross-validation experiment *runner* (the
+primitive `splitting.py::grouped_kfold` is leakage-tested, including the
+small-class-count fix above, but no training loop consumes it yet); a
+hyperparameter-search runner; MIL pooling-baseline comparisons (mean/max
+pooling vs. gated attention) or attention-stability analysis;
+subject-aware/subject-capped sampling (class weights are now correctly
+computed from the train split only, but there is no per-epoch
+max-cells-per-subject sampler yet); explicit bulk-vs-single-cell-vs-MIL
+experiment-mode separation; species-provenance / cross-species-merge guards
+(GSE288003's mouse→human ortholog mapping still runs unconditionally, with
+no recorded mapped/unmapped gene counts); an effective contiguous label
+space (the rare-class policy changes which smoke labels are used, but
+`num_smoke_types` and the model's output width are still fixed at 6 — a
+merge/exclusion policy does not yet shrink the model's output space);
+probability calibration / validation-selected threshold tooling (the model
+still reports risk at a fixed 0.70 cutoff in `train.py::predict` and
+`inference.py`, which is **not** a clinically validated threshold — treat it
+as an arbitrary placeholder; `final_test_evaluation`'s provenance honestly
+records `threshold_source: "default_0.50"` rather than claiming a
+validation-selected threshold that doesn't exist); dose-response head
+supervision gating (the head still runs unconditionally regardless of how
+many real dose labels are present). Each of these is a legitimate,
 separately-scoped follow-up, not an oversight.
 
 **No clinical claim.** Nothing in this repository has been clinically
@@ -330,7 +400,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (152 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_evaluate.py`, `test_inference.py` |
+| `tests/*` | All modules covered (176 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_evaluate.py`, `test_inference.py` |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |

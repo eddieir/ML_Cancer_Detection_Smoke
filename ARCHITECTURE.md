@@ -550,6 +550,48 @@ section; summarized here for architectural completeness:
    applies the fitted `PreprocessingArtifact` (or requires an explicit
    `already_preprocessed=True` declaration with exact gene-order
    verification) before every forward pass.
+7. **Cross-task leakage validation was incomplete**: the per-phase checks in
+   point 1 only compare same-modality datasets (train cells vs. val cells,
+   train bags vs. val bags), missing a subject whose cells are in train but
+   whose bag is in val (or vice versa) — a real path Phase 3 exercises since
+   it uses all four datasets jointly. `train.py::validate_experiment_partitions()`
+   now checks this directly and `Trainer.phase3` calls it.
+8. **Held-out test evaluation was enforced only by docstring.**
+   `Trainer.final_test_evaluation()` now tracks every subject seen during
+   training/validation on that `Trainer` and raises if a test subject
+   overlaps them, blocks a second call by default (`allow_repeat=True`
+   required, and the result is marked non-pristine), and writes a separate
+   `heldout_test_report.json`/`heldout_test_predictions.json` with explicit
+   provenance (manifest path, checkpoint id, threshold source, timestamp,
+   run count) rather than relying on `evaluation_report.json`'s shared path.
+9. **Checkpoint-selection macro-F1 and reported macro-F1 could silently
+   disagree.** `Trainer.phase1` computed its selection metric with
+   `f1_score(..., average="macro")` and no explicit label list, which
+   restricts averaging to classes observed in that validation batch;
+   `evaluate.py` already passed an explicit label list. `src/metrics.py`
+   now defines this once (`multiclass_f1_report`, flags `is_partial` when a
+   class had zero true examples) and both call sites use it.
+10. **Cell-type IDs were never validated**, only checked for column
+    presence. `metrics.py::validate_cell_type_ids()` enforces
+    `0 <= id < num_cell_types`, integer-valued, no NaN, correct length —
+    used by `Predictor.predict_subject/predict_h5ad` and `Trainer.predict`.
+11. **`grouped_kfold` could crash on small class counts**: independently
+    resetting a fold-index counter per class bucket meant two subjects in
+    two different classes could collide on fold 0, leaving another fold
+    with an empty train or validation set. Fold assignment now uses one
+    cursor shared across all class buckets.
+
+Not yet done, tracked in README's "What this pass does not include": the
+full raw-count preprocessing chain reproduced inside `predict_h5ad` (species/
+gene-ID/normalization steps, vs. today's reorder+scale-only via the fitted
+artifact); an `ExperimentContext`/`Trainer.from_experiment_data()`
+auto-wiring pipeline output into a Trainer; checkpoint checksum verification
+and optimizer/scheduler resume; an effective contiguous label space (the
+model's output width still doesn't shrink when a rare-class policy merges or
+excludes classes); baseline/grouped-CV/MIL-comparison experiment runners;
+subject-aware sampling; bulk/single-cell/MIL mode separation; species/
+ortholog-mapping safety; validation-selected threshold/calibration tooling;
+dose-head supervision gating.
 
 None of these are architecture changes — Stages 1–6 as specified above are
 unchanged. They are pipeline-around-the-architecture fixes that any real
