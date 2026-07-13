@@ -63,6 +63,7 @@ def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
     adata.obs["is_pseudo_bulk"]  = is_pseudo_bulk
     adata.obs["subject_id"]      = subject_id_series.values
     adata.obs["malignancy"]      = 0.0          # overwritten by labellers.py
+    adata.obs["malignancy_known"] = False       # True only where a real label exists (see labellers.py)
     adata.obs["cell_type_id"]    = 0            # overwritten by transforms.py
     adata.obs["exposure_dose"]   = DOSE_UNKNOWN # no wired source currently supplies a real dose (see DoseResponseHead)
     return adata
@@ -120,10 +121,11 @@ def load_microarray(csv_path: str, smoke_type: str) -> ad.AnnData:
             print(f"[loader] microarray  {n_over} samples relabelled from {meta_path.name}")
 
         if "malignancy" in meta.columns:
-            adata.obs["malignancy"] = (
-                adata.obs_names.map(meta["malignancy"]).fillna(0.0).astype(np.float32).values
-            )
-            print(f"[loader] microarray  malignancy labels loaded from {meta_path.name}")
+            mapped = adata.obs_names.to_series().map(meta["malignancy"])
+            adata.obs["malignancy"] = mapped.fillna(0.0).astype(np.float32).values
+            adata.obs["malignancy_known"] = mapped.notna().values
+            print(f"[loader] microarray  malignancy labels loaded from {meta_path.name}  "
+                  f"({int(mapped.notna().sum())}/{adata.n_obs} samples have a real label)")
 
         if "subject_id" in meta.columns:
             override = adata.obs_names.to_series().map(meta["subject_id"])

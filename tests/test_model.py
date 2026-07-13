@@ -109,6 +109,45 @@ def test_multi_task_loss_all_three_modes_are_differentiable():
     assert set(d3) == {"total", "smoke", "malignancy", "subject"}
 
 
+def test_malignancy_loss_ignores_unknown_cells():
+    """Cells with malig_known=False must contribute zero gradient signal to
+    the malignancy loss — they carry a 0.0 placeholder, not a real label."""
+    loss_fn = MultiTaskLoss()
+    malig_preds = torch.rand(10, 1)
+    malig_targets = torch.zeros(10)          # all placeholder negatives
+    known_mask = torch.zeros(10, dtype=torch.bool)   # none actually known
+    loss = loss_fn._lm(malig_preds, malig_targets, known_mask)
+    assert loss.item() == 0.0
+
+
+def test_malignancy_loss_uses_only_known_cells():
+    loss_fn = MultiTaskLoss()
+    torch.manual_seed(0)
+    malig_preds = torch.rand(6, 1, requires_grad=True)
+    malig_targets = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    known_mask = torch.tensor([True, True, False, False, False, False])
+
+    full_loss = loss_fn.bce(malig_preds.view(-1)[:2], malig_targets[:2])
+    masked_loss = loss_fn._lm(malig_preds, malig_targets, known_mask)
+    assert torch.allclose(full_loss, masked_loss)
+    masked_loss.backward()
+    assert malig_preds.grad is not None
+
+
+def test_cell_level_loss_with_no_known_malignancy_is_differentiable_zero_malig_term():
+    model = _model()
+    x = torch.randn(6, GENES)
+    _, logits, malig = model.forward_cell(x)
+    smoke_t = torch.randint(0, N_SMOKE_CLASSES, (6,))
+    malig_t = torch.zeros(6)
+    known = torch.zeros(6, dtype=torch.bool)
+
+    loss_fn = MultiTaskLoss()
+    total, stats = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=known)
+    assert stats["malignancy"] == 0.0
+    assert total.requires_grad
+
+
 def test_dose_response_loss_ignores_unknown_doses():
     loss_fn = MultiTaskLoss()
     dose_pred = torch.rand(10, 1)

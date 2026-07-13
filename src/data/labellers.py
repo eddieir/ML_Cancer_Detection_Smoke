@@ -61,16 +61,36 @@ def add_malignancy_labels(
     Assign per-cell malignancy labels.
     Priority: tumor_barcodes list > values a loader already set in obs
     (e.g. TCGA tumor/NAT via convert_tcga's samples_meta.csv) > 0.0 default.
+
+    0.0 is used as a numeric placeholder for cells with no real malignancy
+    label, but it is NOT a verified-normal call — malignancy_known marks
+    which cells actually carry ground truth (tumor_barcodes match, or a
+    loader-set per-sample label such as TCGA tumor/NAT) versus which are
+    just filled with the placeholder so the array has a value everywhere.
+    MultiTaskLoss must mask its BCE loss to malignancy_known cells only
+    (see model.py::MultiTaskLoss._lm), otherwise every unlabelled cell
+    silently trains the model to say "not malignant".
     """
     if "malignancy" not in adata.obs.columns:
         adata.obs["malignancy"] = 0.0
+    if "malignancy_known" not in adata.obs.columns:
+        adata.obs["malignancy_known"] = False
 
     if tumor_barcodes:
         mask = adata.obs_names.isin(set(tumor_barcodes))
         adata.obs.loc[mask, "malignancy"] = 1.0
-        print(f"[label] malignancy  {mask.sum():,} tumor cells set to 1.0")
+        adata.obs.loc[mask, "malignancy_known"] = True
+        print(f"[label] malignancy  {mask.sum():,} tumor cells set to 1.0 (known)")
 
-    adata.obs["malignancy"] = adata.obs["malignancy"].astype(np.float32)
+    adata.obs["malignancy"]       = adata.obs["malignancy"].astype(np.float32)
+    adata.obs["malignancy_known"] = adata.obs["malignancy_known"].astype(bool)
+
+    known = adata.obs["malignancy_known"]
+    n_pos = int((known & (adata.obs["malignancy"] == 1.0)).sum())
+    n_neg = int((known & (adata.obs["malignancy"] == 0.0)).sum())
+    n_unk = int((~known).sum())
+    print(f"[label] malignancy  known_positive={n_pos:,}  known_negative={n_neg:,}  "
+          f"unknown={n_unk:,}")
     return adata
 
 

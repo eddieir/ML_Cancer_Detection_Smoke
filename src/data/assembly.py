@@ -98,6 +98,11 @@ def assemble_subject_bags(
             "cell_type_ids":      adata.obs["cell_type_id"].values[mask].astype(int),
             "smoke_labels":       adata.obs["smoke_type"].values[mask].astype(int),
             "malig_labels":       adata.obs["malignancy"].values[mask].astype(np.float32),
+            "malig_known":        (
+                adata.obs["malignancy_known"].values[mask].astype(bool)
+                if "malignancy_known" in adata.obs.columns
+                else np.zeros(mask.sum(), dtype=bool)
+            ),
             "cancer_label":       outcome if known else None,
             "cancer_label_known": known,
         })
@@ -122,6 +127,9 @@ def export_cell_dataset(
     X     = np.array(adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray(), dtype=np.float32)
     smoke = adata.obs["smoke_type"].values.astype(np.int64)
     malig = adata.obs["malignancy"].values.astype(np.float32)
+    malig_known = (adata.obs["malignancy_known"].values.astype(bool)
+                   if "malignancy_known" in adata.obs.columns
+                   else np.zeros(X.shape[0], dtype=bool))
     ctype = adata.obs["cell_type_id"].values.astype(np.int64)
     dose  = (adata.obs["exposure_dose"].values.astype(np.float32)
              if "exposure_dose" in adata.obs.columns
@@ -130,15 +138,21 @@ def export_cell_dataset(
     np.save(out / "gene_matrix.npy",       X)
     np.save(out / "smoke_labels.npy",      smoke)
     np.save(out / "malignancy_labels.npy", malig)
+    np.save(out / "malignancy_known.npy",  malig_known)
     np.save(out / "cell_type_ids.npy",     ctype)
     np.save(out / "exposure_dose.npy",     dose)
     adata.obs.to_csv(out / "cell_metadata.csv")
     adata.var.to_csv(out / "gene_list.csv")
 
     n_known = int((dose >= 0).sum())
+    n_malig_known_pos = int((malig_known & (malig == 1.0)).sum())
+    n_malig_known_neg = int((malig_known & (malig == 0.0)).sum())
+    n_malig_unknown   = int((~malig_known).sum())
     print(f"[assembly] export  {X.shape[0]:,} x {X.shape[1]} → {out}/")
     print(f"           smoke   {dict((i, int((smoke==i).sum())) for i in range(6))}")
-    print(f"           malig   {malig.mean():.2%} positive")
+    print(f"           malig   known_positive={n_malig_known_pos:,}  "
+          f"known_negative={n_malig_known_neg:,}  unknown={n_malig_unknown:,}")
     print(f"           dose    {n_known:,} cells with known exposure duration")
     return {"gene_matrix": X, "smoke_labels": smoke,
-            "malignancy_labels": malig, "cell_type_ids": ctype, "exposure_dose": dose}
+            "malignancy_labels": malig, "malignancy_known": malig_known,
+            "cell_type_ids": ctype, "exposure_dose": dose}

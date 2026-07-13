@@ -69,6 +69,26 @@ def test_add_malignancy_labels_defaults_to_zero_without_barcodes():
     assert (out.obs["malignancy"] == 0.0).all()
 
 
+def test_add_malignancy_labels_marks_known_and_unknown():
+    from data.labellers import add_malignancy_labels
+    n = 5
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(n)])
+    adata = ad.AnnData(X=np.zeros((n, 2), dtype="float32"), obs=obs,
+                        var=pd.DataFrame(index=["G1", "G2"]))
+    out = add_malignancy_labels(adata, tumor_barcodes=["c0", "c2"])
+    assert out.obs["malignancy_known"].tolist() == [True, False, True, False, False]
+
+
+def test_add_malignancy_labels_without_barcodes_is_entirely_unknown():
+    from data.labellers import add_malignancy_labels
+    n = 3
+    adata = ad.AnnData(X=np.zeros((n, 2), dtype="float32"),
+                        obs=pd.DataFrame(index=[f"c{i}" for i in range(n)]),
+                        var=pd.DataFrame(index=["G1", "G2"]))
+    out = add_malignancy_labels(adata, tumor_barcodes=None)
+    assert (out.obs["malignancy_known"] == False).all()  # noqa: E712 — pandas needs elementwise ==
+
+
 def test_add_malignancy_labels_preserves_existing_labels():
     """TCGA-style: malignancy already set per-sample by the loader — don't overwrite it."""
     from data.labellers import add_malignancy_labels

@@ -50,10 +50,20 @@ def _binary_metrics(
     y_prob:    List[float],
     threshold: float = 0.5,
 ) -> Dict:
-    """ROC-AUC, PR-AUC, sensitivity, specificity for any binary task."""
+    """
+    ROC-AUC, PR-AUC, sensitivity, specificity for any binary task.
+    Gracefully handles empty input and single-class targets by returning
+    None for undefined metrics rather than a misleading number — callers
+    must not substitute a default like 0.5 or 1.0 in place of None.
+    """
     from sklearn.metrics import (
         roc_auc_score, average_precision_score, confusion_matrix
     )
+    n = len(y_true)
+    if n == 0:
+        return {"roc_auc": None, "pr_auc": None, "sensitivity": None,
+                "specificity": None, "threshold": threshold, "n": 0,
+                "note": "no known labels — metrics undefined"}
     has_both = len(set(y_true)) > 1
     y_pred   = [1 if p >= threshold else 0 for p in y_prob]
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
@@ -63,6 +73,8 @@ def _binary_metrics(
         "sensitivity": round(tp / (tp + fn), 4) if (tp + fn) > 0 else None,
         "specificity": round(tn / (tn + fp), 4) if (tn + fp) > 0 else None,
         "threshold":   threshold,
+        "n":           n,
+        "note":        None if has_both else "single-class target — ROC/PR-AUC undefined",
     }
 
 
@@ -127,7 +139,7 @@ class Evaluator:
     ) -> Dict:
         """Single forward pass over cell_dataset — shared by cell_level() and full_report()."""
         smoke_preds, smoke_true = [], []
-        malig_probs, malig_true = [], []
+        malig_probs, malig_true, malig_known = [], [], []
 
         self.model.eval()
         with torch.no_grad():
@@ -137,11 +149,28 @@ class Evaluator:
                 smoke_true.extend(batch["smoke_label"].tolist())
                 malig_probs.extend(malig.squeeze().cpu().tolist())
                 malig_true.extend(batch["malignancy_label"].tolist())
+                malig_known.extend(batch["malignancy_known"].tolist())
 
         return {
             "smoke_pred": smoke_preds, "smoke_true": smoke_true,
-            "malig_prob": malig_probs, "malig_true": malig_true,
+            "malig_prob": malig_probs, "malig_true": malig_true, "malig_known": malig_known,
         }
+
+    @staticmethod
+    def _known_malignancy_metrics(p: Dict) -> Dict:
+        """
+        Restrict malignancy metrics to cells with a real label — cells
+        stamped with the 0.0 placeholder (unknown) are not verified-normal
+        and must not count as evidence the model correctly predicted "not
+        malignant" (see labellers.py::add_malignancy_labels).
+        """
+        known_true = [t for t, k in zip(p["malig_true"], p["malig_known"]) if k]
+        known_prob = [pr for pr, k in zip(p["malig_prob"], p["malig_known"]) if k]
+        metrics = _binary_metrics(known_true, known_prob, threshold=0.5)
+        metrics["n_known_positive"] = int(sum(t == 1.0 for t in known_true))
+        metrics["n_known_negative"] = int(sum(t == 0.0 for t in known_true))
+        metrics["n_unknown"] = len(p["malig_true"]) - len(known_true)
+        return metrics
 
     def cell_level(
         self,
@@ -153,7 +182,7 @@ class Evaluator:
         return {
             "n_cells":    len(p["smoke_true"]),
             "smoke_type": _smoke_metrics(p["smoke_true"], p["smoke_pred"]),
-            "malignancy": _binary_metrics(p["malig_true"], p["malig_prob"], threshold=0.5),
+            "malignancy": self._known_malignancy_metrics(p),
         }
 
     # ── Subject-level ─────────────────────────────────────────────────────────
@@ -214,7 +243,7 @@ class Evaluator:
             "cell_level": {
                 "n_cells":    len(cell_preds["smoke_true"]),
                 "smoke_type": _smoke_metrics(cell_preds["smoke_true"], cell_preds["smoke_pred"]),
-                "malignancy": _binary_metrics(cell_preds["malig_true"], cell_preds["malig_prob"], threshold=0.5),
+                "malignancy": self._known_malignancy_metrics(cell_preds),
             },
             "subject_level":    self._subject_metrics_from_records(records, threshold),
             "interpretability": self._interpretability_from_records(records),

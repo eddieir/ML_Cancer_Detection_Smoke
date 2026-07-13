@@ -304,7 +304,26 @@ class MultiTaskLoss(nn.Module):
         self.mse  = nn.MSELoss()
 
     def _ls (self, logits, targets): return self.ce (logits, targets)
-    def _lm (self, preds,  targets): return self.bce(preds.view(-1),  targets.float())
+
+    def _lm(self, preds, targets, known_mask=None):
+        """
+        BCE for malignancy, optionally restricted to cells with a REAL label.
+        Cells with no verified malignancy call are stamped 0.0 as a numeric
+        placeholder (see labellers.py::add_malignancy_labels) — training
+        against that placeholder as if it were a confirmed negative would
+        teach the model "everything is benign unless proven otherwise",
+        which is not a label anyone actually assigned. known_mask=None
+        preserves the old unmasked behaviour for callers (tests, the
+        model.py smoke test) that pass fully-synthetic, fully-known labels.
+        """
+        preds, targets = preds.view(-1), targets.float().view(-1)
+        if known_mask is not None:
+            known_mask = known_mask.view(-1).bool()
+            if known_mask.sum() == 0:
+                return preds.sum() * 0.0
+            preds, targets = preds[known_mask], targets[known_mask]
+        return self.bce(preds, targets)
+
     def _lsb(self, prob,   target) : return self.bce(prob.view(-1),   target.view(-1).float())
 
     def dose_response_loss(
@@ -355,8 +374,10 @@ class MultiTaskLoss(nn.Module):
         self,
         smoke_logits: torch.Tensor, smoke_targets: torch.Tensor,
         malig_preds:  torch.Tensor, malig_targets: torch.Tensor,
+        malig_known:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        ls, lm = self._ls(smoke_logits, smoke_targets), self._lm(malig_preds, malig_targets)
+        ls = self._ls(smoke_logits, smoke_targets)
+        lm = self._lm(malig_preds, malig_targets, malig_known)
         total  = self.λs * ls + self.λm * lm
         return total, {"total": total.item(), "smoke": ls.item(), "malignancy": lm.item()}
 
@@ -372,10 +393,11 @@ class MultiTaskLoss(nn.Module):
         smoke_logits: torch.Tensor, smoke_targets: torch.Tensor,
         malig_preds:  torch.Tensor, malig_targets: torch.Tensor,
         cancer_prob:  torch.Tensor, cancer_target: torch.Tensor,
+        malig_known:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         ls, lm, lsb = (
             self._ls (smoke_logits, smoke_targets),
-            self._lm (malig_preds,  malig_targets),
+            self._lm (malig_preds,  malig_targets, malig_known),
             self._lsb(cancer_prob,  cancer_target),
         )
         total = self.λs * ls + self.λm * lm + self.λsb * lsb

@@ -35,6 +35,7 @@ class CellLevelDataset(Dataset):
         malignancy_labels: np.ndarray,              # [N]         float32
         cell_type_ids:     np.ndarray,              # [N]         int64
         exposure_dose:     Optional[np.ndarray] = None,  # [N]  float32, DOSE_UNKNOWN if absent
+        malignancy_known:  Optional[np.ndarray] = None,  # [N]  bool, False if absent (see labellers.py)
     ):
         self.X     = torch.FloatTensor(gene_matrix)
         self.smoke = torch.LongTensor(smoke_labels)
@@ -44,6 +45,10 @@ class CellLevelDataset(Dataset):
             exposure_dose if exposure_dose is not None
             else np.full(len(gene_matrix), DOSE_UNKNOWN, dtype=np.float32)
         )
+        self.malig_known = torch.BoolTensor(
+            malignancy_known if malignancy_known is not None
+            else np.zeros(len(gene_matrix), dtype=bool)
+        )
 
     def __len__(self):  return len(self.X)
 
@@ -52,6 +57,7 @@ class CellLevelDataset(Dataset):
             "x":               self.X[idx],
             "smoke_label":     self.smoke[idx],
             "malignancy_label":self.malig[idx],
+            "malignancy_known": self.malig_known[idx],
             "cell_type_id":    self.ctype[idx],
             "exposure_dose":   self.dose[idx],
         }
@@ -61,12 +67,14 @@ class CellLevelDataset(Dataset):
         """Load directly from the directory written by export_cell_dataset()."""
         d = Path(processed_dir)
         dose_path = d / "exposure_dose.npy"
+        malig_known_path = d / "malignancy_known.npy"
         return cls(
             gene_matrix       = np.load(d / "gene_matrix.npy"),
             smoke_labels      = np.load(d / "smoke_labels.npy"),
             malignancy_labels = np.load(d / "malignancy_labels.npy"),
             cell_type_ids     = np.load(d / "cell_type_ids.npy"),
             exposure_dose     = np.load(dose_path) if dose_path.exists() else None,
+            malignancy_known  = np.load(malig_known_path) if malig_known_path.exists() else None,
         )
 
     def smoke_class_weights(self, num_classes: int = N_SMOKE_CLASSES) -> torch.Tensor:
@@ -129,11 +137,14 @@ class SubjectLevelDataset(Dataset):
                 "included in a SubjectLevelDataset — construct with "
                 "require_known_outcome=True (the default) to exclude it."
             )
+        n = len(b["malig_labels"])
+        malig_known = b.get("malig_known")
         return {
             "gene_matrix":   torch.FloatTensor(b["gene_matrix"]),
             "cell_type_ids": torch.LongTensor(b["cell_type_ids"]),
             "smoke_labels":  torch.LongTensor(b["smoke_labels"]),
             "malig_labels":  torch.FloatTensor(b["malig_labels"]),
+            "malig_known":   torch.BoolTensor(malig_known if malig_known is not None else np.zeros(n, dtype=bool)),
             "cancer_label":  torch.FloatTensor([cancer_label]),
             "subject_id":    b["subject_id"],
         }
@@ -351,9 +362,10 @@ class Trainer:
                 x      = batch["x"].to(self.device)
                 smoke_t= batch["smoke_label"].to(self.device)
                 malig_t= batch["malignancy_label"].to(self.device)
+                malig_k= batch["malignancy_known"].to(self.device)
                 dose_t = batch["exposure_dose"].to(self.device)
                 z, logits, malig = self.model.forward_cell(x)
-                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t)
+                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k)
                 dose_loss, _ = loss_fn.dose_response_loss(self.model.dose_head(z), dose_t, malig)
                 self._grad_step(loss + lambda_dose * dose_loss, opt, params)
             sched.step()
@@ -507,8 +519,9 @@ class Trainer:
                     x      = cb["x"].to(self.device)
                     smoke_t= cb["smoke_label"].to(self.device)
                     malig_t= cb["malignancy_label"].to(self.device)
+                    malig_k= cb["malignancy_known"].to(self.device)
                     _, logits, malig = self.model.forward_cell(x)
-                    cl, _  = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t)
+                    cl, _  = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k)
                     loss   = loss + cl * 0.5
                 except StopIteration:
                     pass
