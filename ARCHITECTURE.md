@@ -667,3 +667,28 @@ section; architectural summary here:
   built to raise on a second call, structurally preventing the
   fit-calibration-then-peek-then-refit pattern that would invalidate a test
   evaluation.
+
+A second pass on this same branch fixed a fold-level leakage bug of the same
+character as §11's whole-dataset-scaling fix, one level deeper: grouped CV
+was reusing the context's OUTER `PreprocessingArtifact` (fit on ALL
+original-train subjects) across every fold, so an inner-CV-validation
+subject's expression had already influenced the scaling/HVG selection it was
+then evaluated against. `benchmarks/fold_preprocessing.py` now refits a
+fresh artifact per fold from `context.normalized_adata_for_refit` (the
+pre-HVG, pre-scaling normalized expression `run_pipeline_split_aware()`
+captures before its own `fit_preprocessing` call), using only that fold's
+training subjects — and the same fold-specific cell/bag datasets fixed a
+matching cross-task leak where cancer-CV's MIL encoder pretraining used to
+always see the OUTER train/val split regardless of the actual CV fold.
+Ground-truth malignancy labels were removed as a Task B feature (a real
+outcome-proxy risk for sources like TCGA); leave-one-source-out now refits
+per held-out source and defaults undeclared source metadata to
+`NOT_COMPARABLE`; a single-class training fold (expected in small CV folds)
+no longer crashes a baseline or silently mis-indexes `predict_proba`'s
+positive-class column (`baselines.py::positive_class_proba` maps via
+`classes_`); logistic regression and the small MLP fit a `StandardScaler`
+scoped to each call's own data; and statistical comparison now reports a
+seed-level bootstrap CI (independent samples) alongside the descriptive
+fold-level one (overlapping, not independent) that `summarize_comparison`
+actually requires before calling a model "meaningfully better". Full list of
+what's fixed vs. still open: README's Benchmarking framework section.

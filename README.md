@@ -479,16 +479,57 @@ synthetic run is stamped `synthetic: true` and the report opens with a
 "validates software only" warning so it can never be mistaken for a
 real-data result.
 
-**Known Phase 1 limitations** (see `report.md`'s own limitations section for
-the same list, generated fresh per run): grouped CV reuses the
-`ExperimentContext`'s already train-fit `PreprocessingArtifact` rather than
-refitting HVG/scaling independently inside each fold (safe — the artifact
-was fit on the *original* train split, a subset of every fold's train
-partition — but not the fully independent per-fold refit the ideal protocol
-calls for); the final frozen-threshold test evaluation is wired for baseline
+**Fixed since the first Phase 1 pass** (a real, previously-undiscovered
+leakage bug, not a style change): grouped CV used to reuse the
+`ExperimentContext`'s outer `PreprocessingArtifact` — fit once on ALL
+original-train subjects — across every fold. Any original-train subject that
+became an *inner* CV validation subject had therefore already influenced the
+gene-scaling means/stds and HVG selection it was then "held out" against.
+CV now refits a fresh `PreprocessingArtifact` per fold, per seed, from
+`context.normalized_adata_for_refit` (the pre-HVG, pre-scaling normalized
+expression `run_pipeline_split_aware()` now captures), using only that
+fold's own training subjects — see
+[fold_preprocessing.py](src/benchmarks/fold_preprocessing.py). The same
+per-fold cell/bag datasets fixed a second leak: cancer-task MIL encoder
+pretraining used to always use the OUTER train/val cell split regardless of
+which subjects were in a given cancer-CV fold, so a fold's own validation
+subjects could appear in Phase 1 encoder training. Leave-one-source-out
+similarly now refits preprocessing using only the remaining-source training
+subjects, and defaults an unlabeled source's species/semantics compatibility
+to `NOT_COMPARABLE` rather than assuming it's fine. Ground-truth malignancy
+labels are no longer a Task B feature (they can proxy the cancer outcome
+directly for outcome-linked sources) — the only sanctioned path back in is a
+validated out-of-fold prediction (`features.py::validate_oof_predictions`).
+Logistic regression and the small MLP now fit a `StandardScaler` inside a
+`Pipeline`, scoped to whatever data each fold passes in. A single-class
+training fold (an expected outcome of small grouped-CV folds, not a bug) no
+longer crashes baselines outright or silently mis-indexes `predict_proba`'s
+positive-class column. Statistical comparison now reports two confidence
+intervals: a fold-level one (folds from repeated seeds over the same subject
+pool overlap and aren't independent — descriptive only) and a seed-level one
+(bootstraps independent per-seed means — the one `summarize_comparison`
+actually requires to call a model "meaningfully better").
+
+**Known Phase 1 limitations remaining** (see `report.md`'s own limitations
+section for the same list, generated fresh per run): the declared
+hyperparameter search spaces (`baselines.py`'s `SMOKE_SEARCH_SPACE`/
+`CANCER_SEARCH_SPACE`) are not yet wired into a nested-CV selection loop —
+every baseline currently trains with its default hyperparameters only; Task
+A baselines run in subject-summary mode only (one feature vector per
+subject) — a true cell-level mode with per-subject cell capping
+(`features.py::cap_cells_per_subject`, already implemented but unused by the
+CV runner) is not wired in, so "cell-weighted" metrics for baselines are
+explicitly marked not-applicable rather than presented as real per-cell
+scores; the final frozen-threshold test evaluation is wired for baseline
 models only (the neural/MIL adapter isn't yet plugged into that same
-one-shot path); attention weights remain an interpretability aid, not a
-causal explanation, in every pooling variant.
+one-shot path); the immutable artifact directory does not yet contain every
+file the ideal schema calls for (per-model OOF prediction CSVs, a
+consolidated `hyperparameters.json`, a separate `preprocessing/` subdir) —
+what's written today (`run_manifest.json`, `eligibility.json`,
+`metrics/*_folds.{json,csv}`, `calibration/`, `comparisons.json`,
+`summary.json`, `report.md`) is real and complete for what it covers, just
+not the full target layout; attention weights remain an interpretability
+aid, not a causal explanation, in every pooling variant.
 
 ## Pipeline
 
@@ -548,7 +589,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (267 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 9 `test_benchmarks_*.py` files |
+| `tests/*` | All modules covered (288 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 10 `test_benchmarks_*.py` files |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -680,11 +721,13 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 - Wire the neural/MIL adapter into the same one-shot frozen-threshold final
   test evaluation path baselines already use (`benchmarks/runner.py::run_cancer_task`
   currently only does this for baseline models — a documented, not silent, gap)
-- Refit HVG/scaling independently inside each grouped-CV fold instead of
-  reusing the context's already train-fit `PreprocessingArtifact` — safe as
-  currently implemented (see the Benchmarking framework section's
-  limitations), but not the fully independent per-fold refit the ideal
-  protocol calls for
+- Wire the declared hyperparameter search spaces (`baselines.py`'s
+  `SMOKE_SEARCH_SPACE`/`CANCER_SEARCH_SPACE`) into an actual nested-grouped-CV
+  selection loop — every baseline currently trains with defaults only, the
+  search spaces are unused constants today
+- Implement true cell-mode Task A evaluation (fit baselines directly on
+  capped per-subject cells, not just subject-summary features) so
+  cell-weighted metrics stop being marked not-applicable for baselines
 - Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
   labels) and NLST (real cancer outcomes + cigar/dual-use history) — this
   also unblocks Task B eligibility on real data, not just the current
