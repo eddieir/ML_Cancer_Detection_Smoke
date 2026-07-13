@@ -115,3 +115,153 @@ def test_run_pipeline_split_aware_test_cells_do_not_affect_gene_scaling():
 
         assert artifact1.gene_means == artifact2.gene_means
         assert artifact1.gene_stds == artifact2.gene_stds
+
+
+def test_run_pipeline_split_aware_returns_explicit_disjoint_per_split_datasets():
+    """Section 5: explicit train/val/test cell datasets and bags, not just
+    one combined array the caller has to filter themselves."""
+    from preprocess import run_pipeline_split_aware
+    with tempfile.TemporaryDirectory() as tmp:
+        h5ad = str(Path(tmp) / "test.h5ad")
+        _synthetic_h5ad_consistent_labels(h5ad, n_subjects=15, cells_per_subject=20)
+        result = run_pipeline_split_aware({
+            "data": {
+                "scrna_sources": [(h5ad, "cigarette", "donor_id")],
+                "n_hvgs": 50,
+                "min_cells_per_subject": 5,
+                "out_dir": str(Path(tmp) / "processed"),
+            },
+            "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
+        })
+        for key in ("train_cell_dataset", "val_cell_dataset", "test_cell_dataset",
+                    "train_bags", "val_bags", "test_bags",
+                    "rare_class_report", "label_provenance_report",
+                    "transductive_batch_correction"):
+            assert key in result
+
+        manifest = result["split_manifest"]
+        train_ds, val_ds, test_ds = (
+            result["train_cell_dataset"], result["val_cell_dataset"], result["test_cell_dataset"]
+        )
+        assert set(train_ds.subject_ids.tolist()) <= set(manifest.train_subjects)
+        assert set(val_ds.subject_ids.tolist())   <= set(manifest.val_subjects)
+        assert set(test_ds.subject_ids.tolist())  <= set(manifest.test_subjects)
+        assert not (set(train_ds.subject_ids.tolist()) & set(val_ds.subject_ids.tolist()))
+        assert not (set(train_ds.subject_ids.tolist()) & set(test_ds.subject_ids.tolist()))
+        assert len(train_ds) + len(val_ds) + len(test_ds) == len(result["cell_data"]["gene_matrix"])
+
+        train_bag_subjects = {b["subject_id"] for b in result["train_bags"]}
+        test_bag_subjects  = {b["subject_id"] for b in result["test_bags"]}
+        assert not (train_bag_subjects & test_bag_subjects)
+
+        assert result["transductive_batch_correction"] is False  # strict mode is the default
+
+
+def test_run_pipeline_split_aware_batch_correction_skipped_by_default():
+    from preprocess import run_pipeline_split_aware
+    with tempfile.TemporaryDirectory() as tmp:
+        h5ad = str(Path(tmp) / "test.h5ad")
+        _synthetic_h5ad_consistent_labels(h5ad)
+        result = run_pipeline_split_aware({
+            "data": {
+                "scrna_sources": [(h5ad, "cigarette", "donor_id")],
+                "n_hvgs": 50,
+                "min_cells_per_subject": 5,
+                "out_dir": str(Path(tmp) / "processed"),
+            },
+            "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
+            # preprocessing.batch_correction.allow_transductive_harmony omitted -> defaults False
+        })
+        assert result["transductive_batch_correction"] is False
+
+
+def test_rare_class_policy_from_config_changes_effective_smoke_labels():
+    """Section 7: the YAML-configured rare-class policy must actually
+    reassign the class used for splitting/training, not just be available
+    as an unused utility."""
+    from preprocess import run_pipeline_split_aware
+    with tempfile.TemporaryDirectory() as tmp:
+        h5ad = str(Path(tmp) / "test.h5ad")
+        # 19 subjects of class 0, 1 subject of class 1 (a "rare" class).
+        _synthetic_h5ad_consistent_labels(h5ad, n_subjects=20, cells_per_subject=10, n_classes=1)
+        import anndata as ad_module
+        adata = ad_module.read_h5ad(h5ad)
+        # loaders.py::_attach_standard_obs derives the numeric smoke_type from
+        # smoke_type_name (not the raw numeric column) whenever that column is
+        # present, so the rare label has to be set via the name, not the id.
+        adata.obs["smoke_type_name"] = adata.obs["smoke_type_name"].astype(str)
+        rare_mask = adata.obs["donor_id"] == "sub_0"
+        adata.obs.loc[rare_mask, "smoke_type_name"] = "cigar"
+        adata.write_h5ad(h5ad)
+
+        cfg = {
+            "data": {
+                "scrna_sources": [(h5ad, "cigarette", "donor_id")],
+                "n_hvgs": 50,
+                "min_cells_per_subject": 5,
+                "out_dir": str(Path(tmp) / "processed"),
+            },
+            "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
+            "rare_class": {
+                "policy": "merge_into_dual_use_or_other",
+                "min_subjects_required": 3,
+                "target_classes": ["cigar"],
+            },
+        }
+        result = run_pipeline_split_aware(cfg)
+        assert result["rare_class_report"]["affected_classes"]["cigar"]["action"] == "merged_into_dual_use"
+
+        # The effective label actually used downstream (exported cell_metadata,
+        # bags, split) must reflect the merge — no cell should carry cigar (2)
+        # anymore, and smoke_type_raw must still show the original cigar label.
+        smoke_type = result["cell_data"]["smoke_labels"]
+        assert 2 not in smoke_type
+        import pandas as pd
+        meta = pd.read_csv(Path(tmp) / "processed" / "cell_metadata.csv")
+        assert (meta["smoke_type_raw"] == 2).sum() > 0
+        assert (meta["smoke_type"] == 2).sum() == 0
+
+
+def test_label_transfer_happens_before_split_changes_effective_class():
+    """Section 6 regression test: NLST label transfer must be applied
+    BEFORE the subject-level split is computed, so the split (and its
+    report) reflects the FINAL label, not the pre-transfer one."""
+    from preprocess import run_pipeline_split_aware
+    with tempfile.TemporaryDirectory() as tmp:
+        h5ad = str(Path(tmp) / "test.h5ad")
+        # All subjects start as class 0 (cigarette); NLST will relabel some to
+        # class 2 (cigar-only) or 5 (unexposed) via transfer_nlst_labels.
+        _synthetic_h5ad_consistent_labels(h5ad, n_subjects=12, cells_per_subject=20, n_classes=1)
+
+        nlst_csv = Path(tmp) / "nlst_screen.csv"
+        pd.DataFrame({
+            "pid": [f"sub_{i}" for i in range(6)],
+            "CIGAR":   [1, 1, 1, 0, 0, 0],
+            "CIGSMOK": [0, 0, 0, 0, 0, 0],
+        }).to_csv(nlst_csv, index=False)
+
+        cfg = {
+            "data": {
+                "scrna_sources": [(h5ad, "cigarette", "donor_id")],
+                "n_hvgs": 50,
+                "min_cells_per_subject": 5,
+                "out_dir": str(Path(tmp) / "processed"),
+                "nlst_csv": str(nlst_csv),
+            },
+            "split": {"seed": 1, "train_frac": 0.5, "val_frac": 0.25, "test_frac": 0.25},
+        }
+        result = run_pipeline_split_aware(cfg)
+        assert result["label_provenance_report"]["nlst_csv_used"] is True
+        assert result["label_provenance_report"]["n_subjects_matched"] == 6
+
+        # subjects sub_0..sub_2 (CIGAR=1) must have been relabelled to class 2
+        # (cigar) by the time the split report / effective label was computed.
+        manifest = result["split_manifest"]
+        report = manifest.report["splits"]
+        # class "2" (cigar, post-transfer) must appear SOMEWHERE in the split
+        # report's class_distribution — impossible if the split had been
+        # computed on the pre-transfer (all-class-0) label.
+        all_classes = set()
+        for split_report in report.values():
+            all_classes |= set(split_report["class_distribution"].keys())
+        assert "2" in all_classes
