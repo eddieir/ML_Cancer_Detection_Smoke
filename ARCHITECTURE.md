@@ -421,12 +421,19 @@ Stop:        Early stop if no improvement for 5 consecutive epochs
 ## 8. Evaluation Metrics
 
 ### Cell-level (Phase 1 validation)
-- Smoke type: macro-averaged F1 across 6 classes, per-class accuracy
-- Malignancy: ROC-AUC, precision-recall AUC
+- Smoke type: **macro-F1 is the primary model-selection metric** (not
+  accuracy — see §11), plus balanced accuracy, weighted-F1, per-class
+  precision/recall/F1/support, and raw + row-normalized confusion matrices
+  (`evaluate.py::_smoke_metrics`)
+- Malignancy: ROC-AUC, precision-recall AUC — computed only on cells with a
+  real (`malignancy_known=True`) label; see §11
 
 ### Subject-level (Phase 2 + 3 validation, primary)
 - ROC-AUC on cancer vs. no-cancer (main metric)
-- Sensitivity / specificity at threshold 0.70 (HIGH RISK cutoff)
+- Sensitivity / specificity at threshold 0.70 (HIGH RISK cutoff) — **this
+  0.70 cutoff is an arbitrary placeholder, not a clinically validated
+  threshold.** No calibration or validation-selected-threshold study has
+  been performed. Treat any HIGH/MODERATE/LOW risk_flag output the same way.
 - Calibration curve (predicted probability vs. observed frequency)
 
 ### Interpretability
@@ -471,3 +478,38 @@ TCGA-LUAD/LUSC (section 6) is wired end-to-end: `data/downloaders.py --tcga`
 samples supply per-cell malignancy labels (Stage 3B) and TCGA cases with a
 Primary Tumor sample count as subject-level cancer positives (Stage 6),
 merged with NLST outcomes in `preprocess.py::run_pipeline`.
+
+---
+
+## 11. Scientific Validity: Splitting, Leakage, and Label Provenance
+
+Everything in sections 1–10 above describes the model architecture and is
+unchanged. Separately, on branch `improve/valid-evaluation-and-training`,
+four correctness/leakage issues in the pipeline that fed that architecture
+were fixed. Full detail and rationale live in README.md's
+[Scientific rigor and known limitations](README.md#scientific-rigor-and-known-limitations)
+section; summarized here for architectural completeness:
+
+1. **No split existed at all before this pass.** Every reported result
+   (§8, the README results table) was computed by training and evaluating
+   on the same cells. `data/splitting.py` adds subject-grouped
+   train/val/test splitting and grouped K-fold CV, with reproducible
+   manifests and leakage tests — but no model has yet been retrained
+   against one of these splits on real data.
+2. **Preprocessing leakage**: gene scaling and HVG selection (Stage 1,
+   §3.1) were fit across the entire merged dataset, including cells that
+   should have been held out. `data/preprocessing.py` fits both on the
+   train split only via a versioned `PreprocessingArtifact`; Harmony batch
+   correction remains a documented exception (no train-only-fit mode
+   exists for it).
+3. **Unknown cancer outcomes were defaulted to 0** (cancer-negative)
+   instead of being excluded from Stage 6 supervision — fixed via
+   `cancer_label_known` and `train.py::check_mil_eligibility`.
+4. **Unknown malignancy labels were defaulted to 0.0** and trained against
+   directly in Stage 3B — fixed via a `malignancy_known` provenance mask
+   applied to `MultiTaskLoss`'s malignancy BCE term.
+
+None of these are architecture changes — Stages 1–6 as specified above are
+unchanged. They are pipeline-around-the-architecture fixes that any real
+reported metric must now go through for the metric to be scientifically
+valid.

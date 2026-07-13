@@ -79,19 +79,119 @@ harmonized to a common gene-symbol space (136 real samples total):
 isn't. The model has collapsed onto the two majority classes (cigarette=83
 samples, dual_use=30 samples) and has learned nothing for vape (7), cannabis
 (6), cigar (1), or unexposed (10) samples — each too small to learn from.
-Macro-F1 (0.27) is the metric that reflects this. This was also evaluated on
-the same data used for training, not a held-out set, so even these numbers
-are optimistic. **There is no subject-level cancer accuracy at all yet**:
-GSE994/GSE307690 are bulk RNA-seq (one expression vector per subject, not
-per cell), so the MIL attention aggregator — which needs many cells per
-subject to attend over — has zero usable bags.
+Macro-F1 (0.27) is the metric that reflects this. **This table is also a
+training-set evaluation, not held-out performance** — it predates the
+subject-level splitting work below, so the model was scored on data it was
+trained on. It is left in place, unaltered, as an honest record of what was
+actually measured at the time; it is not being re-labelled as validation or
+test performance retroactively, and no new real-data experiment has been run
+against a held-out split as of this update (see
+[Scientific rigor and known limitations](#scientific-rigor-and-known-limitations)).
+**There is no subject-level cancer accuracy at all yet**: GSE994/GSE307690
+are bulk RNA-seq (one expression vector per subject, not per cell), so the
+MIL attention aggregator — which needs many cells per subject to attend
+over — has zero usable bags.
 
 **What would change this**: real per-cell, per-subject data with hundreds of
-cells per subject. That means GSE136831 (312,928 real cells — conversion is
-in progress, see the streaming-parser note above) or TCGA (blocked until a
-GDC token is supplied). Both are prerequisites for any meaningful
-subject-level cancer prediction number; nothing before that point is a real
-model-quality result.
+cells per subject. That means GSE136831 (312,928 real cells) or TCGA
+(blocked until a GDC token is supplied). Both are prerequisites for any
+meaningful subject-level cancer prediction number; nothing before that point
+is a real model-quality result.
+
+## Scientific rigor and known limitations
+
+This section documents a set of correctness/leakage fixes made on top of the
+original pipeline, on branch `improve/valid-evaluation-and-training`, and is
+intentionally blunt about what is and isn't resolved.
+
+**Why macro-F1, not accuracy, is the primary smoke-type metric.** The 77.2%
+accuracy number above is a textbook example of why: a model that always
+predicts "cigarette" on this data would score close to that accuracy while
+having zero ability to distinguish any other class. Macro-F1 weights every
+class equally regardless of its size, so it can't be inflated by collapsing
+onto the majority class — see `train.py`'s Phase 1 checkpoint selection and
+`evaluate.py::_smoke_metrics`.
+
+**Subject-level splitting** (`src/data/splitting.py`, new). Every prior
+result in this repo — including the 77.2%/0.27 table above — was computed by
+training and evaluating on the same cells, with no subject held out at all.
+A subject's cells share genetic background and batch/technical variation, so
+even a naive train/test split *by cell* would leak: a model that's seen 80%
+of a subject's cells trivially recognizes the other 20%. `splitting.py` now
+provides `subject_train_val_test_split()` and `grouped_kfold()`, both
+grouped by `subject_id` with reproducible JSON manifests
+(`data/processed/split_manifest.json` by default, see `configs/default.yaml`'s
+`split:` block) and leakage assertions covered by 16 tests. **No model in
+this repo has yet been retrained/re-evaluated against one of these splits on
+real data** — the tooling is in place and tested; the experiment hasn't been
+run (would need a real training run, out of scope for this pass — see
+[Next steps](#next-steps)).
+
+**Unknown cancer outcomes are no longer treated as negative.**
+`assemble_subject_bags()` used to do `outcome_map.get(str(sid), 0)` — any
+subject never matched to an NLST/TCGA outcome silently became a fabricated
+cancer-negative. It now sets `cancer_label=None` /
+`cancer_label_known=False` for those subjects, logs known-positive/known-
+negative/unknown counts, and `SubjectLevelDataset` excludes unknown-outcome
+subjects from supervised training/evaluation by default. `train.py`'s new
+`check_mil_eligibility()` also refuses to run Phase 2/3 MIL training/eval
+when there aren't enough independent subjects or both outcome classes
+represented, instead of silently producing a meaningless AUC.
+
+**Unknown malignancy labels are no longer treated as verified-normal.**
+`add_malignancy_labels()` stamps cells with no real label with a 0.0
+placeholder so the array always has a value — but that placeholder was being
+used directly as a BCE training target, teaching the model "benign unless
+proven otherwise" from data nobody actually labelled. A `malignancy_known`
+provenance column (real for `tumor_barcodes` matches and loader-set per-
+sample labels like TCGA tumor/NAT, false otherwise) now masks the
+malignancy loss to known cells only, and `evaluate.py` restricts malignancy
+metrics to known cells and reports known-positive/known-negative/unknown
+counts instead of an AUC partly computed against fabricated labels.
+
+**Preprocessing leakage fix.** `merge_sources()` z-scored, and
+`smoke_aware_hvg()` selected highly-variable genes across, the *entire*
+merged dataset — before any split existed, so validation/test cells
+influenced which genes became features and how they were scaled.
+`src/data/preprocessing.py` adds a `PreprocessingArtifact` (versioned,
+JSON-serialisable) fit on train-split cells only
+(`fit_preprocessing`/`apply_preprocessing`), and
+`preprocess.py::run_pipeline_split_aware()` wires it end-to-end: split
+first, fit on train, apply unchanged to val/test. The original
+`run_pipeline()` is unchanged and still has this leakage — it's kept only
+for backward compatibility and synthetic smoke-testing, with an explicit
+warning in its docstring. **Batch correction (Harmony) is a documented
+exception that is *not* leakage-free**: Harmony has no train-only-fit /
+apply-to-new-data mode, so it is still fit across the full merged dataset
+even in the split-aware path — see `PreprocessingArtifact.notes`.
+
+**Rare smoke-type classes** (`src/data/rare_class.py`, new). The cigar class
+has ~1 independent subject in the real merged data — not enough to learn or
+evaluate as its own class by any reasonable statistical standard.
+`apply_rare_class_policy()` makes this an explicit, configurable, auditable
+decision (`keep_with_warning` / `merge_into_dual_use_or_other` /
+`exclude_from_training_and_evaluation`, set via `configs/default.yaml`'s
+`rare_class:` block) instead of a class that's silently never predicted.
+Raw labels are never mutated; every action is recorded in a report dict.
+
+**What this pass does *not* include** (explicitly out of scope, not
+silently skipped): a real training run against a held-out split (so there
+is no new "real held-out macro-F1" number to report — see the table above);
+a baseline-model comparison runner (logistic regression / random forest /
+XGBoost / small MLP vs. the neural model); a grouped-cross-validation
+experiment runner (the primitive exists in `splitting.py::grouped_kfold`,
+tested for leakage, but no training loop consumes it yet); a
+hyperparameter-search runner; MIL pooling-baseline comparisons or attention-
+stability analysis; probability calibration / validation-selected threshold
+tooling (the model still reports risk at a fixed 0.70 cutoff in
+`train.py::predict` and `inference.py`, which is **not** a clinically
+validated threshold — treat it as an arbitrary placeholder). Each of these
+is a legitimate, separately-scoped follow-up, not an oversight.
+
+**No clinical claim.** Nothing in this repository has been clinically
+validated. `P(cancer)` is a research-model output on unlabelled or
+approximately-labelled data; it is not a diagnostic and should not be
+treated as one.
 
 ## Novel contributions vs. literature
 
@@ -132,7 +232,10 @@ src/
     transforms.py      QC filtering, normalization, HVG selection, batch correction, cell typing
     labellers.py        smoke-type label transfer, malignancy labels, class weights
     assembly.py          merge sources, build MIL bags, export arrays
-  preprocess.py        orchestrates data/ into run_pipeline(config)
+    splitting.py          subject-level train/val/test split + grouped K-fold CV
+    preprocessing.py       leakage-free fit/transform preprocessing artifact
+    rare_class.py           configurable policy for statistically-too-small classes
+  preprocess.py        orchestrates data/ into run_pipeline(config) / run_pipeline_split_aware(config)
   model.py              MultiSmokeCancerNet (encoder, both heads, gated attention MIL)
   train.py                three-phase Trainer (cell-level, aggregator, end-to-end)
   evaluate.py             cell-level + subject-level metrics, interpretability report
@@ -154,7 +257,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (61 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py` |
+| `tests/*` | All modules covered (117 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_evaluate.py`, `test_inference.py` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |
 | Real data — GSE136831 (312,928 real cells) | Downloaded and converted with real per-cell donor IDs — not yet re-trained on, see [Next steps](#next-steps) |
@@ -276,12 +379,22 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Re-run `run_pipeline()` and Phase 1 training with GSE136831 now converted
-  (312,928 real cells, real per-cell donor IDs) — this is the first source
-  with enough real cells per subject to produce an actual subject-level
-  cancer-prediction number
-- Re-run smoke-type training with the inverse-frequency class weighting
-  (`CellLevelDataset.smoke_class_weights`, `train.py`) and confirm macro-F1
-  actually improves on real data, not just on the unit tests
+- Run `preprocess.py::run_pipeline_split_aware()` on the real merged data
+  (GSE994 + GSE307690 + GSE123352 + GSE136831 once re-converted), then
+  actually train against the resulting split and report real held-out
+  macro-F1/balanced-accuracy/per-class-F1 — the tooling exists and is
+  tested; this experiment has not been run yet, so no held-out number can
+  be reported honestly today
+- Re-run Phase 1 training with the inverse-frequency class weighting
+  (`CellLevelDataset.smoke_class_weights`, `train.py`) against a real
+  held-out split, not the training-set numbers in the table above
+- Build the baseline-model runner from the improvement plan (majority-class,
+  logistic regression, random forest, small MLP) on the same subject-level
+  splits, so the neural model's real held-out macro-F1 can be judged against
+  something simpler rather than assumed better
+- Wire `grouped_kfold()` into an actual training loop for a real
+  cross-validation experiment (aggregate mean/std/median across folds)
+- Add validation-selected threshold + calibration reporting for the cancer
+  head instead of the current fixed, non-clinical 0.70 cutoff
 - Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
   labels) and NLST (real cancer outcomes + cigar/dual-use history)
