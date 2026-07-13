@@ -13,7 +13,7 @@ subject_level and interpretability — not two.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -21,27 +21,116 @@ from torch.utils.data import DataLoader
 import yaml
 
 from constants import CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES
+from data.label_mapping import EffectiveLabelMapping
+from metrics import multiclass_f1_report
 from model import MultiSmokeCancerNet
-from train import CellLevelDataset, SubjectLevelDataset, subject_collate_fn
+from train import (
+    CellLevelDataset, SubjectLevelDataset, load_checkpoint_into, subject_collate_fn,
+    read_checkpoint_metadata, _label_mapping_from_checkpoint_meta,
+)
+
+
+def describe_split(
+    split_name:        str,
+    manifest,
+    is_held_out:        bool = True,
+    data_modality:       str = "single_cell",
+    rare_class_policy:   Optional[str] = None,
+) -> Dict:
+    """
+    Provenance metadata for an evaluation output (not a metric itself): which
+    split, how many subjects/cells, label distribution, whether it's
+    genuinely held out, and whether the underlying data is bulk or single-
+    cell. Attach this to any saved evaluation_report.json so a number can't
+    be mistaken for held-out test performance when it's actually training-
+    set accuracy computed on data the model has seen.
+    """
+    split_report = manifest.report.get("splits", {}).get(split_name, {})
+    return {
+        "split_name":         split_name,
+        "is_held_out":        is_held_out,
+        "data_modality":      data_modality,
+        "n_subjects":         split_report.get("n_subjects"),
+        "n_cells":            split_report.get("n_cells"),
+        "n_unknown_label":    split_report.get("n_unknown_label"),
+        "class_distribution": split_report.get("class_distribution"),
+        "rare_class_policy":  rare_class_policy,
+    }
 
 
 # ─── DRY metric helpers ───────────────────────────────────────────────────────
 
-def _smoke_metrics(y_true: List[int], y_pred: List[int]) -> Dict:
-    """Per-class and macro F1 for smoke type classification."""
-    from sklearn.metrics import classification_report
+def _smoke_metrics(
+    y_true: List[int], y_pred: List[int],
+    num_classes: int = N_SMOKE_CLASSES,
+    class_names: Optional[List[str]] = None,
+) -> Dict:
+    """
+    Full smoke-type multiclass metric set — macro-F1 is the primary
+    model-selection metric (see train.py's Phase 1 checkpoint selection),
+    but overall accuracy alone is misleading on an imbalanced multiclass
+    problem (a model that only ever predicts the majority class scores
+    well on accuracy while getting every minority class wrong), so this
+    always reports the full breakdown alongside it.
+
+    num_classes/class_names default to the fixed 6-class constants (no-merge
+    / legacy default) but MUST be overridden with the model's actual
+    effective label space (data/label_mapping.py::EffectiveLabelMapping.k /
+    .class_names) whenever a rare-class policy has shrunk it — evaluating
+    against a class the model can no longer output produces a permanent
+    zero-support row and an incorrect macro-F1.
+    """
+    from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix
+
+    class_names = class_names or list(SMOKE_TYPES.values())
+    if len(class_names) != num_classes:
+        raise ValueError(
+            f"_smoke_metrics: class_names has {len(class_names)} entries but "
+            f"num_classes={num_classes} — these must match exactly."
+        )
+
+    if len(y_true) == 0:
+        return {"n": 0, "note": "no labelled cells — metrics undefined"}
+
     report = classification_report(
         y_true, y_pred,
-        labels       = list(range(N_SMOKE_CLASSES)),
-        target_names = list(SMOKE_TYPES.values()),
+        labels       = list(range(num_classes)),
+        target_names = class_names,
         output_dict  = True,
         zero_division= 0,
     )
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+    cm_norm = cm.astype(float)
+    row_sums = cm_norm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm_norm, row_sums, out=np.zeros_like(cm_norm), where=row_sums != 0)
+
+    # Same shared definition Trainer.phase1 uses for checkpoint selection —
+    # classification_report's macro/weighted avg already use the explicit
+    # full label list passed above, so these numbers agree with f1_report's
+    # by construction; f1_report additionally names which classes had zero
+    # true examples so this number isn't mistaken for a full-class-set score.
+    f1_report = multiclass_f1_report(y_true, y_pred, num_classes)
+
     return {
-        "accuracy":  round(report["accuracy"], 4),
-        "macro_f1":  round(report["macro avg"]["f1-score"], 4),
-        "per_class": {k: round(v["f1-score"], 4)
-                      for k, v in report.items() if k in SMOKE_TYPES.values()},
+        "n":               len(y_true),
+        "accuracy":        round(report["accuracy"], 4),
+        "balanced_accuracy": round(balanced_accuracy_score(y_true, y_pred), 4),
+        "macro_f1":        round(report["macro avg"]["f1-score"], 4),
+        "weighted_f1":      round(report["weighted avg"]["f1-score"], 4),
+        "classes_absent_from_targets": f1_report["classes_absent_from_targets"],
+        "is_partial":       f1_report["is_partial"],
+        "per_class": {
+            k: {
+                "precision": round(v["precision"], 4),
+                "recall":    round(v["recall"], 4),
+                "f1":        round(v["f1-score"], 4),
+                "support":   int(v["support"]),
+            }
+            for k, v in report.items() if k in class_names
+        },
+        "confusion_matrix":            cm.tolist(),
+        "confusion_matrix_normalized": np.round(cm_norm, 4).tolist(),
+        "class_labels":                class_names,
     }
 
 
@@ -50,10 +139,20 @@ def _binary_metrics(
     y_prob:    List[float],
     threshold: float = 0.5,
 ) -> Dict:
-    """ROC-AUC, PR-AUC, sensitivity, specificity for any binary task."""
+    """
+    ROC-AUC, PR-AUC, sensitivity, specificity for any binary task.
+    Gracefully handles empty input and single-class targets by returning
+    None for undefined metrics rather than a misleading number — callers
+    must not substitute a default like 0.5 or 1.0 in place of None.
+    """
     from sklearn.metrics import (
         roc_auc_score, average_precision_score, confusion_matrix
     )
+    n = len(y_true)
+    if n == 0:
+        return {"roc_auc": None, "pr_auc": None, "sensitivity": None,
+                "specificity": None, "threshold": threshold, "n": 0,
+                "note": "no known labels — metrics undefined"}
     has_both = len(set(y_true)) > 1
     y_pred   = [1 if p >= threshold else 0 for p in y_prob]
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
@@ -63,6 +162,8 @@ def _binary_metrics(
         "sensitivity": round(tp / (tp + fn), 4) if (tp + fn) > 0 else None,
         "specificity": round(tn / (tn + fp), 4) if (tn + fp) > 0 else None,
         "threshold":   threshold,
+        "n":           n,
+        "note":        None if has_both else "single-class target — ROC/PR-AUC undefined",
     }
 
 
@@ -92,9 +193,14 @@ class Evaluator:
     and interpretability() — not two separate passes.
     """
 
-    def __init__(self, model: MultiSmokeCancerNet, device: str = "cpu"):
+    def __init__(self, model: MultiSmokeCancerNet, device: str = "cpu",
+                 label_mapping: Optional["EffectiveLabelMapping"] = None):
         self.model  = model.to(device)
         self.device = device
+        # None = no rare-class policy wired in (six-class default / legacy /
+        # diagnostic model) — _num_classes()/_class_names() fall back to
+        # constants.N_SMOKE_CLASSES/SMOKE_TYPES in that case.
+        self.label_mapping = label_mapping
 
     @classmethod
     def from_checkpoint(
@@ -103,20 +209,40 @@ class Evaluator:
         phase:  int = 3,
         device: str = "cpu",
     ) -> "Evaluator":
-        """Load the best checkpoint from a given training phase."""
+        """
+        Load the best checkpoint from a given training phase. Reconstructs
+        the checkpoint's effective smoke-label mapping (if any) BEFORE
+        constructing the model — via read_checkpoint_metadata, which peeks
+        at the checkpoint without loading weights — so the model is built
+        with the correct num_smoke_types up front instead of failing with
+        an opaque shape-mismatch error inside load_state_dict().
+        """
         if isinstance(config, (str, Path)):
             with open(config) as f:
                 config = yaml.safe_load(f)
-        model    = MultiSmokeCancerNet.from_config(config)
         ckpt_dir = Path(config.get("train", config).get("checkpoint_dir", "checkpoints"))
         if not ckpt_dir.is_absolute():
             ckpt_dir = Path(__file__).parents[1] / ckpt_dir
-        model.load_state_dict(
-            torch.load(ckpt_dir / f"phase{phase}_best.pt",
-                       map_location=device, weights_only=True)
+        ckpt_path = ckpt_dir / f"phase{phase}_best.pt"
+
+        label_mapping = None
+        if ckpt_path.exists():
+            ckpt_meta = read_checkpoint_metadata(ckpt_path, device)
+            label_mapping = _label_mapping_from_checkpoint_meta(ckpt_meta)
+
+        model = MultiSmokeCancerNet.from_config(
+            config, num_smoke_types=label_mapping.k if label_mapping else None,
         )
-        print(f"[evaluate] loaded phase {phase} checkpoint  ({ckpt_dir}/)")
-        return cls(model, device)
+        load_checkpoint_into(model, ckpt_path, device)
+        print(f"[evaluate] loaded phase {phase} checkpoint  ({ckpt_dir}/)"
+              + (f"  effective label space K={label_mapping.k}" if label_mapping else ""))
+        return cls(model, device, label_mapping=label_mapping)
+
+    def _num_classes(self) -> int:
+        return self.label_mapping.k if self.label_mapping else N_SMOKE_CLASSES
+
+    def _class_names(self) -> List[str]:
+        return self.label_mapping.class_names if self.label_mapping else list(SMOKE_TYPES.values())
 
     # ── Cell-level ────────────────────────────────────────────────────────────
 
@@ -127,7 +253,7 @@ class Evaluator:
     ) -> Dict:
         """Single forward pass over cell_dataset — shared by cell_level() and full_report()."""
         smoke_preds, smoke_true = [], []
-        malig_probs, malig_true = [], []
+        malig_probs, malig_true, malig_known = [], [], []
 
         self.model.eval()
         with torch.no_grad():
@@ -137,11 +263,28 @@ class Evaluator:
                 smoke_true.extend(batch["smoke_label"].tolist())
                 malig_probs.extend(malig.squeeze().cpu().tolist())
                 malig_true.extend(batch["malignancy_label"].tolist())
+                malig_known.extend(batch["malignancy_known"].tolist())
 
         return {
             "smoke_pred": smoke_preds, "smoke_true": smoke_true,
-            "malig_prob": malig_probs, "malig_true": malig_true,
+            "malig_prob": malig_probs, "malig_true": malig_true, "malig_known": malig_known,
         }
+
+    @staticmethod
+    def _known_malignancy_metrics(p: Dict) -> Dict:
+        """
+        Restrict malignancy metrics to cells with a real label — cells
+        stamped with the 0.0 placeholder (unknown) are not verified-normal
+        and must not count as evidence the model correctly predicted "not
+        malignant" (see labellers.py::add_malignancy_labels).
+        """
+        known_true = [t for t, k in zip(p["malig_true"], p["malig_known"]) if k]
+        known_prob = [pr for pr, k in zip(p["malig_prob"], p["malig_known"]) if k]
+        metrics = _binary_metrics(known_true, known_prob, threshold=0.5)
+        metrics["n_known_positive"] = int(sum(t == 1.0 for t in known_true))
+        metrics["n_known_negative"] = int(sum(t == 0.0 for t in known_true))
+        metrics["n_unknown"] = len(p["malig_true"]) - len(known_true)
+        return metrics
 
     def cell_level(
         self,
@@ -152,8 +295,9 @@ class Evaluator:
         p = self._cell_predictions(cell_dataset, batch_size)
         return {
             "n_cells":    len(p["smoke_true"]),
-            "smoke_type": _smoke_metrics(p["smoke_true"], p["smoke_pred"]),
-            "malignancy": _binary_metrics(p["malig_true"], p["malig_prob"], threshold=0.5),
+            "smoke_type": _smoke_metrics(p["smoke_true"], p["smoke_pred"],
+                                          self._num_classes(), self._class_names()),
+            "malignancy": self._known_malignancy_metrics(p),
         }
 
     # ── Subject-level ─────────────────────────────────────────────────────────
@@ -213,11 +357,13 @@ class Evaluator:
         report = {
             "cell_level": {
                 "n_cells":    len(cell_preds["smoke_true"]),
-                "smoke_type": _smoke_metrics(cell_preds["smoke_true"], cell_preds["smoke_pred"]),
-                "malignancy": _binary_metrics(cell_preds["malig_true"], cell_preds["malig_prob"], threshold=0.5),
+                "smoke_type": _smoke_metrics(cell_preds["smoke_true"], cell_preds["smoke_pred"],
+                                              self._num_classes(), self._class_names()),
+                "malignancy": self._known_malignancy_metrics(cell_preds),
             },
             "subject_level":    self._subject_metrics_from_records(records, threshold),
             "interpretability": self._interpretability_from_records(records),
+            "effective_label_mapping": self.label_mapping.to_dict() if self.label_mapping else None,
         }
 
         rpath = out / "evaluation_report.json"
@@ -273,15 +419,20 @@ class Evaluator:
         }
 
     def _interpretability_from_records(self, records: List[Dict]) -> Dict:
+        # s (below) is an argmax over the model's smoke head output — indexed
+        # 0..K-1 in the EFFECTIVE label space, not necessarily the raw 0..5
+        # constants.SMOKE_TYPES space (a rare-class policy can shrink K).
+        # Indexing SMOKE_TYPES directly here would mislabel predictions.
+        class_names = self._class_names()
         attn_by_cell  = {ct: [] for ct in CELL_TYPES.values()}
-        attn_by_smoke = {st: [] for st in SMOKE_TYPES.values()}
+        attn_by_smoke = {st: [] for st in class_names}
         ml_at_pairs:  List[Tuple[float, float]] = []
 
         for r in records:
             for a, c, s, m in zip(r["attn"], r["ct_ids"],
                                    r["smoke_pred"], r["malig"]):
                 attn_by_cell [CELL_TYPES [int(c)]].append(float(a))
-                attn_by_smoke[SMOKE_TYPES[int(s)]].append(float(a))
+                attn_by_smoke[class_names[int(s)]].append(float(a))
                 ml_at_pairs.append((float(m), float(a)))
 
         ml  = np.array([x[0] for x in ml_at_pairs])
@@ -345,6 +496,7 @@ if __name__ == "__main__":
         smoke_labels      = np.random.randint(0, N_SMOKE_CLASSES, N_CELLS),
         malignancy_labels = np.random.randint(0, 2, N_CELLS).astype("float32"),
         cell_type_ids     = np.random.randint(0, N_CELL_TYPES, N_CELLS),
+        diagnostic_mode    = True,
     )
 
     def _bag(n):

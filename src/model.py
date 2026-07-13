@@ -208,6 +208,7 @@ class MultiSmokeCancerNet(nn.Module):
         attention_dim:  int   = 128,
     ):
         super().__init__()
+        self.input_dim      = input_dim
         self.embedding_dim  = embedding_dim
         self.num_smoke      = num_smoke
         self.num_cell_types = num_cell_types
@@ -224,8 +225,22 @@ class MultiSmokeCancerNet(nn.Module):
         )
 
     @classmethod
-    def from_config(cls, config: Union[dict, str, Path]) -> "MultiSmokeCancerNet":
-        """Instantiate from a config dict or path to configs/default.yaml."""
+    def from_config(
+        cls,
+        config: Union[dict, str, Path],
+        num_smoke_types: Optional[int] = None,
+    ) -> "MultiSmokeCancerNet":
+        """
+        Instantiate from a config dict or path to configs/default.yaml.
+
+        num_smoke_types, if given, OVERRIDES config['model']['num_smoke_types']
+        — used when the actual effective smoke-label space (K) is only known
+        at load time (data/label_mapping.py::EffectiveLabelMapping.k, read
+        from a checkpoint's or artifact's persisted mapping), since a config
+        file has no way to know a rare-class policy already shrank the
+        output space. Without an override, the config value (or the fixed
+        6-class default) is used — the no-merge / legacy path.
+        """
         if isinstance(config, (str, Path)):
             with open(config) as f:
                 config = yaml.safe_load(f)
@@ -233,7 +248,7 @@ class MultiSmokeCancerNet(nn.Module):
         return cls(
             input_dim      = c.get("input_dim",       N_HVGS_DEFAULT),
             embedding_dim  = c.get("embedding_dim",   256),
-            num_smoke      = c.get("num_smoke_types", N_SMOKE_CLASSES),
+            num_smoke      = num_smoke_types if num_smoke_types is not None else c.get("num_smoke_types", N_SMOKE_CLASSES),
             num_cell_types = c.get("num_cell_types",  N_CELL_TYPES),
             encoder_dropout= c.get("encoder_dropout", 0.3),
             head_dropout   = c.get("head_dropout",    0.2),
@@ -304,7 +319,26 @@ class MultiTaskLoss(nn.Module):
         self.mse  = nn.MSELoss()
 
     def _ls (self, logits, targets): return self.ce (logits, targets)
-    def _lm (self, preds,  targets): return self.bce(preds.view(-1),  targets.float())
+
+    def _lm(self, preds, targets, known_mask=None):
+        """
+        BCE for malignancy, optionally restricted to cells with a REAL label.
+        Cells with no verified malignancy call are stamped 0.0 as a numeric
+        placeholder (see labellers.py::add_malignancy_labels) — training
+        against that placeholder as if it were a confirmed negative would
+        teach the model "everything is benign unless proven otherwise",
+        which is not a label anyone actually assigned. known_mask=None
+        preserves the old unmasked behaviour for callers (tests, the
+        model.py smoke test) that pass fully-synthetic, fully-known labels.
+        """
+        preds, targets = preds.view(-1), targets.float().view(-1)
+        if known_mask is not None:
+            known_mask = known_mask.view(-1).bool()
+            if known_mask.sum() == 0:
+                return preds.sum() * 0.0
+            preds, targets = preds[known_mask], targets[known_mask]
+        return self.bce(preds, targets)
+
     def _lsb(self, prob,   target) : return self.bce(prob.view(-1),   target.view(-1).float())
 
     def dose_response_loss(
@@ -355,8 +389,10 @@ class MultiTaskLoss(nn.Module):
         self,
         smoke_logits: torch.Tensor, smoke_targets: torch.Tensor,
         malig_preds:  torch.Tensor, malig_targets: torch.Tensor,
+        malig_known:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        ls, lm = self._ls(smoke_logits, smoke_targets), self._lm(malig_preds, malig_targets)
+        ls = self._ls(smoke_logits, smoke_targets)
+        lm = self._lm(malig_preds, malig_targets, malig_known)
         total  = self.λs * ls + self.λm * lm
         return total, {"total": total.item(), "smoke": ls.item(), "malignancy": lm.item()}
 
@@ -372,10 +408,11 @@ class MultiTaskLoss(nn.Module):
         smoke_logits: torch.Tensor, smoke_targets: torch.Tensor,
         malig_preds:  torch.Tensor, malig_targets: torch.Tensor,
         cancer_prob:  torch.Tensor, cancer_target: torch.Tensor,
+        malig_known:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         ls, lm, lsb = (
             self._ls (smoke_logits, smoke_targets),
-            self._lm (malig_preds,  malig_targets),
+            self._lm (malig_preds,  malig_targets, malig_known),
             self._lsb(cancer_prob,  cancer_target),
         )
         total = self.λs * ls + self.λm * lm + self.λsb * lsb

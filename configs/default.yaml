@@ -27,6 +27,38 @@ data:
   min_cells_per_subject: 50
   out_dir: data/processed
 
+split:
+  # Subject-level split — a subject's cells/samples always land in exactly
+  # one split (src/data/splitting.py). Never split by cell.
+  train_frac: 0.70
+  val_frac: 0.15
+  test_frac: 0.15
+  seed: 42
+  manifest_path: data/processed/split_manifest.json
+  n_folds: 5  # grouped_kfold; reduced automatically when a class has fewer subjects
+
+rare_class:
+  # Policy for smoke-type classes with too few independent subjects to learn
+  # or evaluate reliably (e.g. cigar, currently ~1 subject in the real data).
+  # One of: keep_with_warning | merge_into_dual_use_or_other | exclude_from_training_and_evaluation
+  # Actually applied by preprocess.py::run_pipeline_split_aware (before the
+  # subject-level split, on the FINAL effective label) — not just an
+  # available-but-unused utility.
+  policy: merge_into_dual_use_or_other
+  min_subjects_required: 3
+  target_classes: [cigar]
+
+preprocessing:
+  batch_correction:
+    method: harmony
+    # Harmony has no train-only-fit / apply-to-new-data mode, so running it
+    # uses held-out (val/test) expression values to compute the batch
+    # correction embedding — a transductive, NOT leakage-free, step. Default
+    # is strict: batch correction is SKIPPED in run_pipeline_split_aware.
+    # Set true only as a deliberate, documented opt-in — the resulting
+    # experiment must not be described as fully leakage-free.
+    allow_transductive_harmony: false
+
 model:
   input_dim: 2000
   embedding_dim: 256

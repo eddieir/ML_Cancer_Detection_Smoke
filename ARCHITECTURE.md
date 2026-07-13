@@ -323,6 +323,12 @@ exists at cell-level pretraining time (see Stage 3C).
 
 ## 5. Three-Phase Training Curriculum
 
+Every phase below takes **explicit, pre-split** train/val datasets built
+from a `SplitManifest` (`data/splitting.py`) — `Trainer.phase1/2/3` do not
+split anything internally, and reject overlapping train/val subject IDs
+before training starts. See §11 for the full rationale; the per-phase specs
+below (optimizer, schedule, batch size) are otherwise unchanged.
+
 ### Phase 1 — Cell-Level Pre-training
 
 **Goal:** Teach the encoder to produce discriminative cell embeddings for smoke type and malignancy.
@@ -421,12 +427,19 @@ Stop:        Early stop if no improvement for 5 consecutive epochs
 ## 8. Evaluation Metrics
 
 ### Cell-level (Phase 1 validation)
-- Smoke type: macro-averaged F1 across 6 classes, per-class accuracy
-- Malignancy: ROC-AUC, precision-recall AUC
+- Smoke type: **macro-F1 is the primary model-selection metric** (not
+  accuracy — see §11), plus balanced accuracy, weighted-F1, per-class
+  precision/recall/F1/support, and raw + row-normalized confusion matrices
+  (`evaluate.py::_smoke_metrics`)
+- Malignancy: ROC-AUC, precision-recall AUC — computed only on cells with a
+  real (`malignancy_known=True`) label; see §11
 
 ### Subject-level (Phase 2 + 3 validation, primary)
 - ROC-AUC on cancer vs. no-cancer (main metric)
-- Sensitivity / specificity at threshold 0.70 (HIGH RISK cutoff)
+- Sensitivity / specificity at threshold 0.70 (HIGH RISK cutoff) — **this
+  0.70 cutoff is an arbitrary placeholder, not a clinically validated
+  threshold.** No calibration or validation-selected-threshold study has
+  been performed. Treat any HIGH/MODERATE/LOW risk_flag output the same way.
 - Calibration curve (predicted probability vs. observed frequency)
 
 ### Interpretability
@@ -471,3 +484,143 @@ TCGA-LUAD/LUSC (section 6) is wired end-to-end: `data/downloaders.py --tcga`
 samples supply per-cell malignancy labels (Stage 3B) and TCGA cases with a
 Primary Tumor sample count as subject-level cancer positives (Stage 6),
 merged with NLST outcomes in `preprocess.py::run_pipeline`.
+
+---
+
+## 11. Scientific Validity: Splitting, Leakage, and Label Provenance
+
+Everything in sections 1–10 above describes the model architecture and is
+unchanged. Separately, on branch `improve/valid-evaluation-and-training`, a
+set of correctness/leakage issues in the pipeline that feeds that
+architecture were fixed. Full detail and rationale live in README.md's
+[Scientific rigor and known limitations](README.md#scientific-rigor-and-known-limitations)
+section; summarized here for architectural completeness:
+
+1. **Subject-level splitting is now real and unavoidable end-to-end**, not
+   just an available utility. `data/splitting.py` provides subject-grouped
+   train/val/test splitting and grouped K-fold CV with reproducible,
+   fingerprinted manifests (`load_or_create_split()` raises rather than
+   silently reusing a stale split if subjects/labels/config changed).
+   Critically, `Trainer.phase1/2/3` (§5) previously called `random_split()`
+   internally regardless of any manifest, so a subject's cells could still
+   land in both the "train" and "validation" partition passed to a phase.
+   This is fixed: every phase now takes explicit, pre-split
+   `train_*_dataset`/`val_*_dataset` arguments, calls
+   `assert_disjoint_subjects()` before training anything, and never accepts
+   a test dataset — `Trainer.final_test_evaluation()` is the one sanctioned
+   place test data is used, after checkpoint selection, evaluated once, and
+   labelled `is_held_out=True`. `preprocess.py::run_pipeline_split_aware()`
+   builds the per-split `CellLevelDataset`/bag lists directly from the
+   manifest via `CellLevelDataset.subset_by_subjects()`, rather than
+   returning one combined array for the caller to filter. No model has yet
+   been retrained against one of these splits on real data.
+2. **Preprocessing leakage + label order**: gene scaling and HVG selection
+   (Stage 1, §3.1) were fit across the entire merged dataset, including
+   cells that should have been held out. `data/preprocessing.py` fits both
+   on the train split only via a versioned `PreprocessingArtifact`,
+   automatically persisted next to the split manifest and the checkpoint
+   directory. Separately, `run_pipeline_split_aware()` used to compute the
+   subject-level split *before* NLST label transfer, so the split could be
+   based on a label that was about to change — label assignment (including
+   NLST transfer) now happens first, the rare-class policy (point 5) is
+   applied to that final label, and only then is the split computed.
+   Harmony batch correction remains a transductive exception (no
+   train-only-fit mode exists for it): `run_pipeline_split_aware()` skips it
+   by default and requires an explicit `allow_transductive_harmony: true`
+   opt-in, which sets a `transductive_batch_correction` flag on the result.
+3. **Unknown cancer outcomes were defaulted to 0** (cancer-negative)
+   instead of being excluded from Stage 6 supervision — fixed via
+   `cancer_label_known` and `train.py::check_mil_eligibility`, now checked
+   separately on train and val before Phase 2/3 train.
+4. **Unknown malignancy labels were defaulted to 0.0** and trained against
+   directly in Stage 3B — fixed via a `malignancy_known` provenance mask
+   applied to `MultiTaskLoss`'s malignancy BCE term.
+5. **Rare smoke-type classes (e.g. cigar, ~1 independent subject) now
+   actually go through the configured policy** (`data/rare_class.py`)
+   instead of the utility existing but nothing calling it.
+   `run_pipeline_split_aware()` applies `keep_with_warning` /
+   `merge_into_dual_use_or_other` / `exclude_from_training_and_evaluation`
+   to the final label before splitting; the raw label survives unmutated as
+   `smoke_type_raw`.
+6. **Checkpoints are now structured**, not a bare `state_dict` — they carry
+   split-manifest path, preprocessing-artifact path, effective label
+   mapping, rare-class policy, seed, metric, epoch, input dim, and git SHA.
+   `Predictor.predict_h5ad()` was validating gene *presence* but not
+   actually reordering/scaling incoming data to match training; it now
+   applies the fitted `PreprocessingArtifact` (or requires an explicit
+   `already_preprocessed=True` declaration with exact gene-order
+   verification) before every forward pass.
+7. **Cross-task leakage validation was incomplete**: the per-phase checks in
+   point 1 only compare same-modality datasets (train cells vs. val cells,
+   train bags vs. val bags), missing a subject whose cells are in train but
+   whose bag is in val (or vice versa) — a real path Phase 3 exercises since
+   it uses all four datasets jointly. `train.py::validate_experiment_partitions()`
+   now checks this directly and `Trainer.phase3` calls it.
+8. **Held-out test evaluation was enforced only by docstring.**
+   `Trainer.final_test_evaluation()` now tracks every subject seen during
+   training/validation on that `Trainer` and raises if a test subject
+   overlaps them, blocks a second call by default (`allow_repeat=True`
+   required, and the result is marked non-pristine), and writes a separate
+   `heldout_test_report.json`/`heldout_test_predictions.json` with explicit
+   provenance (manifest path, checkpoint id, threshold source, timestamp,
+   run count) rather than relying on `evaluation_report.json`'s shared path.
+9. **Checkpoint-selection macro-F1 and reported macro-F1 could silently
+   disagree.** `Trainer.phase1` computed its selection metric with
+   `f1_score(..., average="macro")` and no explicit label list, which
+   restricts averaging to classes observed in that validation batch;
+   `evaluate.py` already passed an explicit label list. `src/metrics.py`
+   now defines this once (`multiclass_f1_report`, flags `is_partial` when a
+   class had zero true examples) and both call sites use it.
+10. **Cell-type IDs were never validated**, only checked for column
+    presence. `metrics.py::validate_cell_type_ids()` enforces
+    `0 <= id < num_cell_types`, integer-valued, no NaN, correct length —
+    used by `Predictor.predict_subject/predict_h5ad` and `Trainer.predict`.
+11. **`grouped_kfold` could crash on small class counts**: independently
+    resetting a fold-index counter per class bucket meant two subjects in
+    two different classes could collide on fold 0, leaving another fold
+    with an empty train or validation set. Fold assignment now uses one
+    cursor shared across all class buckets.
+12. **The effective smoke-label space wasn't actually contiguous or
+    model-visible.** A rare-class policy could merge or exclude a raw
+    class, but `model.num_smoke`, macro-F1's class count, confusion
+    matrices, and inference's displayed class names all stayed fixed at 6
+    — a dead output neuron and a permanent zero-support row.
+    `data/label_mapping.py::EffectiveLabelMapping` now builds a
+    deterministic `0..K-1` space directly from the rare-class-policy
+    report; `run_pipeline_split_aware()` transforms labels into it before
+    the split; `MultiSmokeCancerNet.from_config(num_smoke_types=...)`,
+    `Trainer.set_label_mapping()`, `Evaluator.from_checkpoint()`, and
+    `Predictor.from_config()` all size the model to `K` and validate the
+    mapping matches (checkpoint metadata is peeked via
+    `train.read_checkpoint_metadata()` *before* the model is constructed,
+    so a config/checkpoint conflict fails clearly instead of as an opaque
+    `load_state_dict` shape error). Raw labels remain preserved unmutated.
+13. **`predict_h5ad(already_preprocessed=False)` claimed to accept "raw"
+    input** but only ever reordered/subset genes and applied train-fit
+    scaling — never QC, library-size normalization, or log-transform, so
+    genuinely raw counts silently produced invalid predictions. The
+    boolean is replaced with an explicit `input_stage` argument:
+    `"model_ready"` (exact match, no transform — was `True`),
+    `"normalized_expression"` (reorder/subset/scale via the artifact only,
+    duplicate-gene and finite-value checks added — was `False`), or
+    `"raw_counts"`, which is now always rejected with a clear "not
+    supported" error, since `PreprocessingArtifact` doesn't store the
+    QC/normalization parameters needed to reproduce that chain.
+    `already_preprocessed` remains as a deprecated, warned alias mapped
+    unambiguously to the two supported stages — never to `"raw_counts"`.
+
+Not yet done, tracked in README's "What this pass does not include": the
+full raw-count preprocessing chain reproduced inside `predict_h5ad` (species/
+gene-ID/normalization steps — `input_stage="raw_counts"` is explicitly
+rejected rather than silently mishandled, but not implemented); an
+`ExperimentContext`/`Trainer.from_experiment_data()` auto-wiring pipeline
+output into a Trainer; checkpoint checksum verification and
+optimizer/scheduler resume; baseline/grouped-CV/MIL-comparison experiment
+runners; subject-aware sampling; bulk/single-cell/MIL mode separation;
+species/ortholog-mapping safety; validation-selected threshold/calibration
+tooling; dose-head supervision gating.
+
+None of these are architecture changes — Stages 1–6 as specified above are
+unchanged. They are pipeline-around-the-architecture fixes that any real
+reported metric must now go through for the metric to be scientifically
+valid.

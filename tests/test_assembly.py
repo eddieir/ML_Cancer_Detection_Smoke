@@ -60,13 +60,32 @@ def test_assemble_subject_bags_attaches_cancer_outcome():
     by_subject = {b["subject_id"]: b["cancer_label"] for b in bags}
     assert by_subject["p1"] == 1
     assert by_subject["p2"] == 0
+    assert all(b["cancer_label_known"] for b in bags)
 
 
-def test_assemble_subject_bags_defaults_to_zero_without_outcomes():
+def test_assemble_subject_bags_marks_unknown_outcome_not_negative():
+    """A subject never matched to a cancer-outcome source has an UNKNOWN
+    outcome, not a verified negative — silently defaulting to 0 would
+    fabricate a negative label (see data/assembly.py::assemble_subject_bags)."""
     from data.assembly import assemble_subject_bags
     adata = _bagged_adata(["p1"], [15])
     bags = assemble_subject_bags(adata, cancer_outcomes=None, min_cells_per_subject=10)
-    assert bags[0]["cancer_label"] == 0
+    assert bags[0]["cancer_label"] is None
+    assert bags[0]["cancer_label_known"] is False
+
+
+def test_assemble_subject_bags_partial_outcome_coverage_marks_missing_unknown():
+    """When cancer_outcomes only covers some subjects, the uncovered ones must
+    stay unknown rather than silently becoming cancer_label=0."""
+    from data.assembly import assemble_subject_bags
+    adata = _bagged_adata(["p1", "p2"], [15, 15])
+    outcomes = pd.DataFrame({"subject_id": ["p1"], "cancer_label": [1]})
+    bags = assemble_subject_bags(adata, cancer_outcomes=outcomes, min_cells_per_subject=10)
+    by_subject = {b["subject_id"]: b for b in bags}
+    assert by_subject["p1"]["cancer_label"] == 1
+    assert by_subject["p1"]["cancer_label_known"] is True
+    assert by_subject["p2"]["cancer_label"] is None
+    assert by_subject["p2"]["cancer_label_known"] is False
 
 
 def test_export_cell_dataset_writes_arrays_and_returns_matching_dict():
