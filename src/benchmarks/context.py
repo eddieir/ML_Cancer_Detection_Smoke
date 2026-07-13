@@ -11,6 +11,8 @@ accidentally read `bags` (the whole, unsplit dataset) when it meant
 """
 
 import copy
+import hashlib
+import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,7 +65,12 @@ def _validate_context(
         test_subject_dataset=SubjectLevelDataset(test_bags, require_known_outcome=False),
     )
 
-    # 2. dataset subject sets match the split manifest exactly
+    # 2. dataset subject sets match the split manifest EXACTLY — reject both
+    # unexpected subjects (in the dataset but not the manifest: a leakage-
+    # relevant assembly bug) and missing subjects (in the manifest but absent
+    # from the dataset: a subject silently dropped somewhere between the
+    # split and the exported dataset, which would otherwise surface only as
+    # an unexplained smaller train/val/test set).
     for name, ds, manifest_subjects in (
         ("train", train_cell_dataset, split_manifest.train_subjects),
         ("val", val_cell_dataset, split_manifest.val_subjects),
@@ -79,6 +86,26 @@ def _validate_context(
                 f"ExperimentContext: {name}_cell_dataset contains subject(s) "
                 f"{sorted(unexpected)[:5]} not present in split_manifest.{name}_subjects."
             )
+        missing = manifest_set - ds_subjects
+        if missing:
+            raise ValueError(
+                f"ExperimentContext: split_manifest.{name}_subjects declares subject(s) "
+                f"{sorted(missing)[:5]} that are absent from {name}_cell_dataset — a subject "
+                "was silently dropped somewhere between the split and the exported dataset."
+            )
+
+    # 2b. no blank/placeholder subject IDs in bags (CellLevelDataset already
+    # enforces this for cell datasets at construction time — see train.py —
+    # but bags are plain dicts with no equivalent constructor-time guard).
+    _PLACEHOLDER_IDS = {"", "unknown", "none", "None", "nan", "NaN"}
+    for name, bags in (("train_bags", train_bags), ("val_bags", val_bags), ("test_bags", test_bags)):
+        for b in bags:
+            sid = str(b.get("subject_id", ""))
+            if sid.strip() in _PLACEHOLDER_IDS:
+                raise ValueError(
+                    f"ExperimentContext: {name} contains a blank/placeholder subject_id "
+                    f"({sid!r}) — every bag must carry a real subject identifier."
+                )
 
     # 3. gene count consistency: artifact vs every cell/bag matrix width
     n_genes = len(preprocessing_artifact.gene_list)
@@ -164,6 +191,64 @@ class ExperimentContext:
 
     def fingerprint(self) -> Optional[str]:
         return self.split_manifest.fingerprint
+
+    @property
+    def config_fingerprint(self) -> str:
+        """SHA-256 of this context's own (deep-copied, immutable-to-callers)
+        config snapshot — lets a checkpoint/result record exactly which
+        configuration produced it and detect a mismatch on reload."""
+        blob = json.dumps(self.config, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    @property
+    def label_mapping_fingerprint(self) -> str:
+        blob = json.dumps(self.label_mapping.to_dict(), sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    @property
+    def preprocessing_artifact_fingerprint(self) -> str:
+        from .fold_preprocessing import artifact_fingerprint
+        return artifact_fingerprint(self.preprocessing_artifact)
+
+    def run_identity(self, run_id: str) -> Dict[str, Optional[str]]:
+        """
+        The full set of fingerprints/identifiers a reproducibility artifact
+        or checkpoint must record and a reload must re-verify (section 7):
+        manifest identity, preprocessing artifact identity, label-mapping
+        identity, configuration identity, and this specific run's id. Two
+        runs with identical values here operated on provably identical
+        inputs; any mismatch on reload means the checkpoint no longer
+        describes the current context and must not be silently reused.
+        """
+        return {
+            "run_id": run_id,
+            "git_sha": self.git_sha,
+            "split_manifest_fingerprint": self.split_manifest.fingerprint,
+            "preprocessing_artifact_fingerprint": self.preprocessing_artifact_fingerprint,
+            "label_mapping_fingerprint": self.label_mapping_fingerprint,
+            "config_fingerprint": self.config_fingerprint,
+        }
+
+    def validate_run_identity(self, expected: Dict[str, Optional[str]]) -> None:
+        """
+        Recompute this context's own run_identity() and compare field-by-
+        field against a previously-recorded one (e.g. loaded from a
+        checkpoint or a run artifact). Raises loudly on any mismatch —
+        never silently proceeds with a stale/incompatible checkpoint.
+        """
+        current = self.run_identity(expected.get("run_id", ""))
+        mismatches = {
+            k: (expected.get(k), current.get(k))
+            for k in ("split_manifest_fingerprint", "preprocessing_artifact_fingerprint",
+                      "label_mapping_fingerprint", "config_fingerprint")
+            if expected.get(k) != current.get(k)
+        }
+        if mismatches:
+            raise ValueError(
+                f"ExperimentContext.validate_run_identity: {len(mismatches)} field(s) do not match "
+                f"the recorded run identity: {mismatches}. Refusing to treat this context as "
+                "equivalent to the one the checkpoint/result was produced from."
+            )
 
     @classmethod
     def from_pipeline_result(
