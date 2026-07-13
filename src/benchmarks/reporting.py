@@ -155,9 +155,21 @@ def write_csv_table(path: Path, rows: List[dict]) -> None:
         with open(path, "w") as f:
             f.write("")
         return
-    fieldnames = list(rows[0].keys())
+    # Different models' fold records carry different keys (e.g. the neural
+    # adapter's cell-capping fields aren't present on baseline records) —
+    # using only rows[0]'s keys as the fieldname set crashes DictWriter the
+    # moment a later row has a key the first row didn't. The union of every
+    # row's keys, in first-seen order, covers all of them; a row missing a
+    # given key gets restval (empty), not a crash.
+    fieldnames: List[str] = []
+    seen = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -274,10 +286,33 @@ def write_benchmark_report(
     write_json(run_dir / "summary.json", summary)
     if calibration_report:
         write_json(run_dir / "calibration" / "frozen_policy.json", calibration_report)
+        if "hyperparameter_search" in calibration_report:
+            # Candidates, inner-CV scores, and the final selection for the
+            # frozen-test model — see hyperparameter_search.py. Only ever
+            # populated for the classical baseline nested-selection path
+            # (see README's Benchmarking framework limitations for what
+            # this does NOT yet cover: per-fold CV selection, neural/MIL).
+            write_json(run_dir / "hyperparameters.json", calibration_report["hyperparameter_search"])
 
     for task, cv_report in cv_reports.items():
         write_json(run_dir / "metrics" / f"{task}_folds.json", cv_report)
         write_csv_table(run_dir / "metrics" / f"{task}_folds.csv", cv_results_to_csv_rows(cv_report))
+        # folds.json: outer subject partitions for every fold this task's CV
+        # ran (train/val subject lists + fingerprints) — the per-fold
+        # records already carry fit_subject_ids/preprocessing_fingerprint;
+        # this file collects just that partition/identity info per fold in
+        # one place for audit, without duplicating the full metric report.
+        folds_summary = {
+            name: [
+                {k: f.get(k) for k in (
+                    "seed", "fold", "fit_subject_ids", "preprocessing_fingerprint",
+                    "gene_list_n", "classes_absent_from_val", "stratified",
+                )}
+                for f in result.get("folds", [])
+            ]
+            for name, result in cv_report.get("results", {}).items()
+        }
+        write_json(run_dir / "metrics" / f"{task}_folds_partitions.json", folds_summary)
 
     report_md = generate_markdown_report(
         run_dir, context, run_manifest, eligibility, cv_reports, comparisons, calibration_report, synthetic,
