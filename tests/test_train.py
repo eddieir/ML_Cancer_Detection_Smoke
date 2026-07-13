@@ -13,8 +13,9 @@ from constants import N_SMOKE_CLASSES, N_CELL_TYPES
 from model import MultiSmokeCancerNet
 from train import (
     CellLevelDataset, SubjectLevelDataset, MILEligibilityError, Trainer,
-    assert_disjoint_subjects, check_mil_eligibility,
+    assert_disjoint_subjects, check_mil_eligibility, validate_experiment_partitions,
 )
+from metrics import validate_cell_type_ids
 
 GENES = 20
 
@@ -312,3 +313,220 @@ def test_trainer_phase1_class_weights_computed_from_train_only():
     expected = train_ds.smoke_class_weights()
     result = trainer.phase1(train_ds, val_ds)
     assert torch.allclose(expected, train_ds.smoke_class_weights())
+
+
+# ─── validate_experiment_partitions: cross-task leakage ─────────────────────
+
+def _real_subject_ds(subject_ids, cancer_label=1):
+    return SubjectLevelDataset([
+        _bag(sid, cancer_label=cancer_label, cancer_label_known=True) for sid in subject_ids
+    ])
+
+
+def test_validate_experiment_partitions_passes_for_clean_split():
+    groups = validate_experiment_partitions(
+        train_cell_dataset=_real_cell_ds(["s1", "s2"]),
+        val_cell_dataset=_real_cell_ds(["s3"]),
+        train_subject_dataset=_real_subject_ds(["s1", "s2"]),
+        val_subject_dataset=_real_subject_ds(["s3"]),
+    )
+    assert groups["train"] == {"s1", "s2"}
+    assert groups["val"] == {"s3"}
+
+
+def test_validate_experiment_partitions_rejects_train_cell_val_bag_overlap():
+    """Same-modality checks (train_cell vs val_cell) would miss this: s3's
+    CELLS are only in train, but s3's BAG is in val — cross-modality leakage
+    that a subject-disjoint-per-phase check alone does not catch."""
+    with pytest.raises(ValueError):
+        validate_experiment_partitions(
+            train_cell_dataset=_real_cell_ds(["s1", "s3"]),
+            val_cell_dataset=_real_cell_ds(["s2"]),
+            train_subject_dataset=_real_subject_ds(["s1"]),
+            val_subject_dataset=_real_subject_ds(["s2", "s3"]),  # s3 bag leaked into val
+        )
+
+
+def test_validate_experiment_partitions_rejects_train_bag_val_cell_overlap():
+    with pytest.raises(ValueError):
+        validate_experiment_partitions(
+            train_cell_dataset=_real_cell_ds(["s1"]),
+            val_cell_dataset=_real_cell_ds(["s2", "s3"]),  # s3 cells leaked into val
+            train_subject_dataset=_real_subject_ds(["s1", "s3"]),
+            val_subject_dataset=_real_subject_ds(["s2"]),
+        )
+
+
+def test_validate_experiment_partitions_allows_same_split_cell_bag_overlap():
+    """A subject's cells and that SAME subject's bag both being in "train" is
+    fine and expected — only cross-split overlap is leakage."""
+    groups = validate_experiment_partitions(
+        train_cell_dataset=_real_cell_ds(["s1"]),
+        val_cell_dataset=_real_cell_ds(["s2"]),
+        train_subject_dataset=_real_subject_ds(["s1"]),
+        val_subject_dataset=_real_subject_ds(["s2"]),
+    )
+    assert groups["train"] == {"s1"}
+
+
+def test_validate_experiment_partitions_checks_test_partition_too():
+    with pytest.raises(ValueError):
+        validate_experiment_partitions(
+            train_cell_dataset=_real_cell_ds(["s1"]),
+            val_cell_dataset=_real_cell_ds(["s2"]),
+            train_subject_dataset=_real_subject_ds(["s1"]),
+            val_subject_dataset=_real_subject_ds(["s2"]),
+            test_cell_dataset=_real_cell_ds(["s1"]),  # s1 leaked into test
+            test_subject_dataset=_real_subject_ds([]),
+        )
+
+
+def test_validate_experiment_partitions_skips_diagnostic_datasets():
+    diag = _dataset(np.zeros(10, dtype="int64"))  # diagnostic_mode=True
+    groups = validate_experiment_partitions(
+        train_cell_dataset=diag, val_cell_dataset=diag,
+        train_subject_dataset=_real_subject_ds(["s1"]),
+        val_subject_dataset=_real_subject_ds(["s1"]),  # would overlap if enforced
+    )
+    assert groups == {}
+
+
+def test_validate_experiment_partitions_rejects_empty_partition():
+    with pytest.raises(ValueError):
+        validate_experiment_partitions(
+            train_cell_dataset=_real_cell_ds([]),
+            val_cell_dataset=_real_cell_ds(["s1"]),
+            train_subject_dataset=_real_subject_ds([]),
+            val_subject_dataset=_real_subject_ds(["s1"]),
+        )
+
+
+def test_trainer_phase3_rejects_train_cell_val_bag_overlap():
+    trainer = _trainer()
+    trainer.cfg.update({"phase1_epochs": 1, "phase2_epochs": 1, "phase3_epochs": 1})
+    with pytest.raises(ValueError):
+        trainer.phase3(
+            train_cell_dataset=_real_cell_ds(["s1", "s3"]),
+            val_cell_dataset=_real_cell_ds(["s2"]),
+            train_subject_dataset=_real_subject_ds(["s1"]),
+            val_subject_dataset=_real_subject_ds(["s2", "s3"]),
+            skip_eligibility_check=True,
+        )
+
+
+# ─── Cell-type ID validation ──────────────────────────────────────────────────
+
+def test_validate_cell_type_ids_accepts_valid_boundary_ids():
+    ids = validate_cell_type_ids(np.array([0, 1, 2, 3]), num_cell_types=4, n_expected=4)
+    assert ids.tolist() == [0, 1, 2, 3]
+
+
+def test_validate_cell_type_ids_rejects_negative_id():
+    with pytest.raises(ValueError):
+        validate_cell_type_ids(np.array([0, -1, 2]), num_cell_types=4, n_expected=3)
+
+
+def test_validate_cell_type_ids_rejects_id_equal_to_num_cell_types():
+    with pytest.raises(ValueError):
+        validate_cell_type_ids(np.array([0, 4]), num_cell_types=4, n_expected=2)
+
+
+def test_validate_cell_type_ids_rejects_fractional_id():
+    with pytest.raises(ValueError):
+        validate_cell_type_ids(np.array([0.0, 1.5]), num_cell_types=4, n_expected=2)
+
+
+def test_validate_cell_type_ids_rejects_nan():
+    with pytest.raises(ValueError):
+        validate_cell_type_ids(np.array([0.0, np.nan]), num_cell_types=4, n_expected=2)
+
+
+def test_validate_cell_type_ids_rejects_wrong_length():
+    with pytest.raises(ValueError):
+        validate_cell_type_ids(np.array([0, 1, 2]), num_cell_types=4, n_expected=5)
+
+
+def test_trainer_predict_rejects_invalid_cell_type_id():
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": "/tmp/_test_ckpt_predict"}})
+    n = 10
+    with pytest.raises(ValueError):
+        trainer.predict(
+            np.random.randn(n, GENES).astype("float32"),
+            np.array([0, 1, 2, 99, 0, 0, 0, 0, 0, 0]),  # 99 out of range
+        )
+
+
+# ─── Held-out test evaluation enforcement ─────────────────────────────────────
+
+def _trainer_with_seen_subjects(train_subjects, val_subjects, tmp_path):
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    trainer = Trainer(model, {"train": {"phase1_epochs": 1, "checkpoint_dir": str(tmp_path)}})
+    train_ds = _real_cell_ds(train_subjects)
+    val_ds   = _real_cell_ds(val_subjects)
+    trainer.phase1(train_ds, val_ds)
+    return trainer
+
+
+def test_final_test_evaluation_rejects_test_subject_seen_in_train(tmp_path):
+    trainer = _trainer_with_seen_subjects(["s1", "s2"], ["s3"], tmp_path)
+    with pytest.raises(ValueError):
+        trainer.final_test_evaluation(
+            test_cell_dataset=_real_cell_ds(["s1"]),  # s1 was in train
+            test_subject_dataset=_real_subject_ds(["s1"]),
+        )
+
+
+def test_final_test_evaluation_rejects_test_subject_seen_in_val(tmp_path):
+    trainer = _trainer_with_seen_subjects(["s1", "s2"], ["s3"], tmp_path)
+    with pytest.raises(ValueError):
+        trainer.final_test_evaluation(
+            test_cell_dataset=_real_cell_ds(["s3"]),  # s3 was in val
+            test_subject_dataset=_real_subject_ds(["s3"]),
+        )
+
+
+def test_final_test_evaluation_accepts_genuinely_held_out_subjects(tmp_path):
+    trainer = _trainer_with_seen_subjects(["s1", "s2"], ["s3"], tmp_path)
+    report = trainer.final_test_evaluation(
+        test_cell_dataset=_real_cell_ds(["s4"]),
+        test_subject_dataset=_real_subject_ds(["s4"]),
+        phase=1,
+    )
+    assert report["provenance"]["split_name"] == "test"
+    assert report["provenance"]["is_held_out"] is True
+    assert report["provenance"]["is_pristine"] is True
+    assert (tmp_path / "heldout_test_report.json").exists()
+    assert (tmp_path / "heldout_test_predictions.json").exists()
+
+
+def test_final_test_evaluation_blocks_repeat_run_by_default(tmp_path):
+    trainer = _trainer_with_seen_subjects(["s1", "s2"], ["s3"], tmp_path)
+    trainer.final_test_evaluation(
+        test_cell_dataset=_real_cell_ds(["s4"]),
+        test_subject_dataset=_real_subject_ds(["s4"]),
+        phase=1,
+    )
+    with pytest.raises(RuntimeError):
+        trainer.final_test_evaluation(
+            test_cell_dataset=_real_cell_ds(["s4"]),
+            test_subject_dataset=_real_subject_ds(["s4"]),
+            phase=1,
+        )
+
+
+def test_final_test_evaluation_allow_repeat_marks_result_non_pristine(tmp_path):
+    trainer = _trainer_with_seen_subjects(["s1", "s2"], ["s3"], tmp_path)
+    trainer.final_test_evaluation(
+        test_cell_dataset=_real_cell_ds(["s4"]),
+        test_subject_dataset=_real_subject_ds(["s4"]),
+        phase=1,
+    )
+    report = trainer.final_test_evaluation(
+        test_cell_dataset=_real_cell_ds(["s4"]),
+        test_subject_dataset=_real_subject_ds(["s4"]),
+        allow_repeat=True,
+        phase=1,
+    )
+    assert report["provenance"]["test_evaluation_run_count"] == 2
+    assert report["provenance"]["is_pristine"] is False

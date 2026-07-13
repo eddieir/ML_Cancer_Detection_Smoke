@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 import yaml
 
 from constants import CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES
+from metrics import multiclass_f1_report
 from model import MultiSmokeCancerNet
 from train import CellLevelDataset, SubjectLevelDataset, load_checkpoint_into, subject_collate_fn
 
@@ -81,12 +82,21 @@ def _smoke_metrics(y_true: List[int], y_pred: List[int]) -> Dict:
     row_sums = cm_norm.sum(axis=1, keepdims=True)
     cm_norm = np.divide(cm_norm, row_sums, out=np.zeros_like(cm_norm), where=row_sums != 0)
 
+    # Same shared definition Trainer.phase1 uses for checkpoint selection —
+    # classification_report's macro/weighted avg already use the explicit
+    # full label list passed above, so these numbers agree with f1_report's
+    # by construction; f1_report additionally names which classes had zero
+    # true examples so this number isn't mistaken for a full 6-class score.
+    f1_report = multiclass_f1_report(y_true, y_pred, N_SMOKE_CLASSES)
+
     return {
         "n":               len(y_true),
         "accuracy":        round(report["accuracy"], 4),
         "balanced_accuracy": round(balanced_accuracy_score(y_true, y_pred), 4),
         "macro_f1":        round(report["macro avg"]["f1-score"], 4),
         "weighted_f1":      round(report["weighted avg"]["f1-score"], 4),
+        "classes_absent_from_targets": f1_report["classes_absent_from_targets"],
+        "is_partial":       f1_report["is_partial"],
         "per_class": {
             k: {
                 "precision": round(v["precision"], 4),

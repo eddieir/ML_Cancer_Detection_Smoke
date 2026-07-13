@@ -12,11 +12,11 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
 from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
+from metrics import multiclass_f1_report, validate_cell_type_ids
 from model import MultiSmokeCancerNet, MultiTaskLoss
 
 
@@ -183,15 +183,8 @@ def assert_disjoint_subjects(*datasets, names: Optional[List[str]] = None) -> No
     manifest bug or a manual dataset-construction mistake fails loudly
     instead of silently letting a subject's cells appear in two splits.
     """
-    def _ids(ds) -> set:
-        if isinstance(ds, CellLevelDataset):
-            return set(ds.subject_ids.tolist())
-        if isinstance(ds, SubjectLevelDataset):
-            return {str(b["subject_id"]) for b in ds.bags}
-        return {str(s) for s in ds}
-
     names = names or [f"dataset_{i}" for i in range(len(datasets))]
-    id_sets = [_ids(ds) for ds in datasets]
+    id_sets = [_dataset_subject_ids(ds) for ds in datasets]
     for i in range(len(id_sets)):
         for j in range(i + 1, len(id_sets)):
             overlap = id_sets[i] & id_sets[j]
@@ -201,6 +194,75 @@ def assert_disjoint_subjects(*datasets, names: Optional[List[str]] = None) -> No
                     f"{len(overlap)} subject(s): {sorted(overlap)[:10]}"
                     + (" ..." if len(overlap) > 10 else "")
                 )
+
+
+def _dataset_subject_ids(ds) -> set:
+    """Subject-id set for a CellLevelDataset, a SubjectLevelDataset, or a
+    plain iterable of ids — shared by assert_disjoint_subjects and
+    validate_experiment_partitions."""
+    if ds is None:
+        return set()
+    if isinstance(ds, CellLevelDataset):
+        return set(ds.subject_ids.tolist())
+    if isinstance(ds, SubjectLevelDataset):
+        return {str(b["subject_id"]) for b in ds.bags}
+    return {str(s) for s in ds}
+
+
+def validate_experiment_partitions(
+    train_cell_dataset:    Optional["CellLevelDataset"] = None,
+    val_cell_dataset:      Optional["CellLevelDataset"] = None,
+    train_subject_dataset: Optional["SubjectLevelDataset"] = None,
+    val_subject_dataset:   Optional["SubjectLevelDataset"] = None,
+    test_cell_dataset:     Optional["CellLevelDataset"] = None,
+    test_subject_dataset:  Optional["SubjectLevelDataset"] = None,
+) -> Dict[str, set]:
+    """
+    Full cross-task leakage check. assert_disjoint_subjects, called
+    separately on (train_cell, val_cell) and (train_subject, val_subject) by
+    Trainer._validate_train_val, misses two overlap pairs: a subject whose
+    CELLS are in train but whose BAG is in val, and vice versa. That is a
+    real leakage path Phase 3 exercises (it uses all four datasets together),
+    so this checks it directly by unioning each split's cell-subject-ids and
+    bag-subject-ids into one set per split, then requiring the per-split sets
+    to be pairwise disjoint. (A subject legitimately appearing in both its
+    OWN split's cell dataset and that SAME split's bag dataset is fine and
+    expected — only cross-split overlap is leakage.)
+
+    Diagnostic-mode datasets (synthetic smoke tests with no real subject
+    identity) are skipped entirely — this function only enforces real
+    experiments. Returns the per-split subject-id sets actually checked, so
+    callers (e.g. Trainer.final_test_evaluation) can compare a later test set
+    against previously-validated train/val sets without recomputing them.
+    """
+    all_ds = [train_cell_dataset, val_cell_dataset, train_subject_dataset,
+              val_subject_dataset, test_cell_dataset, test_subject_dataset]
+    if any(getattr(ds, "diagnostic_mode", False) for ds in all_ds if ds is not None):
+        return {}
+
+    groups: Dict[str, set] = {
+        "train": _dataset_subject_ids(train_cell_dataset) | _dataset_subject_ids(train_subject_dataset),
+        "val":   _dataset_subject_ids(val_cell_dataset)   | _dataset_subject_ids(val_subject_dataset),
+    }
+    if test_cell_dataset is not None or test_subject_dataset is not None:
+        groups["test"] = _dataset_subject_ids(test_cell_dataset) | _dataset_subject_ids(test_subject_dataset)
+
+    for name, ids in groups.items():
+        if not ids:
+            raise ValueError(f"validate_experiment_partitions: {name!r} partition has no subjects.")
+
+    names = list(groups.keys())
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            overlap = groups[names[i]] & groups[names[j]]
+            if overlap:
+                raise ValueError(
+                    f"Cross-task subject leakage: {names[i]!r} and {names[j]!r} share "
+                    f"{len(overlap)} subject(s) — checked across BOTH cell-level and "
+                    f"subject-level (bag) datasets, not just same-modality pairs: "
+                    f"{sorted(overlap)[:10]}" + (" ..." if len(overlap) > 10 else "")
+                )
+    return groups
 
 
 class SubjectLevelDataset(Dataset):
@@ -398,6 +460,13 @@ class Trainer:
         self.rare_class_policy:        Optional[str] = None
         self.transductive_batch_correction: bool = False
 
+        # Held-out-test enforcement state: subjects seen as train/val during
+        # this Trainer's lifetime, and how many times final_test_evaluation
+        # has already run — see _record_seen_subjects / final_test_evaluation.
+        self._train_subjects_seen: set = set()
+        self._val_subjects_seen:   set = set()
+        self._test_eval_run_count: int = 0
+
     @classmethod
     def from_config(
         cls,
@@ -453,6 +522,8 @@ class Trainer:
         diagnostic = getattr(train_ds, "diagnostic_mode", False) or getattr(val_ds, "diagnostic_mode", False)
         if not diagnostic:
             assert_disjoint_subjects(train_ds, val_ds, names=[train_name, val_name])
+            self._train_subjects_seen |= _dataset_subject_ids(train_ds)
+            self._val_subjects_seen   |= _dataset_subject_ids(val_ds)
 
     def _save(self, phase: int, metric: float, metric_name: str = "metric", extra: Optional[Dict] = None) -> None:
         """
@@ -600,9 +671,20 @@ class Trainer:
                     targets.extend(batch["smoke_label"].tolist())
 
             acc = sum(p == t for p, t in zip(preds, targets)) / len(targets)
-            f1  = f1_score(targets, preds, average="macro", zero_division=0)
-            history.append({"epoch": epoch, "smoke_acc": acc, "smoke_macro_f1": f1})
+            # Same definition evaluate.py's _smoke_metrics uses (explicit
+            # label list over ALL effective classes, not just classes
+            # observed in this validation batch) — otherwise the metric used
+            # to select this checkpoint could silently disagree with the
+            # macro-F1 later reported for it. See metrics.py.
+            f1_report = multiclass_f1_report(targets, preds, N_SMOKE_CLASSES)
+            f1 = f1_report["macro_f1"]
+            history.append({"epoch": epoch, "smoke_acc": acc, "smoke_macro_f1": f1,
+                             "classes_absent_from_val": f1_report["classes_absent_from_targets"]})
             self._log(f"  epoch {epoch:02d}/{epochs}  smoke_acc={acc:.3f}  smoke_macro_f1={f1:.3f}")
+            if f1_report["is_partial"]:
+                self._log(f"    WARNING: validation split has zero examples of class(es) "
+                           f"{f1_report['classes_absent_from_targets']} — this macro_f1 is "
+                           "partial, not a full-class-set score.")
 
             # Select on macro-F1, not accuracy: accuracy rewards collapsing
             # onto majority classes (see README's "Current results" table),
@@ -727,6 +809,14 @@ class Trainer:
                                   "train_cell", "val_cell")
         self._validate_train_val(train_subject_dataset, val_subject_dataset,
                                   "train_subject", "val_subject")
+        # The two checks above only catch same-modality overlap (train_cell
+        # vs val_cell, train_subject vs val_subject). Phase 3 uses all four
+        # datasets jointly, so a subject whose CELLS are in train but whose
+        # BAG is in val (or vice versa) would otherwise go undetected.
+        validate_experiment_partitions(
+            train_cell_dataset=train_cell_dataset, val_cell_dataset=val_cell_dataset,
+            train_subject_dataset=train_subject_dataset, val_subject_dataset=val_subject_dataset,
+        )
         if not skip_eligibility_check:
             elig_tr = check_mil_eligibility(train_subject_dataset)
             elig_va = check_mil_eligibility(val_subject_dataset)
@@ -818,21 +908,58 @@ class Trainer:
         test_subject_dataset: SubjectLevelDataset,
         phase: int = 3,
         out_dir: Optional[Union[str, Path]] = None,
+        allow_repeat: bool = False,
     ) -> Dict:
         """
         The ONE sanctioned place test data is used: load the validation-
         selected checkpoint for `phase` and evaluate it ONCE on the
-        untouched test split. Never call this more than once per experiment
-        and never feed its output back into model/hyperparameter/threshold
-        selection — doing so turns the test set into a second validation
-        set and invalidates the "held out" label on the result.
+        untouched test split.
 
-        Returns evaluate.py's cell_level/subject_level metrics wrapped with
-        describe_split()-style provenance so the result is unambiguously
-        labeled held-out test performance and can't be confused with
-        training-set or validation-set numbers.
+        Enforcement, not just documentation:
+          - test subjects must be disjoint from every subject seen by
+            _validate_train_val on this Trainer instance so far (i.e. every
+            subject that has appeared in ANY train/val call for ANY phase) —
+            raises ValueError on overlap instead of silently scoring on data
+            that leaked into training/validation.
+          - a second call raises RuntimeError by default (allow_repeat=True
+            is required to deliberately re-run, and the result is then
+            marked non-pristine) — repeated test evaluation without that
+            guard is how a test set quietly becomes a second validation set.
+          - the report is written to its own heldout_test_report.json /
+            heldout_test_predictions.json (separate from evaluation_report.json,
+            which full_report() also writes and which may be called on
+            train/val data elsewhere) with explicit provenance.
+
+        Diagnostic-mode datasets (synthetic smoke tests) skip the
+        subject-overlap check, matching _validate_train_val's behaviour.
         """
+        import json as _json
+        from datetime import datetime, timezone
         from evaluate import Evaluator  # local import — evaluate.py imports from this module
+
+        diagnostic = (getattr(test_cell_dataset, "diagnostic_mode", False)
+                      or getattr(test_subject_dataset, "diagnostic_mode", False))
+        test_subjects = _dataset_subject_ids(test_cell_dataset) | _dataset_subject_ids(test_subject_dataset)
+
+        if not diagnostic:
+            overlap_train = test_subjects & self._train_subjects_seen
+            overlap_val   = test_subjects & self._val_subjects_seen
+            if overlap_train or overlap_val:
+                raise ValueError(
+                    "final_test_evaluation: test subjects overlap subjects already used for "
+                    f"training ({sorted(overlap_train)[:10]}) or validation "
+                    f"({sorted(overlap_val)[:10]}) on this Trainer — refusing to score a "
+                    "'held-out' result on data the model or checkpoint selection has seen."
+                )
+
+        if self._test_eval_run_count > 0 and not allow_repeat:
+            raise RuntimeError(
+                f"final_test_evaluation has already run {self._test_eval_run_count} time(s) "
+                "on this Trainer. Repeated test evaluation risks the test set being used, "
+                "even inadvertently, to guide model/hyperparameter/threshold choices — pass "
+                "allow_repeat=True only for a deliberate re-run, which will be marked "
+                "non-pristine in the saved report."
+            )
 
         self._load_best(phase)
         ev = Evaluator(self.model, self.device)
@@ -840,15 +967,33 @@ class Trainer:
             test_cell_dataset, test_subject_dataset,
             out_dir=out_dir or self.ckpt_dir,
         )
+        self._test_eval_run_count += 1
         report["provenance"] = {
-            "split_name":  "test",
-            "is_held_out": True,
-            "checkpoint":  f"phase{phase}_best.pt",
+            "split_name":     "test",
+            "is_held_out":    True,
+            "checkpoint":     f"phase{phase}_best.pt",
+            "split_manifest_path": self.split_manifest_path,
+            "threshold_source": "default_0.50" if not hasattr(self, "_selected_threshold")
+                                 else "validation_selected",
+            "evaluation_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "test_evaluation_run_count": self._test_eval_run_count,
+            "is_pristine": self._test_eval_run_count == 1,
             "note": "Final held-out test evaluation — run once, not used for model/"
                     "threshold/hyperparameter selection.",
         }
+
+        out = Path(out_dir) if out_dir else self.ckpt_dir
+        if not out.is_absolute():
+            out = Path(__file__).parents[1] / out
+        out.mkdir(parents=True, exist_ok=True)
+        with open(out / "heldout_test_report.json", "w") as f:
+            _json.dump(report, f, indent=2)
+        with open(out / "heldout_test_predictions.json", "w") as f:
+            _json.dump({**raw, "provenance": report["provenance"]}, f)
+
         self._log("[train] final_test_evaluation complete — this is a HELD-OUT TEST result, "
-                   "not a validation or training-set number.")
+                   "not a validation or training-set number. "
+                   f"Saved → {out / 'heldout_test_report.json'}")
         return report
 
     # ── Inference ─────────────────────────────────────────────────────────────
@@ -859,6 +1004,9 @@ class Trainer:
         cell_type_ids: np.ndarray,    # [N]         int
     ) -> Dict:
         """Run inference on one subject. Returns cancer risk + interpretability."""
+        cell_type_ids = validate_cell_type_ids(
+            cell_type_ids, self.model.num_cell_types, n_expected=len(gene_matrix),
+        )
         self.model.eval()
         with torch.no_grad():
             out = self.model.forward_subject(
