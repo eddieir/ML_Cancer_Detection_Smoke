@@ -72,9 +72,23 @@ class Predictor:
     For raw H5AD files, call predict_h5ad() which handles loading automatically.
     """
 
-    def __init__(self, model: MultiSmokeCancerNet, device: str = "cpu"):
+    def __init__(
+        self,
+        model:                  MultiSmokeCancerNet,
+        device:                 str = "cpu",
+        preprocessing_artifact: "Optional[object]" = None,
+    ):
+        """
+        preprocessing_artifact, if given (a data.preprocessing.PreprocessingArtifact),
+        is used to validate that any raw AnnData passed to predict_h5ad() has
+        the exact gene panel/order the model was trained on before running
+        inference — see data/preprocessing.py::verify_compatible. Without it,
+        a caller can silently feed a mismatched gene panel and get a
+        confident-looking but meaningless prediction.
+        """
         self.model  = model.to(device).eval()
         self.device = device
+        self.preprocessing_artifact = preprocessing_artifact
 
     @classmethod
     def from_config(
@@ -83,7 +97,12 @@ class Predictor:
         phase:  int = 3,
         device: str = "cpu",
     ) -> "Predictor":
-        """Load best checkpoint from a given training phase."""
+        """
+        Load best checkpoint from a given training phase. If
+        checkpoint_dir/preprocessing_artifact.json exists (see
+        data/preprocessing.py::PreprocessingArtifact.save), it's loaded too
+        so predict_h5ad() can validate incoming data's gene panel.
+        """
         if device == "cuda" and not torch.cuda.is_available():
             print("[inference] WARNING: CUDA not available — falling back to CPU")
             device = "cpu"
@@ -99,7 +118,15 @@ class Predictor:
             torch.load(ckpt, map_location=device, weights_only=True)
         )
         print(f"[inference] loaded phase {phase} checkpoint  ({ckpt})")
-        return cls(model, device)
+
+        artifact = None
+        artifact_path = ckpt_dir / "preprocessing_artifact.json"
+        if artifact_path.exists():
+            from data.preprocessing import PreprocessingArtifact
+            artifact = PreprocessingArtifact.load(artifact_path)
+            print(f"[inference] loaded preprocessing artifact  ({artifact_path})")
+
+        return cls(model, device, preprocessing_artifact=artifact)
 
     # ── Core prediction — all other methods call this ─────────────────────────
 
@@ -168,6 +195,9 @@ class Predictor:
         import anndata as ad
         adata = ad.read_h5ad(h5ad_path)
         self._validate_h5ad(adata, subject_col, cell_type_col)
+        if self.preprocessing_artifact is not None:
+            from data.preprocessing import verify_compatible
+            verify_compatible(self.preprocessing_artifact, adata.var_names)
 
         X = np.array(
             adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray(),

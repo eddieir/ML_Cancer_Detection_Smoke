@@ -13,11 +13,19 @@ import scanpy as sc
 from constants import DOSE_UNKNOWN
 
 
-def merge_sources(*adatas: ad.AnnData) -> ad.AnnData:
+def merge_sources(*adatas: ad.AnnData, scale: bool = True) -> ad.AnnData:
     """
     Concatenate heterogeneous sources on common gene intersection.
     Assigns batch column for downstream Harmony correction.
-    Scales the merged matrix (z-score) once across the full distribution.
+
+    scale=True (default, legacy behaviour) z-scores the merged matrix across
+    every cell from every source BEFORE any train/val/test split exists —
+    this is preprocessing leakage: validation/test cells influence the
+    mean/std used to scale the training cells. Kept as the default only for
+    backward compatibility with existing callers/tests; the leakage-free
+    path (preprocess.py::run_pipeline_split_aware, data/preprocessing.py)
+    calls merge_sources(*adatas, scale=False) and fits scaling on the
+    train split only via PreprocessingArtifact.
     """
     genes = adatas[0].var_names
     for a in adatas[1:]:
@@ -33,10 +41,11 @@ def merge_sources(*adatas: ad.AnnData) -> ad.AnnData:
 
     merged = ad.concat(clipped, axis=0, join="inner", label="source")
     merged.var_names_make_unique()
-    import scipy.sparse as sp
-    if sp.issparse(merged.X):
-        merged.X = merged.X.toarray()              # explicit: avoids UserWarning from scale()
-    sc.pp.scale(merged, max_value=10)
+    if scale:
+        import scipy.sparse as sp
+        if sp.issparse(merged.X):
+            merged.X = merged.X.toarray()          # explicit: avoids UserWarning from scale()
+        sc.pp.scale(merged, max_value=10)
     print(f"[assembly] merge  final {merged.n_obs:,} cells x {merged.n_vars:,} genes")
     return merged
 
