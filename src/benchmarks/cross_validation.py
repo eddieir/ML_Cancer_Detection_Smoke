@@ -5,24 +5,47 @@ data/splitting.py::grouped_kfold.
 CV always runs over the TRAIN+VAL subject pool of an ExperimentContext —
 the test split is never touched here (see runner.py for the one place a
 frozen final test evaluation happens, after CV has picked a configuration).
-Baselines use subject-summary features (features.py); the neural model uses
-its native cell/bag datasets, subset per fold by subject id.
 
-Undefined per-fold metrics (e.g. AUROC with one class in a fold's val split)
-are recorded as None, never coerced to a filler value — see metrics.py.
+Preprocessing (gene scaling + HVG selection) is refit PER FOLD from
+context.normalized_adata_for_refit, using only that fold's training
+subjects (see fold_preprocessing.py) — reusing the context's outer
+PreprocessingArtifact across folds would leak an inner-CV-validation
+subject's influence on scaling/HVG selection into its own "held-out"
+evaluation. Baselines use subject-summary features built from the fold's
+own refit data; the neural/MIL models train on the SAME fold-specific cell
+and bag datasets, so Phase 1 encoder pretraining never sees a cancer-fold's
+validation subjects either (the cross-task leakage the pooled outer
+train+val cell dataset used to allow).
+
+Undefined per-fold metrics (e.g. AUROC with one class in a fold's val
+split) are recorded as None, never coerced to a filler value — see metrics.py.
 """
 
+import dataclasses
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from data.splitting import grouped_kfold
-from train import CellLevelDataset, MILEligibilityError, SubjectLevelDataset
+from train import (
+    CellLevelDataset,
+    MILEligibilityError,
+    SubjectLevelDataset,
+    assert_disjoint_subjects,
+    validate_experiment_partitions,
+)
 
-from .baselines import CANCER_BASELINES, SMOKE_BASELINES
+from .baselines import CANCER_BASELINES, SMOKE_BASELINES, positive_class_proba
 from .features import build_cancer_subject_features, build_smoke_subject_summary_features
+from .fold_preprocessing import (
+    artifact_fingerprint,
+    bags_from_fold_cell_dataset,
+    fold_train_val_datasets,
+    require_normalized_adata,
+)
 from .metrics import (
     aggregate_metric,
+    aggregate_metric_by_seed,
     cancer_prediction_metrics,
     full_smoke_metrics_report,
     subject_weighted_smoke_metrics,
@@ -33,8 +56,11 @@ DEFAULT_SEEDS = [42, 43, 44]
 
 
 def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelDataset:
-    """Merge two CellLevelDatasets (e.g. a context's train + val splits) into
-    one pool for grouped CV. Never used to merge across train and TEST."""
+    """Merge two CellLevelDatasets (e.g. an outer context's train + val
+    splits) into one pool. Used by ood.py's per-source held-out evaluation
+    and by tests; run_smoke_cv/run_cancer_cv build fold data straight from
+    normalized_adata_for_refit instead (see fold_preprocessing.py) so they
+    no longer need this for CV itself."""
     return CellLevelDataset(
         gene_matrix       = np.concatenate([a.X.numpy(), b.X.numpy()]),
         smoke_labels      = np.concatenate([a.smoke.numpy(), b.smoke.numpy()]),
@@ -48,44 +74,70 @@ def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelD
     )
 
 
+def _majority_label_by_subject(normalized_adata, subjects: Sequence[str], num_classes: int) -> Dict[str, int]:
+    obs = normalized_adata.obs
+    subj_series = obs["subject_id"].astype(str)
+    smoke_series = obs["smoke_type"].astype(int)
+    out = {}
+    for s in subjects:
+        vals = smoke_series[subj_series == str(s)].values
+        out[s] = int(np.bincount(vals, minlength=num_classes).argmax())
+    return out
+
+
+def _fold_context(context, artifact, train_cell_dataset, val_cell_dataset):
+    """Shallow-copied ExperimentContext with the fold's own artifact/cell
+    datasets swapped in, so Trainer.from_experiment_context builds a model
+    with the fold's own input_dim/gene space instead of the outer one."""
+    return dataclasses.replace(
+        context, preprocessing_artifact=artifact,
+        train_cell_dataset=train_cell_dataset, val_cell_dataset=val_cell_dataset,
+    )
+
+
 # ─── Task A: smoke classification CV ──────────────────────────────────────────
 
 def run_smoke_cv(
     context, model_names: Sequence[str], n_folds: int = 5,
     seeds: Sequence[int] = DEFAULT_SEEDS, device: str = "cpu",
 ) -> Dict:
-    pool = concat_cell_datasets(context.train_cell_dataset, context.val_cell_dataset)
+    normalized_adata = require_normalized_adata(context)
     num_classes = context.num_smoke_classes
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
+    n_hvgs = context.preprocessing_artifact.n_hvgs
 
-    X_full, y_full, subject_ids, feature_names = build_smoke_subject_summary_features(
-        pool, num_cell_types=num_cell_types, num_classes=num_classes,
-    )
-    subject_ids = np.array(subject_ids)
+    pool_subjects = sorted(set(context.subjects_for("train")) | set(context.subjects_for("val")))
+    label_by_subject = _majority_label_by_subject(normalized_adata, pool_subjects, num_classes)
+    subject_ids = np.array(pool_subjects)
+    y_full = np.array([label_by_subject[s] for s in pool_subjects])
 
-    results: Dict[str, Dict] = {name: {"folds": [], "hyperparameters": []} for name in model_names}
+    results: Dict[str, Dict] = {name: {"folds": []} for name in model_names}
 
     for seed in seeds:
         folds = grouped_kfold(subject_ids, y_full, n_folds=n_folds, seed=seed)
         for fold_idx, fold in enumerate(folds):
-            train_mask = np.isin(subject_ids, fold["train"])
-            val_mask = np.isin(subject_ids, fold["val"])
-            Xtr, ytr = X_full[train_mask], y_full[train_mask]
-            Xva, yva = X_full[val_mask], y_full[val_mask]
-            val_subj_pool = pool.subset_by_subjects(fold["val"])
+            artifact, train_ds, val_ds = fold_train_val_datasets(context, fold["train"], fold["val"], n_hvgs=n_hvgs)
+            assert_disjoint_subjects(train_ds, val_ds, names=["fold_train", "fold_val"])
+            fp = artifact_fingerprint(artifact)
+
+            Xtr, ytr, _, feature_names = build_smoke_subject_summary_features(train_ds, num_cell_types, num_classes)
+            Xva, yva, _, _ = build_smoke_subject_summary_features(val_ds, num_cell_types, num_classes)
 
             for name in model_names:
                 fold_record = {"seed": seed, "fold": fold_idx,
                                 "classes_absent_from_val": fold["classes_absent_from_val"],
-                                "stratified": fold["stratified"]}
+                                "stratified": fold["stratified"],
+                                "preprocessing_fingerprint": fp,
+                                "fit_subject_ids": sorted(str(s) for s in fold["train"]),
+                                "gene_list_n": len(artifact.gene_list)}
                 if name == "neural":
-                    train_subj_pool = pool.subset_by_subjects(fold["train"])
-                    adapter = NeuralSmokeAdapter(context.config, device=device)
-                    adapter.fit(context, train_subj_pool, val_subj_pool, seed=seed)
-                    preds = adapter.predict(val_subj_pool)
-                    cell_report = full_smoke_metrics_report(val_subj_pool.smoke.numpy(), preds, num_classes)
+                    fold_context = _fold_context(context, artifact, train_ds, val_ds)
+                    adapter = NeuralSmokeAdapter(fold_context.config, device=device)
+                    adapter.fit(fold_context, train_ds, val_ds, seed=seed)
+                    preds = adapter.predict(val_ds)
+                    cell_report = full_smoke_metrics_report(val_ds.smoke.numpy(), preds, num_classes)
                     subj_report = subject_weighted_smoke_metrics(
-                        val_subj_pool.smoke.numpy(), preds, val_subj_pool.subject_ids, num_classes,
+                        val_ds.smoke.numpy(), preds, val_ds.subject_ids, num_classes,
                     )
                     fold_record["hyperparameters"] = adapter.metadata()
                 else:
@@ -93,12 +145,15 @@ def run_smoke_cv(
                     model.fit(Xtr, ytr, seed=seed)
                     preds = model.predict(Xva)
                     cell_report = full_smoke_metrics_report(yva, preds, num_classes)
-                    # subject-summary features are already one row per subject,
-                    # so cell-weighted == subject-weighted for these baselines.
+                    # subject-summary features are already one row per subject:
+                    # cell-weighted is NOT APPLICABLE here (there is no per-cell
+                    # prediction to weight), never claimed equal to subject-weighted.
                     subj_report = cell_report
                     fold_record["hyperparameters"] = model.metadata()
+                    fold_record["evaluation_mode"] = "subject_summary"
 
-                fold_record["cell_weighted_macro_f1"] = cell_report["macro_f1"]
+                fold_record["cell_weighted_macro_f1"] = cell_report["macro_f1"] if name == "neural" else None
+                fold_record["cell_weighted_macro_f1_not_applicable"] = name != "neural"
                 fold_record["subject_weighted_macro_f1"] = subj_report["macro_f1"]
                 fold_record["balanced_accuracy"] = cell_report.get("balanced_accuracy")
                 fold_record["weighted_f1"] = cell_report["weighted_f1"]
@@ -107,8 +162,12 @@ def run_smoke_cv(
 
     for name in model_names:
         folds = results[name]["folds"]
+        fold_seeds = [f["seed"] for f in folds]
         results[name]["subject_weighted_macro_f1"] = aggregate_metric(
             [f["subject_weighted_macro_f1"] for f in folds],
+        )
+        results[name]["subject_weighted_macro_f1_by_seed"] = aggregate_metric_by_seed(
+            [f["subject_weighted_macro_f1"] for f in folds], fold_seeds,
         )
         results[name]["cell_weighted_macro_f1"] = aggregate_metric(
             [f["cell_weighted_macro_f1"] for f in folds],
@@ -118,7 +177,7 @@ def run_smoke_cv(
     return {
         "task": "smoke_classification", "primary_metric": "subject_weighted_macro_f1",
         "n_folds_requested": n_folds, "seeds": list(seeds),
-        "feature_names_n": len(feature_names), "results": results,
+        "results": results,
     }
 
 
@@ -128,53 +187,77 @@ def run_cancer_cv(
     context, model_names: Sequence[str], n_folds: int = 5,
     seeds: Sequence[int] = DEFAULT_SEEDS, device: str = "cpu", pooling: Optional[str] = None,
 ) -> Dict:
-    pool_bags = list(context.train_bags) + list(context.val_bags)
-    known_bags = [b for b in pool_bags if b.get("cancer_label_known")]
-    num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
+    normalized_adata = require_normalized_adata(context)
+    all_bags = list(context.train_bags) + list(context.val_bags)
+    outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
+    known_subjects = sorted(outcomes_by_subject.keys())
+    if len(known_subjects) < 2:
+        raise ValueError("run_cancer_cv: fewer than 2 subjects with a known cancer outcome in train+val")
 
-    X_full, y_full, subject_ids, feature_names = build_cancer_subject_features(known_bags, num_cell_types)
-    subject_ids = np.array(subject_ids)
-    bags_by_subject = {str(b["subject_id"]): b for b in known_bags}
+    num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
+    n_hvgs = context.preprocessing_artifact.n_hvgs
+    min_cells = context.config.get("data", context.config).get("min_cells_per_subject", 50)
+
+    subject_ids = np.array(known_subjects)
+    y_full = np.array([outcomes_by_subject[s] for s in known_subjects])
 
     mil_names = [n for n in model_names if n in ("neural", "mean_mil", "max_mil", "attention_mil")]
     baseline_names = [n for n in model_names if n not in mil_names]
-
-    results: Dict[str, Dict] = {name: {"folds": []} for name in model_names}
     pooling_for = {
         "mean_mil": "mean", "max_mil": "max", "attention_mil": "attention", "neural": pooling or "attention",
     }
 
+    results: Dict[str, Dict] = {name: {"folds": []} for name in model_names}
+
     for seed in seeds:
         folds = grouped_kfold(subject_ids, y_full, n_folds=n_folds, seed=seed)
         for fold_idx, fold in enumerate(folds):
-            train_mask = np.isin(subject_ids, fold["train"])
-            val_mask = np.isin(subject_ids, fold["val"])
-            Xtr, ytr = X_full[train_mask], y_full[train_mask]
-            Xva, yva = X_full[val_mask], y_full[val_mask]
+            artifact, train_cell_ds, val_cell_ds = fold_train_val_datasets(
+                context, fold["train"], fold["val"], n_hvgs=n_hvgs,
+            )
+            fp = artifact_fingerprint(artifact)
+            train_bags_fold = bags_from_fold_cell_dataset(train_cell_ds, outcomes_by_subject, min_cells)
+            val_bags_fold = bags_from_fold_cell_dataset(val_cell_ds, outcomes_by_subject, min_cells)
+            if not train_bags_fold or not val_bags_fold:
+                for name in model_names:
+                    results[name]["folds"].append({
+                        "auroc": None, "auprc": None,
+                        "auroc_auprc_undefined_reason": "fold has no subject with >= min_cells_per_subject cells",
+                        "seed": seed, "fold": fold_idx, "preprocessing_fingerprint": fp,
+                    })
+                continue
+
+            Xtr, ytr, _, _ = build_cancer_subject_features(train_bags_fold, num_cell_types)
+            Xva, yva, _, _ = build_cancer_subject_features(val_bags_fold, num_cell_types)
 
             for name in baseline_names:
                 model = CANCER_BASELINES[name]()
                 model.fit(Xtr, ytr, seed=seed)
-                proba = model.predict_proba(Xva)[:, 1]
+                proba = positive_class_proba(model, Xva)
                 report = cancer_prediction_metrics(yva, proba)
-                report.update({"seed": seed, "fold": fold_idx, "hyperparameters": model.metadata()})
+                report.update({"seed": seed, "fold": fold_idx, "hyperparameters": model.metadata(),
+                               "preprocessing_fingerprint": fp, "train_classes_present": sorted(set(ytr.tolist()))})
                 results[name]["folds"].append(report)
 
             for name in mil_names:
-                train_bags_fold = [bags_by_subject[s] for s in fold["train"]]
-                val_bags_fold = [bags_by_subject[s] for s in fold["val"]]
                 train_sd = SubjectLevelDataset(train_bags_fold)
                 val_sd = SubjectLevelDataset(val_bags_fold)
                 try:
+                    validate_experiment_partitions(
+                        train_cell_dataset=train_cell_ds, val_cell_dataset=val_cell_ds,
+                        train_subject_dataset=train_sd, val_subject_dataset=val_sd,
+                    )
+                    fold_context = _fold_context(context, artifact, train_cell_ds, val_cell_ds)
                     adapter = NeuralCancerAdapter(pooling=pooling_for[name], device=device)
                     adapter.fit(
-                        context, context.train_cell_dataset, context.val_cell_dataset,
+                        fold_context, train_cell_ds, val_cell_ds,
                         train_sd, val_sd, seed=seed, pretrain_epochs=2,
                     )
                     proba = adapter.predict_proba(val_sd)
                     y_val_ordered = np.array([b["cancer_label"] for b in val_sd.bags])
                     report = cancer_prediction_metrics(y_val_ordered, proba)
-                    report.update({"seed": seed, "fold": fold_idx, "hyperparameters": adapter.metadata()})
+                    report.update({"seed": seed, "fold": fold_idx, "hyperparameters": adapter.metadata(),
+                                   "preprocessing_fingerprint": fp})
                 except MILEligibilityError as e:
                     # A fold this small failing MIL eligibility (see
                     # train.check_mil_eligibility) is an honest, expected
@@ -183,18 +266,20 @@ def run_cancer_cv(
                     # the whole CV run or silently drop the fold.
                     report = {
                         "auroc": None, "auprc": None, "auroc_auprc_undefined_reason": str(e),
-                        "seed": seed, "fold": fold_idx, "hyperparameters": None,
+                        "seed": seed, "fold": fold_idx, "hyperparameters": None, "preprocessing_fingerprint": fp,
                     }
                 results[name]["folds"].append(report)
 
     for name in model_names:
         folds = results[name]["folds"]
+        fold_seeds = [f["seed"] for f in folds]
         results[name]["auroc"] = aggregate_metric([f["auroc"] for f in folds])
+        results[name]["auroc_by_seed"] = aggregate_metric_by_seed([f["auroc"] for f in folds], fold_seeds)
         results[name]["auprc"] = aggregate_metric([f["auprc"] for f in folds])
         results[name]["n_folds_run"] = len(folds)
 
     return {
         "task": "cancer_prediction", "primary_metric": "auroc",
         "n_folds_requested": n_folds, "seeds": list(seeds),
-        "feature_names_n": len(feature_names), "results": results,
+        "results": results,
     }

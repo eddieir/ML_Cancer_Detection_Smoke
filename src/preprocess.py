@@ -327,6 +327,18 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
             **split_kwargs,
         )
 
+    # Snapshot the full-gene, normalized-but-not-yet-HVG-selected-or-scaled
+    # AnnData BEFORE fit_preprocessing/apply_preprocessing run. Neither
+    # function mutates `merged` in place (both return new objects), so this
+    # is a cheap reference, not a copy — and it's exactly the "pre-feature-
+    # selection, normalized/log-transformed expression" a benchmark needs to
+    # refit its own PreprocessingArtifact per CV fold (see
+    # src/benchmarks/fold_preprocessing.py) instead of reusing this one
+    # artifact (fit on ALL original-train subjects) across every fold, which
+    # would leak an inner-CV-validation subject's influence on scaling/HVG
+    # selection into that same fold's "held-out" evaluation.
+    normalized_adata_for_refit = merged
+
     # ── 5/6. Fit preprocessing on train only, apply to everyone ─────────────
     artifact = fit_preprocessing(
         merged, set(manifest.train_subjects),
@@ -417,6 +429,10 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
             "malignancy_unknown_cells": int((~cell_data["malignancy_known"]).sum()),
         },
         "transductive_batch_correction": transductive_used,
+        # pre-HVG, pre-scaling normalized AnnData — see the comment at its
+        # assignment above. Benchmarks-only; run_pipeline_split_aware's other
+        # callers/tests are unaffected by this additional key.
+        "normalized_adata_for_refit": normalized_adata_for_refit,
     }
 
 

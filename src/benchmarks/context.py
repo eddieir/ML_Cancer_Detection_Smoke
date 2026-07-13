@@ -10,6 +10,7 @@ accidentally read `bags` (the whole, unsplit dataset) when it meant
 `train_bags`.
 """
 
+import copy
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,7 @@ import numpy as np
 from data.label_mapping import EffectiveLabelMapping
 from data.preprocessing import PreprocessingArtifact
 from data.splitting import SplitManifest
+from train import validate_experiment_partitions, SubjectLevelDataset
 
 
 def get_git_sha() -> Optional[str]:
@@ -37,6 +39,87 @@ def _dataset_source_summary(cell_dataset) -> Dict[str, int]:
         return {}
     sources, counts = np.unique(cell_dataset.dataset_source, return_counts=True)
     return {str(s): int(c) for s, c in zip(sources, counts)}
+
+
+def _validate_context(
+    train_cell_dataset, val_cell_dataset, test_cell_dataset,
+    train_bags, val_bags, test_bags,
+    preprocessing_artifact: PreprocessingArtifact, label_mapping: EffectiveLabelMapping,
+    split_manifest: SplitManifest,
+) -> None:
+    """
+    Fail loudly, before returning a usable context, on any of the mismatches
+    that would otherwise surface later as a silent wrong-shape model, a
+    mislabeled prediction, or a leakage bug discovered only by inspection.
+    """
+    # 1. cross-task disjointness (cell vs cell, bag vs bag, cell vs bag,
+    # across all three splits at once) — reuses train.py's own leakage guard
+    # rather than re-implementing a second, possibly-inconsistent version.
+    validate_experiment_partitions(
+        train_cell_dataset=train_cell_dataset, val_cell_dataset=val_cell_dataset,
+        test_cell_dataset=test_cell_dataset,
+        train_subject_dataset=SubjectLevelDataset(train_bags, require_known_outcome=False),
+        val_subject_dataset=SubjectLevelDataset(val_bags, require_known_outcome=False),
+        test_subject_dataset=SubjectLevelDataset(test_bags, require_known_outcome=False),
+    )
+
+    # 2. dataset subject sets match the split manifest exactly
+    for name, ds, manifest_subjects in (
+        ("train", train_cell_dataset, split_manifest.train_subjects),
+        ("val", val_cell_dataset, split_manifest.val_subjects),
+        ("test", test_cell_dataset, split_manifest.test_subjects),
+    ):
+        if ds is None or getattr(ds, "diagnostic_mode", False):
+            continue
+        ds_subjects = set(ds.subject_ids.tolist())
+        manifest_set = {str(s) for s in manifest_subjects}
+        unexpected = ds_subjects - manifest_set
+        if unexpected:
+            raise ValueError(
+                f"ExperimentContext: {name}_cell_dataset contains subject(s) "
+                f"{sorted(unexpected)[:5]} not present in split_manifest.{name}_subjects."
+            )
+
+    # 3. gene count consistency: artifact vs every cell/bag matrix width
+    n_genes = len(preprocessing_artifact.gene_list)
+    for name, ds in (("train_cell_dataset", train_cell_dataset), ("val_cell_dataset", val_cell_dataset),
+                     ("test_cell_dataset", test_cell_dataset)):
+        if ds is not None and len(ds) > 0 and ds.X.shape[1] != n_genes:
+            raise ValueError(f"ExperimentContext: {name} has {ds.X.shape[1]} genes, "
+                              f"preprocessing_artifact has {n_genes}.")
+    for name, bags in (("train_bags", train_bags), ("val_bags", val_bags), ("test_bags", test_bags)):
+        for b in bags:
+            if b["gene_matrix"].shape[1] != n_genes:
+                raise ValueError(
+                    f"ExperimentContext: {name} subject {b['subject_id']} bag has "
+                    f"{b['gene_matrix'].shape[1]} genes, preprocessing_artifact has {n_genes}."
+                )
+
+    # 4. artifact's embedded label mapping matches the context's label_mapping
+    if preprocessing_artifact.label_mapping is not None:
+        artifact_mapping = EffectiveLabelMapping.from_dict(preprocessing_artifact.label_mapping)
+        artifact_mapping.validate_compatible(label_mapping, "preprocessing_artifact", "context.label_mapping")
+
+    # 5. effective smoke labels within [0, K)
+    k = label_mapping.k
+    for name, ds in (("train_cell_dataset", train_cell_dataset), ("val_cell_dataset", val_cell_dataset),
+                     ("test_cell_dataset", test_cell_dataset)):
+        if ds is not None and len(ds) > 0:
+            bad = ds.smoke[(ds.smoke < 0) | (ds.smoke >= k)]
+            if len(bad) > 0:
+                raise ValueError(f"ExperimentContext: {name} has smoke label(s) outside [0, {k}): "
+                                  f"{sorted(set(bad.tolist()))[:5]}")
+
+    # 6. no non-finite expression values
+    for name, ds in (("train_cell_dataset", train_cell_dataset), ("val_cell_dataset", val_cell_dataset),
+                     ("test_cell_dataset", test_cell_dataset)):
+        if ds is not None and len(ds) > 0 and not torch_isfinite_all(ds.X):
+            raise ValueError(f"ExperimentContext: {name} contains non-finite (NaN/Inf) expression values.")
+
+
+def torch_isfinite_all(tensor) -> bool:
+    import torch
+    return bool(torch.isfinite(tensor).all())
 
 
 @dataclass
@@ -57,6 +140,16 @@ class ExperimentContext:
     seed:    int
     dataset_source_summary: Dict[str, Dict[str, int]] = field(default_factory=dict)
     git_sha: Optional[str] = None
+    # Full-gene, normalized-but-not-yet-HVG-selected-or-scaled AnnData (see
+    # preprocess.py::run_pipeline_split_aware). Required for any grouped-CV
+    # or leave-one-source-out run — see fold_preprocessing.py — since
+    # reusing the OUTER preprocessing_artifact (fit on ALL original-train
+    # subjects) across CV folds leaks an inner-validation subject's
+    # influence on scaling/HVG selection into that fold. None only for
+    # hand-built contexts that don't intend to run CV (e.g. a context built
+    # to test something else entirely) — CV code must fail clearly, not
+    # silently fall back to the outer artifact, when this is None.
+    normalized_adata_for_refit: Optional["object"] = None
 
     @property
     def num_smoke_classes(self) -> int:
@@ -104,6 +197,12 @@ class ExperimentContext:
             "test":  _dataset_source_summary(result["test_cell_dataset"]),
         }
 
+        _validate_context(
+            result["train_cell_dataset"], result["val_cell_dataset"], result["test_cell_dataset"],
+            result["train_bags"], result["val_bags"], result["test_bags"],
+            result["preprocessing_artifact"], result["label_mapping"], result["split_manifest"],
+        )
+
         return cls(
             train_cell_dataset=result["train_cell_dataset"],
             val_cell_dataset=result["val_cell_dataset"],
@@ -117,8 +216,12 @@ class ExperimentContext:
             rare_class_report=result["rare_class_report"],
             label_provenance_report=result["label_provenance_report"],
             transductive_batch_correction=result["transductive_batch_correction"],
-            config=config,
+            # Deep-copied so no caller holding a reference to the original
+            # config dict can mutate this context's view of it after
+            # construction (section 9's immutability requirement).
+            config=copy.deepcopy(config),
             seed=resolved_seed,
             dataset_source_summary=summary,
             git_sha=get_git_sha(),
+            normalized_adata_for_refit=result.get("normalized_adata_for_refit"),
         )

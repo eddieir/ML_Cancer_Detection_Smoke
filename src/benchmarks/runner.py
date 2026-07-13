@@ -24,7 +24,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from .baselines import CANCER_BASELINES, SMOKE_BASELINES
+from .baselines import CANCER_BASELINES, SMOKE_BASELINES, positive_class_proba
 from .calibration import build_frozen_policy
 from .context import ExperimentContext
 from .cross_validation import run_cancer_cv, run_smoke_cv
@@ -98,10 +98,32 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
     manifest = SplitManifest(seed=seed, train_subjects=train_subj, val_subjects=val_subj, test_subjects=test_subj)
 
     config = {
+        "data": {"min_cells_per_subject": 5},
         "model": {"embedding_dim": 16, "attention_dim": 8, "num_cell_types": n_ct},
         "train": {"phase1_epochs": 1, "phase2_epochs": 1, "phase1_batch_size": 64,
                   "checkpoint_dir": "checkpoints/benchmarks_synthetic"},
+        "benchmarks": {"species_by_source": {"sourceA": "human", "sourceB": "human"}},
     }
+
+    # Pre-HVG, pre-scaling "normalized" AnnData standing in for what
+    # run_pipeline_split_aware() captures on real data — required so CV can
+    # refit preprocessing per fold (see fold_preprocessing.py) instead of
+    # reusing this synthetic context's single outer artifact across folds.
+    import anndata as ad
+    import pandas as pd
+    all_X = np.concatenate([Xtr, Xva, Xte])
+    all_y = np.concatenate([ytr, yva, yte])
+    all_subj = np.concatenate([str_, sva, ste])
+    all_src = np.concatenate([srctr, srcva, srcte])
+    all_ct = rng.randint(0, n_ct, len(all_y))
+    obs = pd.DataFrame({
+        "subject_id": all_subj, "smoke_type": all_y, "cell_type_id": all_ct,
+        "malignancy": 0.0, "malignancy_known": False,
+        "exposure_dose": -1.0, "source": all_src,
+    })
+    normalized_adata = ad.AnnData(X=all_X.astype("float32"), obs=obs,
+                                    var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]))
+
     return ExperimentContext(
         train_cell_dataset=train_ds, val_cell_dataset=val_ds, test_cell_dataset=test_ds,
         train_bags=train_bags, val_bags=val_bags, test_bags=test_bags, split_manifest=manifest,
@@ -110,6 +132,7 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
         dataset_source_summary={
             "train": {"sourceA": 100, "sourceB": 60}, "val": {"sourceA": 80}, "test": {"sourceA": 80},
         },
+        normalized_adata_for_refit=normalized_adata,
     )
 
 
@@ -154,7 +177,12 @@ def run_smoke_task(context, args, run_dir) -> dict:
     ood_report = None
     if args.leave_one_source_out:
         ood_models = [m for m in args.models if m in SMOKE_BASELINES]
-        ood_report = run_leave_one_source_out(context, ood_models, device=args.device)
+        bench_cfg = context.config.get("benchmarks", {})
+        ood_report = run_leave_one_source_out(
+            context, ood_models, device=args.device,
+            incompatible_sources=bench_cfg.get("incompatible_sources"),
+            species_by_source=bench_cfg.get("species_by_source"),
+        )
         from .reporting import write_json
         write_json(run_dir / "metrics" / "leave_one_source_out.json", ood_report)
 
@@ -195,10 +223,10 @@ def run_cancer_task(context, args, run_dir) -> dict:
 
         model = CANCER_BASELINES[best_name]()
         model.fit(Xtr, ytr, seed=args.seeds[0])
-        prob_val = model.predict_proba(Xva)[:, 1]
+        prob_val = positive_class_proba(model, Xva)
         policy = build_frozen_policy(yva, prob_val, calibration_method=args.calibration,
                                       threshold_strategy=args.threshold_strategy)
-        prob_test = model.predict_proba(Xte)[:, 1]
+        prob_test = positive_class_proba(model, Xte)
         test_result = policy.apply_to_test(yte, prob_test)
         calibration_report = {"selected_model": best_name, "test_result": test_result}
 
