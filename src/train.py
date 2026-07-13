@@ -512,6 +512,49 @@ class Trainer:
                 config = yaml.safe_load(f)
         return cls(model, config, device, seed=seed)
 
+    @classmethod
+    def from_experiment_context(
+        cls,
+        context: "benchmarks.context.ExperimentContext",
+        device:  str = "cpu",
+        seed:    Optional[int] = None,
+        pooling: Optional[str] = None,
+    ) -> "Trainer":
+        """
+        Build a Trainer whose model, label mapping, and provenance are all
+        derived from one ExperimentContext (src/benchmarks/context.py) — so a
+        benchmark comparing baselines against MultiSmokeCancerNet can never
+        accidentally construct the model with the wrong input_dim or the
+        fixed 6-class head when the rare-class policy already shrank K.
+
+        Rejects (raises ValueError) rather than silently truncating/padding
+        when the context's preprocessing artifact's gene count doesn't match
+        model_config['input_dim'] (if input_dim is explicitly set in config —
+        otherwise it's derived from the context) — a mismatch there means the
+        config was written for a different HVG count than this context
+        actually produced.
+        """
+        model_cfg = dict(context.config.get("model", {}))
+        configured_input_dim = model_cfg.get("input_dim")
+        if configured_input_dim is not None and configured_input_dim != context.input_dim:
+            raise ValueError(
+                f"Trainer.from_experiment_context: config model.input_dim="
+                f"{configured_input_dim} does not match context.input_dim="
+                f"{context.input_dim} (len(preprocessing_artifact.gene_list)). "
+                "Remove the explicit input_dim from config to derive it from "
+                "the context, or fix the mismatch."
+            )
+        model_cfg["input_dim"] = context.input_dim
+
+        model = MultiSmokeCancerNet.from_config(
+            {"model": model_cfg}, num_smoke_types=context.num_smoke_classes, pooling=pooling,
+        )
+        trainer = cls(model, context.config, device=device, seed=seed if seed is not None else context.seed)
+        trainer.set_label_mapping(context.label_mapping)
+        trainer.transductive_batch_correction = context.transductive_batch_correction
+        trainer.rare_class_policy = context.label_mapping.policy
+        return trainer
+
     def set_label_mapping(self, mapping: "EffectiveLabelMapping") -> None:
         """
         The sanctioned way to wire an EffectiveLabelMapping (data/label_mapping.py)

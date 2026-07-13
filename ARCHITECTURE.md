@@ -612,15 +612,58 @@ section; summarized here for architectural completeness:
 Not yet done, tracked in README's "What this pass does not include": the
 full raw-count preprocessing chain reproduced inside `predict_h5ad` (species/
 gene-ID/normalization steps — `input_stage="raw_counts"` is explicitly
-rejected rather than silently mishandled, but not implemented); an
-`ExperimentContext`/`Trainer.from_experiment_data()` auto-wiring pipeline
-output into a Trainer; checkpoint checksum verification and
-optimizer/scheduler resume; baseline/grouped-CV/MIL-comparison experiment
-runners; subject-aware sampling; bulk/single-cell/MIL mode separation;
-species/ortholog-mapping safety; validation-selected threshold/calibration
-tooling; dose-head supervision gating.
+rejected rather than silently mishandled, but not implemented); checkpoint
+checksum verification and optimizer/scheduler resume; subject-aware sampling
+wired into `train.py`'s own curriculum (it exists for benchmark baselines,
+§12); bulk/single-cell/MIL mode separation; species/ortholog-mapping safety
+beyond the config-driven check in §12's leave-one-source-out; dose-head
+supervision gating.
+
+The `ExperimentContext`/`Trainer.from_experiment_context()` auto-wiring,
+baseline/grouped-CV/MIL-comparison experiment runners, and
+validation-selected threshold/calibration tooling previously listed here as
+not-yet-done are now implemented — see §12.
 
 None of these are architecture changes — Stages 1–6 as specified above are
 unchanged. They are pipeline-around-the-architecture fixes that any real
 reported metric must now go through for the metric to be scientifically
 valid.
+
+## 12. Phase 1 Benchmarking Framework
+
+`src/benchmarks/` (branch `improve/phase1-rigorous-benchmarking`) answers
+whether `MultiSmokeCancerNet` actually beats simple baselines under
+identical subject-level splits — not causal modelling, counterfactual
+generation, pathway-constrained learning, or foundation models, which are
+out of scope for this phase. Full task definitions, metrics, baseline list,
+CV/calibration protocol, CLI usage, and output layout are in README's
+[Benchmarking framework](README.md#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines)
+section; architectural summary here:
+
+- **`ExperimentContext`** (`benchmarks/context.py`) is built once from
+  `run_pipeline_split_aware()`'s result and is the only object every
+  baseline, the neural adapter, and the CV runner read train/val/test data
+  from — never the raw pipeline dict, which still exposes the whole,
+  unsplit `bags`/`cell_data` keys a benchmark must not accidentally read.
+- **`Trainer.from_experiment_context()`** (`train.py`) derives
+  `MultiSmokeCancerNet`'s `input_dim` and `num_smoke_types` from the
+  context's `PreprocessingArtifact`/`EffectiveLabelMapping` rather than a
+  static config, and raises on any mismatch — the K-class enforcement §11.12
+  already gave `Trainer.set_label_mapping()` is now the *only* path a
+  benchmark can construct a model through, so it's structurally impossible
+  for a benchmark to build the wrong-width model.
+- **MIL pooling ablation**: `model.py`'s `GatedAttentionMIL` now has two
+  siblings, `MeanPoolingMIL`/`MaxPoolingMIL`, behind the same
+  `forward(z_bag, h_bag) -> (prob, attn_or_None)` interface and a
+  `MultiSmokeCancerNet(pooling=...)` switch (`MIL_POOLINGS` dict) — the
+  encoder, heads, and loss are all unchanged; only the aggregator swaps.
+- **Grouped CV runs over train+val only** (`benchmarks/cross_validation.py`),
+  never test; a fold that fails `train.py::check_mil_eligibility` is caught
+  and recorded as an undefined result with its reason rather than crashing
+  the run or being coerced to a filler AUROC.
+- **Calibration/threshold freezing** (`benchmarks/calibration.py`) is a new,
+  separate mechanism from the model's own fixed 0.70 cutoff mentioned
+  elsewhere in this document — `FrozenThresholdPolicy.apply_to_test` is
+  built to raise on a second call, structurally preventing the
+  fit-calibration-then-peek-then-refit pattern that would invalidate a test
+  evaluation.

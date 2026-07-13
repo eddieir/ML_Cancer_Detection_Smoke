@@ -400,6 +400,96 @@ Full table with citations: [ARCHITECTURE.md §9](ARCHITECTURE.md#9-novel-contrib
 This table is also reproduced automatically in the generated demo report — see
 [Running the full demo](#running-the-full-demo).
 
+## Benchmarking framework (Phase 1: does the neural model beat simple baselines?)
+
+`src/benchmarks/` answers one narrow, honest question: under the exact same
+subject-level splits, does `MultiSmokeCancerNet` actually beat simple
+baselines? It does **not** do causal modelling, counterfactual generation,
+pathway-constrained learning, or foundation-model integration — those are
+explicitly out of scope for this phase.
+
+**Two tasks, defined once and never mixed:**
+
+| | Task A — smoke-type classification | Task B — subject-level cancer prediction |
+|---|---|---|
+| Unit of independence | subject | subject bag |
+| Labels | effective smoke classes 0..K-1 | known cancer outcome only (never fabricated) |
+| Primary metric | **subject-weighted** macro-F1 (one vote per subject — a subject with 10,000 cells cannot outvote one with 100) | AUROC (undefined, not 0.5, if a split has one class) |
+| Secondary metrics | cell-weighted macro-F1, balanced accuracy, weighted F1, per-class P/R/F1, confusion matrix | AUPRC, balanced accuracy, sensitivity, specificity, F1, Brier score, ECE |
+| Eligibility check | [eligibility.py](src/benchmarks/eligibility.py)`::check_task_a_eligibility` | `check_task_b_eligibility` — subjects without a real NLST/TCGA-linked outcome are excluded, never scored as a fabricated negative |
+
+**Baselines** ([baselines.py](src/benchmarks/baselines.py)): majority/prevalence
+predictor, logistic regression, random forest, HistGradientBoosting, and a
+small MLP (a few thousand parameters vs. MultiSmokeCancerNet's ~2.9M) — all
+fit only on the data they're given, with deterministic seeds and recorded
+hyperparameters/library versions. Task A also runs the real neural model
+(`neural`); Task B runs three MIL pooling variants sharing one encoder
+(`mean_mil` / `max_mil` / `attention_mil` — [model.py](src/model.py)'s
+`MIL_POOLINGS`) so gated attention has to earn its extra parameters over
+plain mean/max pooling, not just be assumed better.
+
+**Grouped CV** ([cross_validation.py](src/benchmarks/cross_validation.py)):
+wraps `data/splitting.py::grouped_kfold` over the **train+val subject pool
+only** — test is never touched during CV or hyperparameter search. Folds
+are subject-disjoint; a fold too small for `MILEligibilityError`
+(train.py's `check_mil_eligibility`) is recorded as an undefined result with
+its reason, not silently dropped or coerced to AUROC=0.5. Results are
+aggregated (mean/std/median/95% bootstrap CI, n valid vs. n undefined) across
+folds and seeds `[42, 43, 44]` by default.
+
+**Calibration and frozen threshold** ([calibration.py](src/benchmarks/calibration.py),
+Task B only): Platt/isotonic calibration and threshold selection (fixed 0.5,
+Youden's J, balanced-accuracy, sensitivity-constrained) are fit on
+validation predictions only, then frozen into one `FrozenThresholdPolicy`
+applied to test **exactly once** (`apply_to_test` raises on a second call) —
+replacing the previous non-clinical, unvalidated fixed 0.70 cutoff.
+
+**Statistical comparison** ([reporting.py](src/benchmarks/reporting.py)):
+paired fold-level differences, bootstrap CI, Cohen's d, win/tie/loss count.
+A model is only reported as "meaningfully better" if it wins >=70% of paired
+folds AND the CI on the paired difference excludes zero — a numerically
+higher mean alone is never sufficient (`summarize_comparison`).
+
+**Leave-one-source-out** ([ood.py](src/benchmarks/ood.py)): trains on every
+GEO source except one, evaluates only on the held-out source's subjects.
+Species/label-semantics compatibility across sources is config-driven
+(`incompatible_sources`, `species_by_source`), not auto-inferred — a source
+without that information declared explicitly compatible is marked
+`NOT_COMPARABLE`, not silently included.
+
+```bash
+python -m benchmarks.runner --synthetic --fast     # CI: software-only check, no real data
+PYTHONPATH=src python3 -m benchmarks.runner --synthetic --fast --task smoke
+
+PYTHONPATH=src python3 -m benchmarks.runner --config configs/default.yaml --task smoke \
+    --models majority logistic random_forest gradient_boosting small_mlp neural \
+    --cv-folds 5 --seeds 42 43 44 --output artifacts/benchmarks
+
+PYTHONPATH=src python3 -m benchmarks.runner --config configs/default.yaml --task cancer \
+    --models prevalence logistic random_forest gradient_boosting small_mlp \
+    mean_mil max_mil attention_mil --calibration auto --output artifacts/benchmarks
+```
+
+Each run writes an **immutable** `artifacts/benchmarks/<run_id>/` (a
+colliding `--run-id` raises rather than overwriting) containing
+`run_manifest.json` (git SHA, seeds, split fingerprint, label mapping),
+`eligibility.json`, `metrics/*_folds.{json,csv}`, `calibration/frozen_policy.json`,
+`comparisons.json`, `summary.json`, and a human-readable `report.md` — every
+synthetic run is stamped `synthetic: true` and the report opens with a
+"validates software only" warning so it can never be mistaken for a
+real-data result.
+
+**Known Phase 1 limitations** (see `report.md`'s own limitations section for
+the same list, generated fresh per run): grouped CV reuses the
+`ExperimentContext`'s already train-fit `PreprocessingArtifact` rather than
+refitting HVG/scaling independently inside each fold (safe — the artifact
+was fit on the *original* train split, a subset of every fold's train
+partition — but not the fully independent per-fold refit the ideal protocol
+calls for); the final frozen-threshold test evaluation is wired for baseline
+models only (the neural/MIL adapter isn't yet plugged into that same
+one-shot path); attention weights remain an interpretability aid, not a
+causal explanation, in every pooling variant.
+
 ## Pipeline
 
 ```
@@ -429,6 +519,18 @@ src/
   train.py                three-phase Trainer (cell-level, aggregator, end-to-end)
   evaluate.py             cell-level + subject-level metrics, interpretability report
   inference.py            Predictor — predict_subject / predict_batch / predict_h5ad, plus CLI
+  benchmarks/            Phase 1 leakage-free benchmarking (see "Benchmarking framework" above)
+    context.py             ExperimentContext — the one object every benchmark is built from
+    eligibility.py          Task A/B eligibility reports, computed before any training starts
+    features.py              subject-summary feature construction, out-of-fold helper
+    baselines.py              majority/prevalence, logistic, random forest, gradient boosting, small MLP
+    neural.py                  adapters wrapping Trainer/MultiSmokeCancerNet for CV comparison
+    metrics.py                  subject/cell-weighted F1, AUROC/AUPRC/Brier/ECE, bootstrap CI
+    cross_validation.py          grouped-CV runner around data/splitting.py::grouped_kfold
+    calibration.py                 validation-only calibration + frozen threshold
+    ood.py                          leave-one-dataset-source-out validation
+    reporting.py                    statistical comparison, immutable artifacts, Markdown/CSV report
+    runner.py                        CLI entry point (`python -m benchmarks.runner`)
 configs/
   default.yaml           data / model / train config used by model.py and train.py
 tests/                  one file per src/data module + model/pipeline integration tests
@@ -446,7 +548,8 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (222 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py` |
+| `tests/*` | All modules covered (267 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 9 `test_benchmarks_*.py` files |
+| `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |
@@ -569,29 +672,31 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Run `preprocess.py::run_pipeline_split_aware()` on the real merged data
-  (GSE994 + GSE307690 + GSE123352 + GSE136831 once re-converted), then
-  actually train against the resulting split and report real held-out
-  macro-F1/balanced-accuracy/per-class-F1 — the tooling exists and is
-  tested; this experiment has not been run yet, so no held-out number can
-  be reported honestly today
-- Re-run Phase 1 training with the inverse-frequency class weighting
-  (`CellLevelDataset.smoke_class_weights`, `train.py`) against a real
-  held-out split, not the training-set numbers in the table above
-- Build the baseline-model runner from the improvement plan (majority-class,
-  logistic regression, random forest, small MLP) on the same subject-level
-  splits, so the neural model's real held-out macro-F1 can be judged against
-  something simpler rather than assumed better
-- Wire `grouped_kfold()` into an actual training loop for a real
-  cross-validation experiment (aggregate mean/std/median across folds)
-- Add validation-selected threshold + calibration reporting for the cancer
-  head instead of the current fixed, non-clinical 0.70 cutoff
+- Run `python -m benchmarks.runner` against the real merged data (GSE994 +
+  GSE307690 + GSE123352 + GSE136831 once re-converted) for both tasks — the
+  framework exists and is tested against synthetic data, but has not been
+  run against real data yet, so no real baseline-vs-neural comparison number
+  can be reported honestly today
+- Wire the neural/MIL adapter into the same one-shot frozen-threshold final
+  test evaluation path baselines already use (`benchmarks/runner.py::run_cancer_task`
+  currently only does this for baseline models — a documented, not silent, gap)
+- Refit HVG/scaling independently inside each grouped-CV fold instead of
+  reusing the context's already train-fit `PreprocessingArtifact` — safe as
+  currently implemented (see the Benchmarking framework section's
+  limitations), but not the fully independent per-fold refit the ideal
+  protocol calls for
 - Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
-  labels) and NLST (real cancer outcomes + cigar/dual-use history)
+  labels) and NLST (real cancer outcomes + cigar/dual-use history) — this
+  also unblocks Task B eligibility on real data, not just the current
+  synthetic CI check
 - Add a subject-aware/subject-capped sampler (bound max cells sampled per
   subject per epoch) so a handful of subjects with very large cell counts
   can't dominate a training epoch — class weights are now train-split-only,
-  but no per-epoch subject-balancing sampler exists yet
+  but no per-epoch subject-balancing sampler exists yet (`benchmarks/features.py::cap_cells_per_subject`
+  exists for benchmark baselines but is not yet wired into `train.py`'s own curriculum)
+- Phase 2+ of the wider improvement plan (causal modelling, counterfactual
+  generation, pathway-constrained learning, foundation-model integration) is
+  explicitly out of scope for this benchmarking framework and not started
 - Add explicit bulk-vs-single-cell-vs-MIL experiment-mode separation and
   species-provenance tracking (GSE288003's mouse→human ortholog mapping
   still runs unconditionally with no recorded mapped/unmapped gene counts)

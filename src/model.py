@@ -183,6 +183,42 @@ class GatedAttentionMIL(nn.Module):
         # → cancer_prob [1,1],  attention_weights [N]
 
 
+# ─── MIL pooling ablations ────────────────────────────────────────────────────
+# Mean/max pooling share GatedAttentionMIL's forward(z_bag, h_bag) -> (prob, attn)
+# interface (attn is None where there is no meaningful per-cell weight) so
+# MultiSmokeCancerNet can swap pooling strategy without touching forward_subject.
+# Used by src/benchmarks to ablate whether gated attention actually earns its
+# extra parameters over simple pooling on identical encoder features.
+
+class MeanPoolingMIL(nn.Module):
+    def __init__(self, feat_dim: int = 267, embed_dim: int = 256,
+                 attention_dim: int = 128, dropout: float = 0.2):
+        super().__init__()
+        self.classifier = _mlp([embed_dim, 64, 1], dropout=dropout)
+
+    def forward(self, z_bag: torch.Tensor, h_bag: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        z_sub = z_bag.mean(dim=0, keepdim=True)
+        return torch.sigmoid(self.classifier(z_sub)), None
+
+
+class MaxPoolingMIL(nn.Module):
+    def __init__(self, feat_dim: int = 267, embed_dim: int = 256,
+                 attention_dim: int = 128, dropout: float = 0.2):
+        super().__init__()
+        self.classifier = _mlp([embed_dim, 64, 1], dropout=dropout)
+
+    def forward(self, z_bag: torch.Tensor, h_bag: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        z_sub, _ = z_bag.max(dim=0, keepdim=True)
+        return torch.sigmoid(self.classifier(z_sub)), None
+
+
+MIL_POOLINGS = {
+    "attention": GatedAttentionMIL,
+    "mean":      MeanPoolingMIL,
+    "max":       MaxPoolingMIL,
+}
+
+
 # ─── Full Model ───────────────────────────────────────────────────────────────
 
 class MultiSmokeCancerNet(nn.Module):
@@ -206,18 +242,22 @@ class MultiSmokeCancerNet(nn.Module):
         encoder_dropout:float = 0.3,
         head_dropout:   float = 0.2,
         attention_dim:  int   = 128,
+        pooling:        str   = "attention",
     ):
         super().__init__()
+        if pooling not in MIL_POOLINGS:
+            raise ValueError(f"pooling={pooling!r} must be one of {sorted(MIL_POOLINGS)}")
         self.input_dim      = input_dim
         self.embedding_dim  = embedding_dim
         self.num_smoke      = num_smoke
         self.num_cell_types = num_cell_types
+        self.pooling        = pooling
 
         self.encoder         = CellEncoder(input_dim, [1024, 512], embedding_dim, encoder_dropout)
         self.smoke_head      = SmokeTypeHead(embedding_dim, num_smoke, head_dropout)
         self.malignancy_head = MalignancyHead(embedding_dim, head_dropout)
         self.dose_head       = DoseResponseHead(embedding_dim, head_dropout)
-        self.aggregator      = GatedAttentionMIL(
+        self.aggregator      = MIL_POOLINGS[pooling](
             feat_dim      = embedding_dim + num_smoke + 1 + num_cell_types,
             embed_dim     = embedding_dim,
             attention_dim = attention_dim,
@@ -229,6 +269,7 @@ class MultiSmokeCancerNet(nn.Module):
         cls,
         config: Union[dict, str, Path],
         num_smoke_types: Optional[int] = None,
+        pooling: Optional[str] = None,
     ) -> "MultiSmokeCancerNet":
         """
         Instantiate from a config dict or path to configs/default.yaml.
@@ -253,6 +294,7 @@ class MultiSmokeCancerNet(nn.Module):
             encoder_dropout= c.get("encoder_dropout", 0.3),
             head_dropout   = c.get("head_dropout",    0.2),
             attention_dim  = c.get("attention_dim",   128),
+            pooling        = pooling if pooling is not None else c.get("pooling", "attention"),
         )
 
     def forward_cell(
