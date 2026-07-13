@@ -119,6 +119,18 @@ def _scaled_sklearn_fit(baseline: Baseline, model_cls, X, y, seed, **extra_param
     params.update(extra_params)
     if "random_state" in model_cls().get_params():
         params["random_state"] = seed
+    # MLPClassifier's early_stopping=True carves an internal validation split
+    # out of whatever X/y it's given — with very few training rows (a small
+    # grouped-CV fold or OOD held-out-source split, a real and expected
+    # occurrence, not a bug) that internal split can end up empty and
+    # MLPClassifier raises outright. Disabling early_stopping for small
+    # inputs is a training-stability fallback, not a leakage change: it
+    # doesn't touch what data the model is fit or evaluated on, only
+    # whether it also carves an early-stopping split out of its own
+    # training rows.
+    if params.get("early_stopping") and len(y) < 20:
+        params = dict(params, early_stopping=False)
+        baseline.hyperparams = dict(baseline.hyperparams, early_stopping_disabled_small_n=True)
     baseline.model = Pipeline([("scaler", StandardScaler()), ("model", model_cls(**params))])
     baseline.model.fit(X, y)
     baseline.classes_ = baseline.model.classes_
