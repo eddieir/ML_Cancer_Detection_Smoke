@@ -145,6 +145,22 @@ def test_grouped_kfold_reports_classes_absent_from_val_when_unstratified():
 
 # ─── Grouped K-fold leakage + coverage ───────────────────────────────────────
 
+def test_grouped_kfold_two_subjects_two_classes_does_not_crash():
+    """Previously: a per-class-bucket 'i % effective_folds' assignment reset
+    i=0 for every class, so two subjects in two different classes both got
+    fold index 0 — producing an empty train fold and an empty val fold and
+    crashing on the old assert. A shared round-robin cursor across buckets
+    must spread them into different folds instead."""
+    folds = grouped_kfold(["s1", "s2"], labels=["A", "B"], n_folds=5, seed=1)
+    assert len(folds) == 2
+    for fold in folds:
+        assert fold["train"]
+        assert fold["val"]
+        assert not (set(fold["train"]) & set(fold["val"]))
+    all_val = sorted(s for fold in folds for s in fold["val"])
+    assert all_val == ["s1", "s2"]
+
+
 def test_grouped_kfold_no_leakage_per_fold():
     subject_ids, labels = _synthetic_cells(n_subjects=30, n_classes=3)
     folds = grouped_kfold(subject_ids, labels, n_folds=5, seed=2)

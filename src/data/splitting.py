@@ -343,13 +343,21 @@ def grouped_kfold(
               "(not every class fits >=1 subject per fold); see per-fold "
               "'classes_absent_from_val' for which classes are missing where.")
 
+    # A per-class-bucket "i % effective_folds" assignment resets i=0 for every
+    # class, so e.g. two subjects in two different classes both land in fold 0
+    # (i=0 in each bucket) — leaving another fold with an empty validation set
+    # and this one with an empty training set. A single cursor shared across
+    # all buckets spreads subjects from different classes into different
+    # folds instead of colliding on fold 0 every time.
     rng = np.random.RandomState(seed)
     fold_assignment: Dict[str, int] = {}
-    for lab, subs in buckets.items():
+    fold_cursor = 0
+    for lab, subs in sorted(buckets.items(), key=lambda kv: str(kv[0])):
         subs = sorted(subs)
         rng.shuffle(subs)
-        for i, sid in enumerate(subs):
-            fold_assignment[sid] = i % effective_folds
+        for sid in subs:
+            fold_assignment[sid] = fold_cursor % effective_folds
+            fold_cursor += 1
 
     folds = []
     all_subjects = sorted(subject_labels.keys())
@@ -357,9 +365,20 @@ def grouped_kfold(
     for f in range(effective_folds):
         val_subs   = [s for s in all_subjects if fold_assignment[s] == f]
         train_subs = [s for s in all_subjects if fold_assignment[s] != f]
-        assert not (set(val_subs) & set(train_subs))
-        assert train_subs, f"fold {f}: empty training set"
-        assert val_subs, f"fold {f}: empty validation set"
+        if set(val_subs) & set(train_subs):
+            raise RuntimeError(f"grouped_kfold: fold {f} has overlapping train/val subjects (internal bug)")
+        if not train_subs:
+            raise ValueError(
+                f"grouped_kfold: fold {f} would have an empty training set with "
+                f"{len(subject_labels)} subjects and n_folds={effective_folds}. "
+                "Request fewer folds or provide more subjects."
+            )
+        if not val_subs:
+            raise ValueError(
+                f"grouped_kfold: fold {f} would have an empty validation set with "
+                f"{len(subject_labels)} subjects and n_folds={effective_folds}. "
+                "Request fewer folds or provide more subjects."
+            )
         val_classes = {str(subject_labels[s]) for s in val_subs}
         folds.append({
             "train": train_subs,
