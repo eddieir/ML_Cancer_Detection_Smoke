@@ -171,18 +171,39 @@ def download_geo(accession: str, dest_override: Optional[Path] = None) -> Path:
                 def handle_starttag(self, tag, attrs):
                     if tag == "a":
                         for k, v in attrs:
-                            if k == "href" and v.endswith((".gz", ".h5", ".mtx.gz", ".h5ad")):
+                            if k == "href" and v.endswith((".gz", ".h5", ".mtx.gz", ".h5ad", ".tar")):
                                 self.links.append(v)
 
             parser = _LinkParser()
             parser.feed(r.text)
             for link in parser.links:
-                _download_file(ncbi_ftp + link, dest, link)
+                downloaded = _download_file(ncbi_ftp + link, dest, link)
+                if downloaded.suffix == ".tar":
+                    _extract_tar(downloaded, dest)
     except Exception as e:
         print(f"  [warn] supplementary FTP fetch failed: {e}")
 
     print(f"  [done] {accession} → {dest}/")
     return dest
+
+
+def _extract_tar(tar_path: Path, dest: Path) -> None:
+    """
+    GEO ships some accessions' real count matrices only inside a combined
+    `*_RAW.tar` of per-sample 10x triples (e.g. GSE288003's
+    GSM8757329_Con_{barcodes,genes,matrix}.tsv/mtx.gz +
+    GSM8757330_E-cigs_{...}) rather than as loose suppl files — extract it
+    so those per-sample triples land next to everything else in dest/,
+    where convert_scrna_10x's sibling-file matching can find them.
+    """
+    marker = dest / f".{tar_path.name}.extracted"
+    if marker.exists():
+        print(f"  [skip] already extracted: {tar_path.name}")
+        return
+    print(f"  [extract] {tar_path.name} ...")
+    with tarfile.open(tar_path) as tf:
+        tf.extractall(dest, filter="data")
+    marker.touch()
 
 
 def download_all_geo() -> None:

@@ -266,6 +266,50 @@ def test_read_id_list_single_column_unaffected_by_prefer_symbol(tmp_paths):
     assert converters._read_id_list(path, prefer_symbol_col=True) == ["BC0", "BC1"]
 
 
+def test_convert_gse288003_labels_con_and_ecig_separately(tmp_paths):
+    """
+    Regression test for the real correctness bug: GSE288003's two GSM
+    samples are "Con" (unexposed control mouse) and "E-cigs" (e-cig
+    exposed). Blanket-labelling every cell "vape" (the accession's
+    GEO_DATASETS default) would mislabel the entire control sample.
+    convert_gse288003 must tag each sample with its real condition.
+    """
+    import gzip as gzip_module
+    import scipy.io as sio
+    import scipy.sparse as sp
+
+    tmp, converted = tmp_paths
+    src = tmp / "GSE288003"
+    src.mkdir()
+
+    def _write_sample(prefix, n_genes, n_cells):
+        mtx = sp.random(n_genes, n_cells, density=0.5, format="csr")  # genes x cells
+        sio.mmwrite(str(src / f"{prefix}_matrix.mtx"), mtx)
+        with open(src / f"{prefix}_matrix.mtx", "rb") as f_in, \
+             gzip_module.open(src / f"{prefix}_matrix.mtx.gz", "wb") as f_out:
+            f_out.write(f_in.read())
+        (src / f"{prefix}_matrix.mtx").unlink()
+        with gzip_module.open(src / f"{prefix}_barcodes.tsv.gz", "wt") as f:
+            f.write("\n".join(f"BC{i}" for i in range(n_cells)) + "\n")
+        with gzip_module.open(src / f"{prefix}_genes.tsv.gz", "wt") as f:
+            f.write("\n".join(f"ENSG{i}\tGENE{i}\tGene Expression" for i in range(n_genes)) + "\n")
+
+    _write_sample("GSM8757329_Con", n_genes=6, n_cells=3)
+    _write_sample("GSM8757330_E-cigs", n_genes=6, n_cells=4)
+
+    out_path = converters.convert_gse288003("GSE288003", src)
+    import anndata as ad
+    adata = ad.read_h5ad(out_path)
+
+    assert adata.n_obs == 7
+    con_cells = adata.obs[adata.obs["donor_id"] == "GSM8757329"]
+    ecig_cells = adata.obs[adata.obs["donor_id"] == "GSM8757330"]
+    assert len(con_cells) == 3
+    assert len(ecig_cells) == 4
+    assert (con_cells["smoke_type_name"] == "unexposed").all()
+    assert (ecig_cells["smoke_type_name"] == "vape").all()
+
+
 def test_convert_nlst_outcomes(tmp_paths):
     tmp, converted = tmp_paths
     prsn = tmp / "prsn.csv"
