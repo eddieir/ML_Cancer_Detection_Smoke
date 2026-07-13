@@ -234,11 +234,32 @@ and `Trainer._load_best()` all use it.
 *original, unreordered, unscaled* matrix — silently wrong for any input
 whose gene order didn't already exactly match the artifact. It now applies
 `data/preprocessing.py::apply_preprocessing()` (reorder → subset → train-fit
-scale) for raw input, verifies exact gene-order equality via
-`verify_input_matrix()` for input explicitly declared `already_preprocessed=True`,
-verifies the final width against `model.input_dim`, and refuses to run raw
-input with no `preprocessing_artifact` unless `unsafe_legacy_mode=True` is
-explicitly set.
+scale) for input explicitly declared `input_stage="normalized_expression"`,
+verifies exact gene-order equality via `verify_input_matrix()` for
+`input_stage="model_ready"`, verifies the final width against
+`model.input_dim`, and refuses to run input with no `preprocessing_artifact`
+unless `unsafe_legacy_mode=True` is explicitly set.
+
+**Honest input-stage contract — `already_preprocessed: bool` replaced.**
+The old boolean's `False` branch was documented as accepting "RAW/unprocessed
+expression" but only ever reordered/subset genes and applied train-fit
+scaling — it never reproduced QC, library-size normalization, or
+log-transformation, so genuinely raw counts silently produced invalid
+predictions. `PreprocessingArtifact` does not store QC thresholds, a
+library-size target, or log-transform parameters, so this repository cannot
+honestly claim to support raw counts at inference time. `predict_h5ad()` now
+takes an explicit `input_stage` argument instead:
+`"model_ready"` (exact gene order/scaling match required, no transform
+applied, artifact-version and finite-value checked — was `already_preprocessed=True`),
+`"normalized_expression"` (already QC'd/normalized/log-transformed
+upstream, same as training's `data/transforms.py::normalize` — reorder/
+subset/scale via the artifact only, duplicate genes and non-finite values
+rejected — was `already_preprocessed=False`), or `"raw_counts"`, which is
+now **always rejected** with an explicit "not supported" error rather than
+silently mishandled. `already_preprocessed` is kept only as a deprecated
+alias (`DeprecationWarning`, unambiguous mapping to the two supported
+stages — never to `"raw_counts"`). `PreprocessingArtifact` gained an
+`expected_input_stage` field, validated against the caller's declared stage.
 
 **Full cross-task leakage validation.** The per-phase disjointness checks
 above only compared same-modality datasets (train cells vs. val cells, train
@@ -293,16 +314,44 @@ one cursor shared across all class buckets, and the internal `assert`s were
 replaced with explicit `ValueError`/`RuntimeError` (data-dependent failures
 should never be silenced by `python -O`).
 
+**Effective contiguous smoke-label space.** A rare-class policy that merged
+cigar into dual_use, or excluded it entirely, changed which raw labels were
+*used* — but `model.num_smoke`, macro-F1's class count, the confusion
+matrix, and every displayed class name stayed fixed at 6, leaving a dead
+output neuron and a permanent zero-support row. `src/data/label_mapping.py`
+adds `EffectiveLabelMapping`: built once, deterministically, directly from
+`apply_rare_class_policy()`'s report (never inferred from which classes
+happen to appear in one evaluation split) — a contiguous `0..K-1` space that
+drops merged-away/excluded raw ids. `run_pipeline_split_aware()` transforms
+`obs["smoke_type"]` into this contiguous space before it reaches the split,
+the exported cell dataset, or the bags, and persists the mapping in
+`PreprocessingArtifact.label_mapping`. `MultiSmokeCancerNet.from_config()`
+accepts a `num_smoke_types` override so the model's actual output width
+equals `K`, not a config default. `Trainer.set_label_mapping()` validates
+`mapping.k == model.num_smoke` before wiring it in (raises on mismatch);
+`Trainer.phase1`'s checkpoint-selection macro-F1 and `train_cell_dataset.
+smoke_class_weights()` now use `self.model.num_smoke`, never the fixed
+6-class constant. `Evaluator.from_checkpoint()` and `Predictor.from_config()`
+both peek at a checkpoint's metadata (`train.read_checkpoint_metadata()`)
+*before* constructing the model, so they build it with the checkpoint's
+actual `K` up front instead of failing with an opaque shape-mismatch error
+inside `load_state_dict()` — and if a loaded `PreprocessingArtifact` also
+carries a `label_mapping`, the two are cross-validated
+(`EffectiveLabelMapping.validate_compatible()`), raising a clear error if a
+checkpoint and an artifact came from different rare-class-policy runs.
+Raw labels are preserved unmutated (`smoke_type_raw`) throughout.
+
 **What this pass does *not* include** (explicitly out of scope, not
 silently skipped): a real training run against a held-out split (so there
 is no new "real held-out macro-F1" number to report — see the table above);
-the full raw-count→model-ready input-stage inference contract (species
+the full raw-count preprocessing chain reproduced at inference time (species
 validation, gene-ID harmonization, library-size normalization, and log
-transform reproduced from scratch for genuinely raw counts — `predict_h5ad`
-still only reorders/subsets/scales via the fitted artifact, which assumes
-the input is already normalized/log-transformed the same way training data
-was); an `ExperimentContext`/`Trainer.from_experiment_data()` that wires
-pipeline output into a Trainer automatically (metadata fields like
+transform from genuine raw counts) — `predict_h5ad(input_stage="raw_counts")`
+is explicitly rejected rather than silently mishandled, since
+`PreprocessingArtifact` doesn't store the QC/normalization parameters needed
+to reproduce that chain; only `"model_ready"` and `"normalized_expression"`
+are supported (see above); an `ExperimentContext`/`Trainer.from_experiment_data()`
+that wires pipeline output into a Trainer automatically (metadata fields like
 `split_manifest_path` are still set manually after construction); checkpoint
 checksum verification and full resume support (optimizer/scheduler/
 early-stopper state is not yet saved or restorable); a baseline-model
@@ -317,11 +366,8 @@ computed from the train split only, but there is no per-epoch
 max-cells-per-subject sampler yet); explicit bulk-vs-single-cell-vs-MIL
 experiment-mode separation; species-provenance / cross-species-merge guards
 (GSE288003's mouse→human ortholog mapping still runs unconditionally, with
-no recorded mapped/unmapped gene counts); an effective contiguous label
-space (the rare-class policy changes which smoke labels are used, but
-`num_smoke_types` and the model's output width are still fixed at 6 — a
-merge/exclusion policy does not yet shrink the model's output space);
-probability calibration / validation-selected threshold tooling (the model
+no recorded mapped/unmapped gene counts); probability calibration /
+validation-selected threshold tooling (the model
 still reports risk at a fixed 0.70 cutoff in `train.py::predict` and
 `inference.py`, which is **not** a clinically validated threshold — treat it
 as an arbitrary placeholder; `final_test_evaluation`'s provenance honestly
@@ -400,7 +446,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (176 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_evaluate.py`, `test_inference.py` |
+| `tests/*` | All modules covered (222 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py` |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |

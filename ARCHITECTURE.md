@@ -580,18 +580,45 @@ section; summarized here for architectural completeness:
     two different classes could collide on fold 0, leaving another fold
     with an empty train or validation set. Fold assignment now uses one
     cursor shared across all class buckets.
+12. **The effective smoke-label space wasn't actually contiguous or
+    model-visible.** A rare-class policy could merge or exclude a raw
+    class, but `model.num_smoke`, macro-F1's class count, confusion
+    matrices, and inference's displayed class names all stayed fixed at 6
+    — a dead output neuron and a permanent zero-support row.
+    `data/label_mapping.py::EffectiveLabelMapping` now builds a
+    deterministic `0..K-1` space directly from the rare-class-policy
+    report; `run_pipeline_split_aware()` transforms labels into it before
+    the split; `MultiSmokeCancerNet.from_config(num_smoke_types=...)`,
+    `Trainer.set_label_mapping()`, `Evaluator.from_checkpoint()`, and
+    `Predictor.from_config()` all size the model to `K` and validate the
+    mapping matches (checkpoint metadata is peeked via
+    `train.read_checkpoint_metadata()` *before* the model is constructed,
+    so a config/checkpoint conflict fails clearly instead of as an opaque
+    `load_state_dict` shape error). Raw labels remain preserved unmutated.
+13. **`predict_h5ad(already_preprocessed=False)` claimed to accept "raw"
+    input** but only ever reordered/subset genes and applied train-fit
+    scaling — never QC, library-size normalization, or log-transform, so
+    genuinely raw counts silently produced invalid predictions. The
+    boolean is replaced with an explicit `input_stage` argument:
+    `"model_ready"` (exact match, no transform — was `True`),
+    `"normalized_expression"` (reorder/subset/scale via the artifact only,
+    duplicate-gene and finite-value checks added — was `False`), or
+    `"raw_counts"`, which is now always rejected with a clear "not
+    supported" error, since `PreprocessingArtifact` doesn't store the
+    QC/normalization parameters needed to reproduce that chain.
+    `already_preprocessed` remains as a deprecated, warned alias mapped
+    unambiguously to the two supported stages — never to `"raw_counts"`.
 
 Not yet done, tracked in README's "What this pass does not include": the
 full raw-count preprocessing chain reproduced inside `predict_h5ad` (species/
-gene-ID/normalization steps, vs. today's reorder+scale-only via the fitted
-artifact); an `ExperimentContext`/`Trainer.from_experiment_data()`
-auto-wiring pipeline output into a Trainer; checkpoint checksum verification
-and optimizer/scheduler resume; an effective contiguous label space (the
-model's output width still doesn't shrink when a rare-class policy merges or
-excludes classes); baseline/grouped-CV/MIL-comparison experiment runners;
-subject-aware sampling; bulk/single-cell/MIL mode separation; species/
-ortholog-mapping safety; validation-selected threshold/calibration tooling;
-dose-head supervision gating.
+gene-ID/normalization steps — `input_stage="raw_counts"` is explicitly
+rejected rather than silently mishandled, but not implemented); an
+`ExperimentContext`/`Trainer.from_experiment_data()` auto-wiring pipeline
+output into a Trainer; checkpoint checksum verification and
+optimizer/scheduler resume; baseline/grouped-CV/MIL-comparison experiment
+runners; subject-aware sampling; bulk/single-cell/MIL mode separation;
+species/ortholog-mapping safety; validation-selected threshold/calibration
+tooling; dose-head supervision gating.
 
 None of these are architecture changes — Stages 1–6 as specified above are
 unchanged. They are pipeline-around-the-architecture fixes that any real
