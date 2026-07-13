@@ -69,13 +69,18 @@ def build_fold_cell_dataset(
     benchmarks/ already expects, so build_smoke_subject_summary_features,
     baselines, and the neural adapter all work unchanged on fold data.
 
-    cell_type_id in normalized_adata_for_refit is always the pre-annotation
-    placeholder (0 for every cell) — annotate_cell_types() (celltypist) runs
-    AFTER the snapshot point in run_pipeline_split_aware(). This is a
-    documented limitation (loses cell-type-proportion feature richness in
-    CV), not a leakage risk: celltypist is deterministic pretrained-model
-    inference, not fit to this dataset, so re-running it per fold would add
-    no leakage protection, only runtime.
+    cell_type_id in normalized_adata_for_refit carries the REAL CellTypist
+    annotation (run_pipeline_split_aware() now runs annotate_cell_types()
+    once, BEFORE capturing this snapshot — see preprocess.py) — every fold
+    and the outer split see the same deterministic cell-type labels.
+    CellTypist is only ever run this one time on the full merged dataset:
+    its majority-voting step is smoothed over whichever cells are present in
+    a given call, so annotating a different subset per fold would silently
+    change individual cells' cell_type_id between folds, breaking the
+    "stable cell-type ID across folds" invariant this module depends on.
+    fit_preprocessing/apply_preprocessing only ever touch gene expression
+    (.X), never obs["cell_type_id"], so this label survives fold
+    reconstruction unchanged.
     """
     subject_ids_col = normalized_adata.obs["subject_id"].astype(str)
     wanted = {str(s) for s in subject_list}

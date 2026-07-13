@@ -327,16 +327,37 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
             **split_kwargs,
         )
 
+    # Cell-type annotation BEFORE the refit snapshot. CellTypist
+    # (annotate_cell_types) is pretrained-model inference, not data-fit: it
+    # loads a fixed pretrained classifier and only reads obs["is_pseudo_bulk"]
+    # and layers["lognorm"] (restored explicitly since merge_sources leaves
+    # .X as z-scores) — it never fits/trains on this dataset, so running it
+    # once here adds no leakage risk. It must run exactly ONCE on the full
+    # merged dataset, not per CV fold: CellTypist's majority-voting step
+    # smooths each cell's label using the OTHER cells present in the same
+    # call, so annotating a different cell subset per fold would silently
+    # change individual cells' cell_type_id between folds and break the
+    # "deterministic cell-type label-to-ID mapping across folds" invariant
+    # fold_preprocessing.py depends on. Previously this ran AFTER the
+    # refit-snapshot line below, which meant every fold-reconstructed cell
+    # got cell_type_id=0 (the placeholder) instead of its real annotation —
+    # silently destroying cell-type proportions and MIL cell-type-id inputs
+    # for every benchmark CV fold and OOD evaluation.
+    merged = annotate_cell_types(merged)
+
     # Snapshot the full-gene, normalized-but-not-yet-HVG-selected-or-scaled
     # AnnData BEFORE fit_preprocessing/apply_preprocessing run. Neither
     # function mutates `merged` in place (both return new objects), so this
     # is a cheap reference, not a copy — and it's exactly the "pre-feature-
-    # selection, normalized/log-transformed expression" a benchmark needs to
-    # refit its own PreprocessingArtifact per CV fold (see
-    # src/benchmarks/fold_preprocessing.py) instead of reusing this one
-    # artifact (fit on ALL original-train subjects) across every fold, which
-    # would leak an inner-CV-validation subject's influence on scaling/HVG
-    # selection into that same fold's "held-out" evaluation.
+    # selection, normalized/log-transformed expression, WITH real cell-type
+    # annotations" a benchmark needs to refit its own PreprocessingArtifact
+    # per CV fold (see src/benchmarks/fold_preprocessing.py) instead of
+    # reusing this one artifact (fit on ALL original-train subjects) across
+    # every fold, which would leak an inner-CV-validation subject's
+    # influence on scaling/HVG selection into that same fold's "held-out"
+    # evaluation. fit_preprocessing/apply_preprocessing only ever touch .X
+    # (gene expression) and never obs["cell_type_id"], so cell-type labels
+    # here are exactly what every fold and the outer split will see.
     normalized_adata_for_refit = merged
 
     # ── 5/6. Fit preprocessing on train only, apply to everyone ─────────────
@@ -362,7 +383,8 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
               "transductive Harmony correction across the full dataset.")
         transductive_used = False
 
-    merged = annotate_cell_types(merged)
+    # cell-type annotation already ran once, above, before the refit
+    # snapshot — see the comment there for why it must not run twice.
 
     # ── 8. Export + assemble ─────────────────────────────────────────────────
     cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
