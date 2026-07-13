@@ -67,22 +67,47 @@ def assemble_subject_bags(
         dtype=np.float32,
     )
     bags, skipped = [], 0
+    n_known_pos = n_known_neg = n_unknown = 0
 
     for sid in adata.obs["subject_id"].unique():
         mask = (adata.obs["subject_id"] == sid).values
         if mask.sum() < min_cells_per_subject:
             skipped += 1
             continue
+
+        # A subject absent from cancer_outcomes has an UNKNOWN outcome, not
+        # a verified negative. Silently defaulting missing outcomes to 0
+        # would train/evaluate the cancer head against fabricated negative
+        # labels for every subject we simply have no outcome data for
+        # (e.g. any scRNA-seq donor never linked to NLST/TCGA). cancer_label
+        # is None and cancer_label_known=False for those; consumers
+        # (SubjectLevelDataset, Trainer.phase2/3, Evaluator) must exclude
+        # unknown-outcome bags from cancer-outcome supervision/evaluation,
+        # though the bag remains usable for cell-level smoke/malignancy tasks.
+        outcome = outcome_map.get(str(sid))
+        known = outcome is not None
+        if known:
+            n_known_pos += int(outcome == 1)
+            n_known_neg += int(outcome == 0)
+        else:
+            n_unknown += 1
+
         bags.append({
-            "subject_id":    sid,
-            "gene_matrix":   X[mask],
-            "cell_type_ids": adata.obs["cell_type_id"].values[mask].astype(int),
-            "smoke_labels":  adata.obs["smoke_type"].values[mask].astype(int),
-            "malig_labels":  adata.obs["malignancy"].values[mask].astype(np.float32),
-            "cancer_label":  outcome_map.get(str(sid), 0),
+            "subject_id":         sid,
+            "gene_matrix":        X[mask],
+            "cell_type_ids":      adata.obs["cell_type_id"].values[mask].astype(int),
+            "smoke_labels":       adata.obs["smoke_type"].values[mask].astype(int),
+            "malig_labels":       adata.obs["malignancy"].values[mask].astype(np.float32),
+            "cancer_label":       outcome if known else None,
+            "cancer_label_known": known,
         })
 
     print(f"[assembly] bags  {len(bags)} subjects  |  {skipped} dropped (<{min_cells_per_subject} cells)")
+    print(f"[assembly] cancer outcomes  known_positive={n_known_pos}  "
+          f"known_negative={n_known_neg}  unknown={n_unknown}")
+    if cancer_outcomes is None:
+        print("[assembly] WARNING: no cancer_outcomes source given — "
+              "ALL subjects have unknown cancer outcome")
     return bags
 
 

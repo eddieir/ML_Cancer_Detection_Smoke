@@ -7,8 +7,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
+import pytest
+
 from constants import N_SMOKE_CLASSES
-from train import CellLevelDataset
+from train import CellLevelDataset, SubjectLevelDataset, MILEligibilityError, check_mil_eligibility
 
 GENES = 20
 
@@ -55,3 +57,59 @@ def test_smoke_class_weights_zero_for_absent_classes():
     assert torch.isfinite(weights).all()
     assert (weights[2:] == 0).all()
     assert (weights[:2] > 0).all()
+
+
+def _bag(subject_id, cancer_label=None, cancer_label_known=False, n=10):
+    return {
+        "subject_id":         subject_id,
+        "gene_matrix":        np.random.randn(n, GENES).astype("float32"),
+        "cell_type_ids":      np.zeros(n, dtype="int64"),
+        "smoke_labels":       np.zeros(n, dtype="int64"),
+        "malig_labels":       np.zeros(n, dtype="float32"),
+        "cancer_label":       cancer_label,
+        "cancer_label_known": cancer_label_known,
+    }
+
+
+def test_subject_level_dataset_excludes_unknown_outcome_by_default():
+    bags = [
+        _bag("known_pos", cancer_label=1, cancer_label_known=True),
+        _bag("known_neg", cancer_label=0, cancer_label_known=True),
+        _bag("unknown",   cancer_label=None, cancer_label_known=False),
+    ]
+    ds = SubjectLevelDataset(bags)
+    assert len(ds) == 2
+    subject_ids = {ds[i]["subject_id"] for i in range(len(ds))}
+    assert subject_ids == {"known_pos", "known_neg"}
+    assert ds.n_excluded_unknown_outcome == 1
+
+
+def test_subject_level_dataset_can_keep_unknown_outcome_when_requested():
+    bags = [
+        _bag("known", cancer_label=1, cancer_label_known=True),
+        _bag("unknown", cancer_label=None, cancer_label_known=False),
+    ]
+    ds = SubjectLevelDataset(bags, require_known_outcome=False)
+    assert len(ds) == 2
+
+
+def test_mil_eligibility_rejects_too_few_subjects():
+    bags = [_bag(f"s{i}", cancer_label=i % 2, cancer_label_known=True) for i in range(4)]
+    ds = SubjectLevelDataset(bags)
+    with pytest.raises(MILEligibilityError):
+        check_mil_eligibility(ds, min_subjects=10)
+
+
+def test_mil_eligibility_rejects_single_class():
+    bags = [_bag(f"s{i}", cancer_label=1, cancer_label_known=True) for i in range(15)]
+    ds = SubjectLevelDataset(bags)
+    with pytest.raises(MILEligibilityError):
+        check_mil_eligibility(ds, min_subjects=10, min_positive=2, min_negative=2)
+
+
+def test_mil_eligibility_passes_balanced_sufficient_data():
+    bags = [_bag(f"s{i}", cancer_label=i % 2, cancer_label_known=True) for i in range(20)]
+    ds = SubjectLevelDataset(bags)
+    report = check_mil_eligibility(ds, min_subjects=10, min_positive=2, min_negative=2)
+    assert report["n_total"] == 20
+    assert report["problems"] == []

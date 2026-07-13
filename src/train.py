@@ -93,21 +93,48 @@ class SubjectLevelDataset(Dataset):
     """
     Wraps the list of bag dicts produced by assemble_subject_bags() (preprocess.py).
     Used in Phase 2/3 subject-level training.
+
+    A bag with no real cancer outcome (assemble_subject_bags sets
+    cancer_label_known=False when the subject was never matched to an
+    NLST/TCGA outcome) carries no valid supervision signal for the cancer
+    head. Training or evaluating against a fabricated label for those
+    subjects is exactly the "unknown treated as negative" failure mode this
+    dataset must not reproduce, so by default only known-outcome bags are
+    kept. Pass require_known_outcome=False to keep every bag (e.g. for
+    cell-level-only uses of the bag's smoke/malignancy arrays).
     """
 
-    def __init__(self, bags: List[dict]):
-        self.bags = bags
+    def __init__(self, bags: List[dict], require_known_outcome: bool = True):
+        if require_known_outcome:
+            known = [b for b in bags if b.get("cancer_label_known", b.get("cancer_label") is not None)]
+            n_excluded = len(bags) - len(known)
+            if n_excluded:
+                print(f"[train] SubjectLevelDataset  excluded {n_excluded}/{len(bags)} "
+                      "subjects with unknown cancer outcome from supervised training/eval")
+            self.bags = known
+        else:
+            self.bags = bags
+        self.n_excluded_unknown_outcome = (
+            len(bags) - len(self.bags) if require_known_outcome else None
+        )
 
     def __len__(self):  return len(self.bags)
 
     def __getitem__(self, idx):
         b = self.bags[idx]
+        cancer_label = b.get("cancer_label")
+        if cancer_label is None:
+            raise ValueError(
+                f"Subject {b.get('subject_id')} has unknown cancer_label but was "
+                "included in a SubjectLevelDataset — construct with "
+                "require_known_outcome=True (the default) to exclude it."
+            )
         return {
             "gene_matrix":   torch.FloatTensor(b["gene_matrix"]),
             "cell_type_ids": torch.LongTensor(b["cell_type_ids"]),
             "smoke_labels":  torch.LongTensor(b["smoke_labels"]),
             "malig_labels":  torch.FloatTensor(b["malig_labels"]),
-            "cancer_label":  torch.FloatTensor([b.get("cancer_label", 0)]),
+            "cancer_label":  torch.FloatTensor([cancer_label]),
             "subject_id":    b["subject_id"],
         }
 
@@ -118,6 +145,51 @@ def subject_collate_fn(batch: list) -> list:
     be stacked. Each item in the DataLoader remains an individual dict.
     """
     return batch
+
+
+# ─── MIL eligibility ──────────────────────────────────────────────────────────
+
+class MILEligibilityError(ValueError):
+    """Raised when a SubjectLevelDataset cannot support valid MIL training/eval."""
+
+
+def check_mil_eligibility(
+    subject_dataset: "SubjectLevelDataset",
+    min_subjects: int = 10,
+    min_positive: int = 2,
+    min_negative: int = 2,
+) -> Dict:
+    """
+    Subject-level MIL training/evaluation is only meaningful when there are
+    enough independent subjects with a known outcome, and both outcome
+    classes are represented — otherwise ROC-AUC/sensitivity/specificity are
+    undefined or trivially perfect/degenerate. Called at the start of
+    Trainer.phase2/phase3 so a too-small merge fails loudly instead of
+    silently training a cancer head with best_auc stuck at 0.5.
+    """
+    labels = [subject_dataset[i]["cancer_label"].item() for i in range(len(subject_dataset))]
+    n_pos = sum(l == 1.0 for l in labels)
+    n_neg = sum(l == 0.0 for l in labels)
+    n_total = len(labels)
+
+    problems = []
+    if n_total < min_subjects:
+        problems.append(f"only {n_total} subjects with known cancer outcome (need >= {min_subjects})")
+    if n_pos < min_positive:
+        problems.append(f"only {n_pos} known-positive subjects (need >= {min_positive})")
+    if n_neg < min_negative:
+        problems.append(f"only {n_neg} known-negative subjects (need >= {min_negative})")
+
+    report = {"n_total": n_total, "n_positive": n_pos, "n_negative": n_neg, "problems": problems}
+    if problems:
+        raise MILEligibilityError(
+            "Subject-level MIL training/evaluation is not valid on this dataset: "
+            + "; ".join(problems)
+            + ". Provide more subjects with real cancer outcomes (NLST/TCGA linkage), "
+              "or lower min_subjects/min_positive/min_negative if this is a deliberate "
+              "small-scale diagnostic run."
+        )
+    return report
 
 
 # ─── Early stopping ───────────────────────────────────────────────────────────
@@ -314,12 +386,21 @@ class Trainer:
 
     # ── Phase 2: Aggregator training (encoder frozen) ─────────────────────────
 
-    def phase2(self, subject_dataset: SubjectLevelDataset) -> Dict:
+    def phase2(self, subject_dataset: SubjectLevelDataset, skip_eligibility_check: bool = False) -> Dict:
         """
         Freeze encoder + heads. Train only the MIL aggregator on
         subject-level cancer outcomes (NLST / TCGA labels).
+
+        Raises MILEligibilityError before training anything if there aren't
+        enough independent subjects with a known, class-balanced outcome —
+        see check_mil_eligibility(). Pass skip_eligibility_check=True only
+        for a deliberate small-scale diagnostic run.
         """
         self._log("\n=== Phase 2 — Aggregator Training ===")
+        if not skip_eligibility_check:
+            elig = check_mil_eligibility(subject_dataset)
+            self._log(f"  MIL eligibility ✓  {elig['n_total']} subjects "
+                       f"({elig['n_positive']} positive, {elig['n_negative']} negative)")
 
         epochs = self.cfg.get("phase2_epochs", 12)
         lr     = self.cfg.get("phase2_lr",     5e-4)
@@ -379,13 +460,20 @@ class Trainer:
         self,
         cell_dataset:    CellLevelDataset,
         subject_dataset: SubjectLevelDataset,
+        skip_eligibility_check: bool = False,
     ) -> Dict:
         """
         All layers unfrozen. Jointly optimises all three loss terms.
         Alternates cell-level and subject-level steps each iteration.
         Early stopping on subject-level validation AUC.
+
+        See phase2's docstring — same MIL eligibility check applies here.
         """
         self._log("\n=== Phase 3 — End-to-End Fine-Tuning ===")
+        if not skip_eligibility_check:
+            elig = check_mil_eligibility(subject_dataset)
+            self._log(f"  MIL eligibility ✓  {elig['n_total']} subjects "
+                       f"({elig['n_positive']} positive, {elig['n_negative']} negative)")
 
         epochs = self.cfg.get("phase3_epochs", 8)
         lr     = self.cfg.get("phase3_lr",     1e-4)
