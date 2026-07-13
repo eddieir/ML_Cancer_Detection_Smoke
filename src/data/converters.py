@@ -246,7 +246,8 @@ def _read_mtx_streaming(path: Path, chunk_rows: int = 20_000_000):
     return sp.coo_matrix((val, (row, col)), shape=(nrows, ncols)).tocsr()
 
 
-def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] = None) -> Path:
+def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] = None,
+                       cell_metadata: Optional[pd.DataFrame] = None) -> Path:
     """
     10x-style raw counts (matrix.mtx[.gz] + barcodes.tsv[.gz] + features/genes.tsv[.gz],
     or a single combined `*_RawCounts_Sparse.mtx.gz` with sibling barcode/feature
@@ -255,6 +256,19 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
     donor_map: optional {barcode_prefix: donor_id} to populate obs['donor_id']
     when the raw files don't already encode it (GEO supplementary files rarely do —
     check the accession's associated paper/metadata for the barcode→donor mapping).
+    Only used as a fallback when cell_metadata isn't supplied — prefix-splitting
+    is a heuristic and can misparse barcodes whose subject ID doesn't literally
+    prefix the barcode (see GSE136831 below).
+
+    cell_metadata: optional DataFrame indexed by *full* barcode (exact match
+    against the source barcode file, not a prefix) with a 'donor_id' column
+    and any other per-cell columns to carry through to obs. Takes priority
+    over donor_map — an exact per-cell join is more reliable than a regex
+    prefix guess. Needed for GSE136831: its Subject_Identity values don't
+    always literally prefix the barcode (e.g. subject "1372C" has barcodes
+    prefixed "137C-a_..." — a real quirk in the deposited metadata, not a
+    parsing bug), so only a full-barcode join against the published
+    per-cell metadata table gives 100% correct donor assignment.
     """
     import scanpy as sc
 
@@ -286,7 +300,8 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
         feature_files = _find_sibling("feature", "gene")
 
         barcodes = (_read_id_list(barcode_files[0], expected_len=mtx.shape[1]) if barcode_files else None)
-        genes    = (_read_id_list(feature_files[0], expected_len=mtx.shape[0]) if feature_files else None)
+        genes    = (_read_id_list(feature_files[0], expected_len=mtx.shape[0], prefer_symbol_col=True)
+                    if feature_files else None)
 
         # 10x convention is genes x cells (rows x cols); AnnData needs the
         # opposite (obs=cells x var=genes). Orient by matching mtx dims
@@ -306,7 +321,15 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
                             obs=pd.DataFrame(index=barcodes),
                             var=pd.DataFrame(index=genes))
 
-    if donor_map:
+    if cell_metadata is not None:
+        joined = cell_metadata.reindex(adata.obs_names)
+        n_missing = joined["donor_id"].isna().sum()
+        if n_missing:
+            print(f"[convert] {accession}  WARNING: {n_missing:,}/{adata.n_obs:,} "
+                  "barcodes had no match in cell_metadata — labelled 'unknown'")
+        for col in joined.columns:
+            adata.obs[col] = joined[col].fillna("unknown").values
+    elif donor_map:
         prefixes = adata.obs_names.str.extract(r"^([^-_]+)")[0]
         adata.obs["donor_id"] = prefixes.map(donor_map).fillna("unknown").values
     elif "donor_id" not in adata.obs.columns:
@@ -321,10 +344,58 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
     return out_path
 
 
-def _read_id_list(path: Path, expected_len: Optional[int] = None) -> list[str]:
+def _load_gse136831_cell_metadata(src_dir: Path) -> Optional[pd.DataFrame]:
+    """
+    GSE136831's `*_AllCells.Samples.CellType.MetadataTable.txt.gz` carries
+    real per-cell Subject_Identity, Disease_Identity (COPD/IPF/Control) and
+    CellType_Category, keyed by the exact same barcode strings used in
+    `*_AllCells.cellBarcodes.txt.gz` / the mtx column order. Returns a
+    DataFrame indexed by that barcode with donor_id/disease_identity/
+    cell_type columns, or None if the file isn't present yet.
+
+    Disease_Identity is COPD/IPF/Control, not a direct smoking-status field
+    — this dataset is the Vanderbilt/Habermann interstitial lung disease
+    atlas, not a dedicated smoking cohort. smoke_type still defaults to
+    "cigarette" for these samples (COPD is strongly smoking-associated,
+    and this pipeline has no better per-subject label for this accession),
+    the same documented-approximation pattern already used for TCGA in
+    convert_tcga above — not a claim that GSE136831 records smoking status.
+    """
+    matches = list(src_dir.glob("*Samples.CellType.MetadataTable*"))
+    if not matches:
+        return None
+    meta = pd.read_csv(matches[0], sep="\t", quotechar='"')
+    meta = meta.set_index("CellBarcode_Identity")
+    return pd.DataFrame({
+        "donor_id":         meta["Subject_Identity"],
+        "disease_identity": meta["Disease_Identity"],
+        "cell_type":        meta["CellType_Category"],
+    })
+
+
+def _read_id_list(path: Path, expected_len: Optional[int] = None,
+                   prefer_symbol_col: bool = False) -> list[str]:
+    """
+    prefer_symbol_col: real 10x features.tsv convention is
+    [ensembl_id, gene_symbol, feature_type] — sc.read_10x_mtx's
+    var_names="gene_symbols" already prefers column 2 on the standard
+    triples path, so the manual combined-matrix path (used for GEO
+    supplementary `*_RawCounts_Sparse.mtx.gz` files without an accompanying
+    matrix.mtx triple, e.g. GSE136831) does the same here for consistency:
+    when the file has >=2 tab-separated columns, use column 2 (the symbol)
+    instead of column 1 (the Ensembl ID) — this also means
+    harmonize_gene_ids() (transforms.py) doesn't need a live BioMart
+    round-trip for genes that already ship a symbol.
+    """
     opener = gzip.open if path.suffix == ".gz" else open
+    col = 0
+    if prefer_symbol_col:
+        with opener(path, "rt") as f:
+            first = f.readline()
+        if len(first.rstrip("\n").split("\t")) >= 2:
+            col = 1
     with opener(path, "rt") as f:
-        ids = [line.split("\t")[0].strip().strip('"') for line in f if line.strip()]
+        ids = [line.rstrip("\n").split("\t")[col].strip().strip('"') for line in f if line.strip()]
     # Some GEO supplementary files ship a header row (e.g. GSE136831's
     # GeneIDs.txt has `"Ensembl_GeneID"	"HGNC_EnsemblAlt_GeneID"` on line 1);
     # detect it by comparing against the matrix's known dimension rather than
@@ -446,7 +517,17 @@ def convert_accession(accession: str) -> Optional[Path]:
             return _missing(accession, processed)
         return convert_canuck(accession, gz, processed)
 
-    if accession in ("GSE136831", "GSE288003"):
+    if accession == "GSE136831":
+        if not src.exists():
+            return _missing(accession, src)
+        cell_metadata = _load_gse136831_cell_metadata(src)
+        if cell_metadata is None:
+            print(f"[convert] {accession}  WARNING: no *Samples.CellType.MetadataTable* "
+                  f"file found in {src} — falling back to prefix-guessed donor_id. "
+                  f"Re-run downloaders.py --accession {accession} to fetch it.")
+        return convert_scrna_10x(accession, src, cell_metadata=cell_metadata)
+
+    if accession == "GSE288003":
         return convert_scrna_10x(accession, src) if src.exists() else _missing(accession, src)
 
     gz = src / expected_file

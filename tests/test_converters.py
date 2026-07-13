@@ -179,6 +179,93 @@ def test_convert_scrna_10x_combined_matrix_transposes_genes_x_cells(tmp_paths):
     assert list(adata.var_names) == [f"ENSG{i}" for i in range(n_genes)]
 
 
+def test_convert_scrna_10x_cell_metadata_overrides_prefix_guess(tmp_paths):
+    """
+    Regression test for the real GSE136831 quirk: subject "1372C" has
+    barcodes prefixed "137C-a_..." — the barcode prefix does NOT equal the
+    subject ID, so the old prefix-regex donor_map path would mislabel this
+    cell's donor. A full-barcode cell_metadata join must get it right.
+    """
+    import gzip as gzip_module
+    import scipy.io as sio
+    import scipy.sparse as sp
+
+    tmp, converted = tmp_paths
+    src = tmp / "GSE_META"
+    src.mkdir()
+    n_genes, n_cells = 3, 2
+    mtx = sp.random(n_genes, n_cells, density=0.5, format="csr")
+    sio.mmwrite(str(src / "matrix.mtx"), mtx)
+    with open(src / "matrix.mtx", "rb") as f_in, gzip_module.open(src / "matrix.mtx.gz", "wb") as f_out:
+        f_out.write(f_in.read())
+    (src / "matrix.mtx").unlink()
+
+    barcodes = ["137C-a_AAACCTGCAGCGAACA", "001C_AAACCTGCATCGGGTC"]
+    with gzip_module.open(src / "barcodes.tsv.gz", "wt") as f:
+        f.write("\n".join(barcodes) + "\n")
+    with gzip_module.open(src / "features.tsv.gz", "wt") as f:
+        f.write("\n".join(f"ENSG{i}\tGENE{i}\tGene Expression" for i in range(n_genes)) + "\n")
+
+    cell_metadata = pd.DataFrame({
+        "donor_id":         ["1372C", "001C"],
+        "disease_identity": ["Control", "Control"],
+    }, index=barcodes)
+
+    out_path = converters.convert_scrna_10x("GSE_META", src, cell_metadata=cell_metadata)
+    import anndata as ad
+    adata = ad.read_h5ad(out_path)
+    assert adata.obs.loc["137C-a_AAACCTGCAGCGAACA", "donor_id"] == "1372C"
+    assert adata.obs.loc["001C_AAACCTGCATCGGGTC", "donor_id"] == "001C"
+    assert adata.obs.loc["001C_AAACCTGCATCGGGTC", "disease_identity"] == "Control"
+
+
+def test_load_gse136831_cell_metadata_parses_real_column_names(tmp_paths):
+    tmp, converted = tmp_paths
+    src = tmp / "GSE136831"
+    src.mkdir()
+    meta_path = src / "GSE136831_AllCells.Samples.CellType.MetadataTable.txt.gz"
+    with gzip.open(meta_path, "wt") as f:
+        f.write('"CellBarcode_Identity"\t"nUMI"\t"nGene"\t"CellType_Category"\t'
+                '"Manuscript_Identity"\t"Subclass_Cell_Identity"\t"Disease_Identity"\t'
+                '"Subject_Identity"\t"Library_Identity"\n')
+        f.write('"137C-a_AAACCTGCAGCGAACA"\t1759\t1100\t"Lymphoid"\t"T_Cytotoxic"\t'
+                '"T_Cytotoxic_C"\t"Control"\t"1372C"\t"137C-a"\n')
+
+    meta = converters._load_gse136831_cell_metadata(src)
+    assert meta is not None
+    assert meta.loc["137C-a_AAACCTGCAGCGAACA", "donor_id"] == "1372C"
+    assert meta.loc["137C-a_AAACCTGCAGCGAACA", "disease_identity"] == "Control"
+
+
+def test_read_id_list_prefers_symbol_column(tmp_paths):
+    """
+    GSE136831's GeneIDs.txt.gz ships [Ensembl_GeneID, HGNC_EnsemblAlt_GeneID]
+    (a real gene symbol) — prefer_symbol_col=True should pick the symbol
+    column so harmonize_gene_ids() doesn't need a live BioMart lookup for
+    genes that already have one.
+    """
+    tmp, converted = tmp_paths
+    path = tmp / "GeneIDs.txt.gz"
+    with gzip.open(path, "wt") as f:
+        f.write('"Ensembl_GeneID"\t"HGNC_EnsemblAlt_GeneID"\n')
+        f.write('"ENSG00000000003"\t"TSPAN6"\n')
+        f.write('"ENSG00000000005"\t"TNMD"\n')
+
+    ids = converters._read_id_list(path, expected_len=2, prefer_symbol_col=True)
+    assert ids == ["TSPAN6", "TNMD"]
+
+    ids_default = converters._read_id_list(path, expected_len=2)
+    assert ids_default == ["ENSG00000000003", "ENSG00000000005"]
+
+
+def test_read_id_list_single_column_unaffected_by_prefer_symbol(tmp_paths):
+    tmp, converted = tmp_paths
+    path = tmp / "barcodes.tsv.gz"
+    with gzip.open(path, "wt") as f:
+        f.write("BC0\nBC1\n")
+    assert converters._read_id_list(path, prefer_symbol_col=True) == ["BC0", "BC1"]
+
+
 def test_convert_nlst_outcomes(tmp_paths):
     tmp, converted = tmp_paths
     prsn = tmp / "prsn.csv"
