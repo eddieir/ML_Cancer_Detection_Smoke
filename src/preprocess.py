@@ -250,6 +250,11 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
       train_bags / val_bags / test_bags                          : list[dict]
       split_manifest         — data.splitting.SplitManifest
       preprocessing_artifact — data.preprocessing.PreprocessingArtifact
+      label_mapping          — data.label_mapping.EffectiveLabelMapping: the
+                                deterministic, contiguous (0..K-1) effective
+                                smoke-label space actually used by the split,
+                                the exported cell dataset, and the bags —
+                                also embedded in preprocessing_artifact.label_mapping
       rare_class_report      — data.rare_class.apply_rare_class_policy's report
       label_provenance_report — NLST join count + known/unknown outcome counts
       transductive_batch_correction — bool, whether full-data Harmony ran
@@ -262,6 +267,7 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
 
     from data.preprocessing import fit_preprocessing, apply_preprocessing
     from data.rare_class import apply_rare_class_policy
+    from data.label_mapping import build_effective_label_mapping
     from data.splitting import load_or_create_split, subject_train_val_test_split
     from train import CellLevelDataset
 
@@ -290,6 +296,15 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         merged = merged[keep_mask].copy()
         print(f"[preprocess] rare_class policy={rare_policy!r} excluded {n_dropped:,} cells")
 
+    # Deterministic contiguous effective label space (0..K-1), built directly
+    # from the policy report — never inferred from a particular split. A
+    # merged-away or excluded raw class must not leave a dead, unreachable
+    # output in the model or an always-zero-support row in every metric.
+    label_mapping = build_effective_label_mapping(rare_report)
+    merged.obs["smoke_type"] = label_mapping.transform(merged.obs["smoke_type"].values)
+    print(f"[preprocess] effective smoke-label space: K={label_mapping.k}  "
+          f"classes={label_mapping.class_names}  policy={rare_policy!r}")
+
     # ── 4. Subject-level split on the FINAL effective label ─────────────────
     split_kwargs = dict(
         train_frac=split_cfg.get("train_frac", 0.70),
@@ -317,6 +332,7 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         merged, set(manifest.train_subjects),
         n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT),
     )
+    artifact.label_mapping = label_mapping.to_dict()
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────
@@ -383,6 +399,7 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         "bags": bags,
         "split_manifest": manifest,
         "preprocessing_artifact": artifact,
+        "label_mapping": label_mapping,
         # explicit per-split datasets — use these for Trainer
         "train_cell_dataset": train_cell_dataset,
         "val_cell_dataset":   val_cell_dataset,

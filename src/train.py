@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 import yaml
 
 from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
+from data.label_mapping import EffectiveLabelMapping
 from metrics import multiclass_f1_report, validate_cell_type_ids
 from model import MultiSmokeCancerNet, MultiTaskLoss
 
@@ -345,6 +346,30 @@ def load_checkpoint_into(model: nn.Module, ckpt_path: Union[str, Path], device: 
     return {}
 
 
+def read_checkpoint_metadata(ckpt_path: Union[str, Path], device: str = "cpu") -> Dict:
+    """
+    Peek at a checkpoint's metadata WITHOUT constructing or loading weights
+    into any model. Used to discover the checkpoint's actual effective
+    smoke-label space (effective_label_mapping) BEFORE building the model,
+    so a model can be constructed with the correct num_smoke_types up front
+    — otherwise a config/checkpoint class-count mismatch only surfaces as an
+    opaque shape-mismatch error deep inside load_state_dict(). Returns {}
+    for a legacy bare-state_dict checkpoint (no metadata to read).
+    """
+    obj = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if isinstance(obj, dict) and "model_state_dict" in obj:
+        return obj
+    return {}
+
+
+def _label_mapping_from_checkpoint_meta(ckpt_meta: Dict) -> Optional["EffectiveLabelMapping"]:
+    """Shared helper: reconstruct EffectiveLabelMapping from a checkpoint's
+    saved effective_label_mapping dict, or None if absent (legacy checkpoint
+    / no rare-class policy was wired in for that run)."""
+    raw = ckpt_meta.get("effective_label_mapping") if ckpt_meta else None
+    return EffectiveLabelMapping.from_dict(raw) if raw else None
+
+
 # ─── MIL eligibility ──────────────────────────────────────────────────────────
 
 class MILEligibilityError(ValueError):
@@ -459,6 +484,13 @@ class Trainer:
         self.effective_label_mapping:  Optional[Dict] = None
         self.rare_class_policy:        Optional[str] = None
         self.transductive_batch_correction: bool = False
+        # The typed EffectiveLabelMapping object (data/label_mapping.py) —
+        # set via set_label_mapping(), which also keeps
+        # effective_label_mapping/rare_class_policy above in sync and
+        # validates it against self.model.num_smoke. None means "no
+        # rare-class policy was wired in" (six-class default / legacy /
+        # diagnostic runs) — class-name lookups fall back to constants.SMOKE_TYPES.
+        self.label_mapping: Optional["EffectiveLabelMapping"] = None
 
         # Held-out-test enforcement state: subjects seen as train/val during
         # this Trainer's lifetime, and how many times final_test_evaluation
@@ -479,6 +511,36 @@ class Trainer:
             with open(config) as f:
                 config = yaml.safe_load(f)
         return cls(model, config, device, seed=seed)
+
+    def set_label_mapping(self, mapping: "EffectiveLabelMapping") -> None:
+        """
+        The sanctioned way to wire an EffectiveLabelMapping (data/label_mapping.py)
+        into this Trainer — validates it against self.model.num_smoke (the
+        model's actual output width) and keeps effective_label_mapping/
+        rare_class_policy in sync so they're persisted correctly in every
+        checkpoint. Raises ValueError immediately, before any training runs,
+        if the model was NOT built with num_smoke == mapping.k (see
+        MultiSmokeCancerNet.from_config's num_smoke_types override) —
+        catching a config/mapping conflict here is far clearer than letting
+        it surface as a silently-wrong macro-F1 or a dead output neuron.
+        """
+        if mapping.k != self.model.num_smoke:
+            raise ValueError(
+                f"Trainer.set_label_mapping: mapping has K={mapping.k} effective classes "
+                f"but self.model.num_smoke={self.model.num_smoke} — the model must be "
+                f"constructed with num_smoke_types={mapping.k} (see "
+                "MultiSmokeCancerNet.from_config's num_smoke_types override) before wiring "
+                "this mapping in."
+            )
+        self.label_mapping = mapping
+        self.effective_label_mapping = mapping.to_dict()
+        self.rare_class_policy = mapping.policy
+
+    def _class_names(self) -> List[str]:
+        """Ordered smoke-class display names for this Trainer's current
+        output space — the wired EffectiveLabelMapping if set, else the
+        fixed 6-class constants.SMOKE_TYPES (no-merge / legacy default)."""
+        return self.label_mapping.class_names if self.label_mapping else list(SMOKE_TYPES.values())
 
     # ── Shared utilities ──────────────────────────────────────────────────────
 
@@ -621,7 +683,12 @@ class Trainer:
         batch_size = self.cfg.get("phase1_batch_size", 512)
 
         if smoke_class_weights is None:
-            smoke_class_weights = train_cell_dataset.smoke_class_weights()
+            # num_classes = the model's actual output width, not the fixed
+            # 6-class constant — a rare-class policy may have shrunk it to
+            # K < 6 (see data/label_mapping.py); weighting a merged/excluded
+            # class that no longer exists in the model's output would be
+            # silently meaningless.
+            smoke_class_weights = train_cell_dataset.smoke_class_weights(num_classes=self.model.num_smoke)
             self._log(f"  smoke class weights (auto, inverse-freq, train-only): "
                        f"{[round(w, 3) for w in smoke_class_weights.tolist()]}")
 
@@ -675,8 +742,11 @@ class Trainer:
             # label list over ALL effective classes, not just classes
             # observed in this validation batch) — otherwise the metric used
             # to select this checkpoint could silently disagree with the
-            # macro-F1 later reported for it. See metrics.py.
-            f1_report = multiclass_f1_report(targets, preds, N_SMOKE_CLASSES)
+            # macro-F1 later reported for it. See metrics.py. num_classes is
+            # self.model.num_smoke (the model's actual output width), NOT
+            # the fixed 6-class constant — a rare-class policy may have
+            # shrunk the effective label space to K < 6 (data/label_mapping.py).
+            f1_report = multiclass_f1_report(targets, preds, self.model.num_smoke)
             f1 = f1_report["macro_f1"]
             history.append({"epoch": epoch, "smoke_acc": acc, "smoke_macro_f1": f1,
                              "classes_absent_from_val": f1_report["classes_absent_from_targets"]})
@@ -838,7 +908,8 @@ class Trainer:
 
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.30, lambda_malignancy=0.30, lambda_subject=0.40,
-            smoke_class_weights=train_cell_dataset.smoke_class_weights().to(self.device),
+            smoke_class_weights=train_cell_dataset.smoke_class_weights(
+                num_classes=self.model.num_smoke).to(self.device),
         )
         params  = list(self.model.parameters())
         opt     = self._make_optimizer(params, lr, wd=1e-5)
@@ -962,7 +1033,7 @@ class Trainer:
             )
 
         self._load_best(phase)
-        ev = Evaluator(self.model, self.device)
+        ev = Evaluator(self.model, self.device, label_mapping=self.label_mapping)
         report, raw = ev.full_report(
             test_cell_dataset, test_subject_dataset,
             out_dir=out_dir or self.ckpt_dir,
@@ -1016,12 +1087,17 @@ class Trainer:
         prob  = out["cancer_probability"].item()
         attn  = out["attention_weights"].cpu().numpy()
         smoke = out["cell_smoke_probs"].cpu().numpy().argmax(axis=1)
+        # class_names is indexed by the model's actual effective smoke id
+        # (0..K-1) — using constants.SMOKE_TYPES directly here would
+        # mislabel predictions whenever a rare-class policy has shrunk K
+        # below 6 (see data/label_mapping.py, set_label_mapping()).
+        class_names = self._class_names()
 
         return {
             "cancer_probability":  prob,
             "risk_flag":           "HIGH" if prob >= 0.7 else "MODERATE" if prob >= 0.4 else "LOW",
             "top5_cells":          attn.argsort()[-5:][::-1].tolist(),
-            "dominant_smoke_type": SMOKE_TYPES[int(np.bincount(smoke).argmax())],
+            "dominant_smoke_type": class_names[int(np.bincount(smoke).argmax())],
             "attention_weights":   attn,
         }
 

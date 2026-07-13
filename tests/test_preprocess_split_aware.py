@@ -222,6 +222,62 @@ def test_rare_class_policy_from_config_changes_effective_smoke_labels():
         assert (meta["smoke_type"] == 2).sum() == 0
 
 
+def test_rare_class_merge_produces_contiguous_effective_labels_matching_model_k():
+    """Section 1 (effective smoke-class mapping): a merged-away raw class
+    must shrink the model's actual output space to a deterministic
+    contiguous K, not just be absent from the data while 6 output neurons
+    remain."""
+    from preprocess import run_pipeline_split_aware
+    from model import MultiSmokeCancerNet
+    with tempfile.TemporaryDirectory() as tmp:
+        h5ad = str(Path(tmp) / "test.h5ad")
+        _synthetic_h5ad_consistent_labels(h5ad, n_subjects=20, cells_per_subject=10, n_classes=1)
+        adata = ad.read_h5ad(h5ad)
+        adata.obs["smoke_type_name"] = adata.obs["smoke_type_name"].astype(str)
+        rare_mask = adata.obs["donor_id"] == "sub_0"
+        adata.obs.loc[rare_mask, "smoke_type_name"] = "cigar"
+        adata.write_h5ad(h5ad)
+
+        cfg = {
+            "data": {
+                "scrna_sources": [(h5ad, "cigarette", "donor_id")],
+                "n_hvgs": 50,
+                "min_cells_per_subject": 5,
+                "out_dir": str(Path(tmp) / "processed"),
+            },
+            "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
+            "rare_class": {
+                "policy": "merge_into_dual_use_or_other",
+                "min_subjects_required": 3,
+                "target_classes": ["cigar"],
+            },
+        }
+        result = run_pipeline_split_aware(cfg)
+        mapping = result["label_mapping"]
+
+        # Contiguous 0..K-1, K=5 (6 raw classes minus merged-away cigar).
+        assert mapping.k == 5
+        assert sorted(mapping.effective_id_to_name) == list(range(5))
+        assert "cigar" not in mapping.class_names
+
+        # The actual exported labels are within [0, K) — no dead id beyond K-1.
+        smoke_labels = result["cell_data"]["smoke_labels"]
+        assert smoke_labels.max() < mapping.k
+        assert smoke_labels.min() >= 0
+
+        # Persisted identically in the preprocessing artifact.
+        assert result["preprocessing_artifact"].label_mapping == mapping.to_dict()
+
+        # A model built with num_smoke_types=K actually has that output width
+        # — no unused/dead output neuron for the merged-away class.
+        model = MultiSmokeCancerNet(input_dim=50, embedding_dim=16, attention_dim=8,
+                                     num_smoke=mapping.k)
+        assert model.num_smoke == 5
+        import torch
+        _, logits, _ = model.forward_cell(torch.randn(4, 50))
+        assert logits.shape == (4, 5)
+
+
 def test_label_transfer_happens_before_split_changes_effective_class():
     """Section 6 regression test: NLST label transfer must be applied
     BEFORE the subject-level split is computed, so the split (and its

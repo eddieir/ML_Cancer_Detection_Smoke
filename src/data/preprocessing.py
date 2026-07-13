@@ -18,13 +18,23 @@ checks (required genes, gene order, input dimension, artifact version).
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import anndata as ad
 import numpy as np
 import scanpy as sc
 
 ARTIFACT_VERSION = "1"
+
+# The only input stages apply_preprocessing()/predict_h5ad() know how to
+# handle — see inference.py. "normalized_expression" is what this artifact's
+# apply_preprocessing() actually expects: input already QC'd, library-size
+# normalized, and log-transformed (data/transforms.py::normalize) upstream
+# of this artifact; the artifact itself only stores gene subsetting/ordering
+# and train-fit mean/std scaling, NOT QC thresholds, a library-size target,
+# or log-transform parameters — so it cannot reproduce a full raw-count
+# pipeline, only pick up from already-normalized expression.
+EXPECTED_INPUT_STAGE = "normalized_expression"
 
 
 @dataclass
@@ -38,6 +48,15 @@ class PreprocessingArtifact:
     fit_n_cells:                int
     fit_n_subjects:              int
     notes:                     List[str] = field(default_factory=list)
+    # Smoke-label effective mapping (data/label_mapping.py), set after fitting
+    # once the rare-class policy has run — None only for artifacts fit before
+    # this field existed (legacy) or that never had label-mapping context.
+    label_mapping:              Optional[Dict] = None
+    # What input stage apply_preprocessing() expects to receive — see
+    # EXPECTED_INPUT_STAGE above. Stored explicitly (not just documented) so
+    # inference can validate a caller's claimed input_stage against what
+    # this artifact can actually consume.
+    expected_input_stage:       str = EXPECTED_INPUT_STAGE
 
     def to_dict(self) -> dict:
         return asdict(self)

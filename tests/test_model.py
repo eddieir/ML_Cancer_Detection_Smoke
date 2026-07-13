@@ -25,6 +25,36 @@ def test_smoke_type_head_output_shape():
     assert logits.shape == (10, N_SMOKE_CLASSES)
 
 
+# ─── Effective label-space K wiring (MultiSmokeCancerNet.from_config) ───────
+
+def test_from_config_defaults_to_six_classes():
+    cfg = {"model": {"input_dim": GENES, "embedding_dim": 32, "attention_dim": 16}}
+    model = MultiSmokeCancerNet.from_config(cfg)
+    assert model.num_smoke == N_SMOKE_CLASSES
+    z = torch.randn(4, 32)
+    assert model.smoke_head(z).shape == (4, N_SMOKE_CLASSES)
+
+
+def test_from_config_num_smoke_types_override_shrinks_output_dimension():
+    """A rare-class policy that merges/excludes a class must actually shrink
+    the model's smoke-head output — not leave a dead, unreachable neuron."""
+    cfg = {"model": {"input_dim": GENES, "embedding_dim": 32, "attention_dim": 16,
+                      "num_smoke_types": 6}}
+    K = 5
+    model = MultiSmokeCancerNet.from_config(cfg, num_smoke_types=K)
+    assert model.num_smoke == K
+    x = torch.randn(8, GENES)
+    _, logits, _ = model.forward_cell(x)
+    assert logits.shape == (8, K)
+
+
+def test_from_config_override_none_falls_back_to_config_value():
+    cfg = {"model": {"input_dim": GENES, "embedding_dim": 32, "attention_dim": 16,
+                      "num_smoke_types": 4}}
+    model = MultiSmokeCancerNet.from_config(cfg, num_smoke_types=None)
+    assert model.num_smoke == 4
+
+
 def test_malignancy_head_outputs_probability():
     z = torch.randn(10, 32)
     out = MalignancyHead(embedding_dim=32)(z)

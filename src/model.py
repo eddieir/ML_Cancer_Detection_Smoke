@@ -225,8 +225,22 @@ class MultiSmokeCancerNet(nn.Module):
         )
 
     @classmethod
-    def from_config(cls, config: Union[dict, str, Path]) -> "MultiSmokeCancerNet":
-        """Instantiate from a config dict or path to configs/default.yaml."""
+    def from_config(
+        cls,
+        config: Union[dict, str, Path],
+        num_smoke_types: Optional[int] = None,
+    ) -> "MultiSmokeCancerNet":
+        """
+        Instantiate from a config dict or path to configs/default.yaml.
+
+        num_smoke_types, if given, OVERRIDES config['model']['num_smoke_types']
+        — used when the actual effective smoke-label space (K) is only known
+        at load time (data/label_mapping.py::EffectiveLabelMapping.k, read
+        from a checkpoint's or artifact's persisted mapping), since a config
+        file has no way to know a rare-class policy already shrank the
+        output space. Without an override, the config value (or the fixed
+        6-class default) is used — the no-merge / legacy path.
+        """
         if isinstance(config, (str, Path)):
             with open(config) as f:
                 config = yaml.safe_load(f)
@@ -234,7 +248,7 @@ class MultiSmokeCancerNet(nn.Module):
         return cls(
             input_dim      = c.get("input_dim",       N_HVGS_DEFAULT),
             embedding_dim  = c.get("embedding_dim",   256),
-            num_smoke      = c.get("num_smoke_types", N_SMOKE_CLASSES),
+            num_smoke      = num_smoke_types if num_smoke_types is not None else c.get("num_smoke_types", N_SMOKE_CLASSES),
             num_cell_types = c.get("num_cell_types",  N_CELL_TYPES),
             encoder_dropout= c.get("encoder_dropout", 0.3),
             head_dropout   = c.get("head_dropout",    0.2),

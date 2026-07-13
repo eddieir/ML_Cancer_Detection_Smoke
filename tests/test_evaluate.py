@@ -7,10 +7,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from constants import N_CELL_TYPES, N_SMOKE_CLASSES
+from data.label_mapping import EffectiveLabelMapping, build_effective_label_mapping
 from data.splitting import subject_train_val_test_split
 from evaluate import Evaluator, _binary_metrics, _smoke_metrics, describe_split
 from model import MultiSmokeCancerNet
-from train import CellLevelDataset
+from train import CellLevelDataset, Trainer, read_checkpoint_metadata
 
 GENES = 20
 
@@ -110,3 +111,71 @@ def test_cell_level_evaluation_reports_known_positive_negative_counts():
     assert result["malignancy"]["n_known_positive"] == 3
     assert result["malignancy"]["n_known_negative"] == 3
     assert result["malignancy"]["n_unknown"] == 4
+
+
+# ─── Effective label mapping wiring (Evaluator) ───────────────────────────────
+
+def _merged_mapping():
+    report = {
+        "policy": "merge_into_dual_use_or_other",
+        "affected_classes": {"cigar": {"n_subjects": 1, "too_rare": True, "action": "merged_into_dual_use"}},
+    }
+    return build_effective_label_mapping(report)
+
+
+def test_smoke_metrics_evaluates_exactly_k_classes_after_merge():
+    mapping = _merged_mapping()  # K=5
+    import numpy as np
+    y_true = np.random.randint(0, mapping.k, 30).tolist()
+    y_pred = np.random.randint(0, mapping.k, 30).tolist()
+    m = _smoke_metrics(y_true, y_pred, num_classes=mapping.k, class_names=mapping.class_names)
+    assert len(m["class_labels"]) == mapping.k
+    assert len(m["confusion_matrix"]) == mapping.k
+    assert set(m["per_class"].keys()) == set(mapping.class_names)
+
+
+def test_smoke_metrics_rejects_class_names_length_mismatch():
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        _smoke_metrics([0, 1], [0, 1], num_classes=5, class_names=["a", "b"])  # only 2 names for 5 classes
+
+
+def test_evaluator_label_mapping_defaults_to_six_class():
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    ev = Evaluator(model)
+    assert ev._num_classes() == N_SMOKE_CLASSES
+    assert len(ev._class_names()) == N_SMOKE_CLASSES
+
+
+def test_evaluator_uses_wired_mapping_for_interpretability_class_names():
+    mapping = _merged_mapping()
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=mapping.k)
+    ev = Evaluator(model, label_mapping=mapping)
+    assert ev._num_classes() == mapping.k
+    assert ev._class_names() == mapping.class_names
+
+
+def test_evaluator_from_checkpoint_reconstructs_mapping_and_matches_model(tmp_path):
+    mapping = _merged_mapping()
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=mapping.k)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(tmp_path)}})
+    trainer.set_label_mapping(mapping)
+    trainer._save(3, 0.5, metric_name="val_cancer_auc")
+
+    cfg = {"model": {"input_dim": GENES, "embedding_dim": 16, "attention_dim": 8},
+           "train": {"checkpoint_dir": str(tmp_path)}}
+    ev = Evaluator.from_checkpoint(cfg, phase=3)
+    assert ev.model.num_smoke == mapping.k
+    assert ev.label_mapping.class_names == mapping.class_names
+
+
+def test_evaluator_from_checkpoint_no_mapping_is_legacy_default(tmp_path):
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(tmp_path)}})
+    trainer._save(3, 0.5, metric_name="val_cancer_auc")  # no label_mapping set
+
+    cfg = {"model": {"input_dim": GENES, "embedding_dim": 16, "attention_dim": 8},
+           "train": {"checkpoint_dir": str(tmp_path)}}
+    ev = Evaluator.from_checkpoint(cfg, phase=3)
+    assert ev.label_mapping is None
+    assert ev._num_classes() == N_SMOKE_CLASSES

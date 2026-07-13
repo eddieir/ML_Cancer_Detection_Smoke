@@ -14,8 +14,10 @@ from model import MultiSmokeCancerNet
 from train import (
     CellLevelDataset, SubjectLevelDataset, MILEligibilityError, Trainer,
     assert_disjoint_subjects, check_mil_eligibility, validate_experiment_partitions,
+    read_checkpoint_metadata,
 )
 from metrics import validate_cell_type_ids
+from data.label_mapping import build_effective_label_mapping, identity_label_mapping
 
 GENES = 20
 
@@ -530,3 +532,102 @@ def test_final_test_evaluation_allow_repeat_marks_result_non_pristine(tmp_path):
     )
     assert report["provenance"]["test_evaluation_run_count"] == 2
     assert report["provenance"]["is_pristine"] is False
+
+
+# ─── Effective label mapping wiring (Trainer.set_label_mapping) ──────────────
+
+def _merged_mapping():
+    report = {
+        "policy": "merge_into_dual_use_or_other",
+        "affected_classes": {"cigar": {"n_subjects": 1, "too_rare": True, "action": "merged_into_dual_use"}},
+    }
+    return build_effective_label_mapping(report)
+
+
+def test_set_label_mapping_accepts_matching_k():
+    mapping = _merged_mapping()  # K=5
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=mapping.k)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": "/tmp/_test_ckpt_mapping"}})
+    trainer.set_label_mapping(mapping)
+    assert trainer.label_mapping is mapping
+    assert trainer.effective_label_mapping == mapping.to_dict()
+    assert trainer.rare_class_policy == mapping.policy
+
+
+def test_set_label_mapping_rejects_k_mismatch():
+    mapping = _merged_mapping()  # K=5
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=6)  # still 6
+    trainer = Trainer(model, {"train": {"checkpoint_dir": "/tmp/_test_ckpt_mapping2"}})
+    with pytest.raises(ValueError):
+        trainer.set_label_mapping(mapping)
+
+
+def test_trainer_class_names_falls_back_to_six_class_default():
+    trainer = _trainer()
+    assert trainer._class_names() == list(__import__("constants").SMOKE_TYPES.values())
+
+
+def test_trainer_class_names_uses_wired_mapping():
+    mapping = _merged_mapping()
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=mapping.k)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": "/tmp/_test_ckpt_mapping3"}})
+    trainer.set_label_mapping(mapping)
+    assert trainer._class_names() == mapping.class_names
+
+
+def test_phase1_metrics_evaluate_exactly_k_classes_after_merge():
+    """The checkpoint-selection macro-F1 must be computed over the model's
+    ACTUAL output width (K), not the fixed 6-class constant — otherwise a
+    merged-away class permanently contributes a phantom zero-support row."""
+    mapping = _merged_mapping()  # K=5
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=mapping.k)
+    trainer = Trainer(model, {"train": {"phase1_epochs": 1, "checkpoint_dir": "/tmp/_test_ckpt_mapping4"}})
+    trainer.set_label_mapping(mapping)
+
+    n = 40
+    train_ds = CellLevelDataset(
+        gene_matrix=np.random.randn(n, GENES).astype("float32"),
+        smoke_labels=np.random.randint(0, mapping.k, n),
+        malignancy_labels=np.zeros(n, dtype="float32"),
+        cell_type_ids=np.zeros(n, dtype="int64"),
+        subject_ids=np.array([f"s{i}" for i in range(n)]),
+    )
+    val_ds = CellLevelDataset(
+        gene_matrix=np.random.randn(n, GENES).astype("float32"),
+        smoke_labels=np.random.randint(0, mapping.k, n),
+        malignancy_labels=np.zeros(n, dtype="float32"),
+        cell_type_ids=np.zeros(n, dtype="int64"),
+        subject_ids=np.array([f"t{i}" for i in range(n)]),
+    )
+    result = trainer.phase1(train_ds, val_ds)
+    assert "best_smoke_macro_f1" in result
+    # class weights must also be sized K, not 6
+    weights = train_ds.smoke_class_weights(num_classes=mapping.k)
+    assert weights.shape == (mapping.k,)
+
+
+def test_checkpoint_round_trip_preserves_effective_label_mapping(tmp_path):
+    mapping = _merged_mapping()
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8, num_smoke=mapping.k)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(tmp_path)}})
+    trainer.set_label_mapping(mapping)
+    trainer._save(1, 0.5, metric_name="val_smoke_macro_f1")
+
+    ckpt_path = tmp_path / "phase1_best.pt"
+    meta = read_checkpoint_metadata(ckpt_path)
+    from data.label_mapping import EffectiveLabelMapping
+    loaded = EffectiveLabelMapping.from_dict(meta["effective_label_mapping"])
+    assert loaded.k == mapping.k
+    assert loaded.class_names == mapping.class_names
+    assert loaded.raw_to_effective == mapping.raw_to_effective
+
+
+def test_read_checkpoint_metadata_does_not_mutate_model():
+    """Peeking at metadata must not touch any model weights — used to
+    discover K before a model is even constructed."""
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": "/tmp/_test_ckpt_peek"}})
+    trainer._save(1, 0.1, metric_name="val_smoke_macro_f1")
+    before = next(model.parameters()).clone()
+    read_checkpoint_metadata(trainer.ckpt_dir / "phase1_best.pt")
+    assert torch.equal(next(model.parameters()), before)
