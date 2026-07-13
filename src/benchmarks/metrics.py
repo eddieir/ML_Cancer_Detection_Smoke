@@ -98,10 +98,19 @@ def bootstrap_ci(values: Sequence[float], n_boot: int = 2000, seed: int = 42, al
 
 def aggregate_metric(values: Sequence[Optional[float]], seed: int = 42) -> Dict:
     """
-    Standard fold/seed aggregation: mean, std, median, bootstrap CI, and an
-    explicit count of defined vs undefined values. Never silently drops the
-    undefined count — a model with 3/5 folds undefined must not look
+    Descriptive fold-level aggregation: mean, std, median, bootstrap CI, and
+    an explicit count of defined vs undefined values. Never silently drops
+    the undefined count — a model with 3/5 folds undefined must not look
     identical to one with 5/5 defined folds just because the mean is similar.
+
+    The bootstrap CI here resamples raw per-fold values as if they were
+    independent — with repeated seeds over the same (overlapping) subject
+    pool, folds are NOT independent samples (a subject reappears in many
+    folds across seeds), so this CI is optimistic/descriptive, not a
+    statistically rigorous uncertainty estimate. `resampling_unit: "fold"`
+    marks this explicitly. Prefer aggregate_metric_by_seed (resamples whole
+    seeds, which ARE independent random re-partitions) whenever >=2 seeds
+    are available — see its docstring.
     """
     defined = [v for v in values if v is not None]
     n_undefined = len(values) - len(defined)
@@ -109,12 +118,53 @@ def aggregate_metric(values: Sequence[Optional[float]], seed: int = 42) -> Dict:
         return {
             "mean": None, "std": None, "median": None, "ci": None,
             "n_valid": 0, "n_undefined": n_undefined, "values": list(values),
+            "resampling_unit": "fold",
         }
     arr = np.asarray(defined, dtype=float)
     return {
         "mean": float(arr.mean()), "std": float(arr.std(ddof=0)) if len(arr) > 1 else 0.0,
         "median": float(np.median(arr)), "ci": bootstrap_ci(defined, seed=seed),
         "n_valid": len(defined), "n_undefined": n_undefined, "values": list(values),
+        "resampling_unit": "fold",
+    }
+
+
+def aggregate_metric_by_seed(
+    values: Sequence[Optional[float]], seeds: Sequence[int], seed: int = 42,
+) -> Dict:
+    """
+    Statistically preferred aggregation for repeated-seed grouped CV: average
+    each seed's fold values into ONE per-seed mean first, then bootstrap
+    across those per-seed means. Distinct seeds are genuinely independent
+    random subject re-partitions (unlike folds within/across seeds, which
+    overlap), so this CI's resampling unit is actually valid — at the cost
+    of far fewer "samples" (one per seed, not one per fold). Requires >=2
+    distinct seeds with at least one defined value each; returns
+    n_valid=0/ci=None with a note otherwise rather than silently falling
+    back to the (statistically weaker) per-fold bootstrap.
+    """
+    by_seed: Dict[int, list] = {}
+    for v, s in zip(values, seeds):
+        by_seed.setdefault(s, []).append(v)
+    seed_means = []
+    for s, vals in by_seed.items():
+        defined = [v for v in vals if v is not None]
+        if defined:
+            seed_means.append(float(np.mean(defined)))
+    if len(seed_means) < 2:
+        return {
+            "mean": float(np.mean(seed_means)) if seed_means else None,
+            "std": None, "median": None, "ci": None, "n_valid": len(seed_means),
+            "n_undefined": len(by_seed) - len(seed_means), "values": seed_means,
+            "resampling_unit": "seed",
+            "note": "fewer than 2 seeds had a defined value — cannot bootstrap across independent seeds",
+        }
+    arr = np.asarray(seed_means, dtype=float)
+    return {
+        "mean": float(arr.mean()), "std": float(arr.std(ddof=0)),
+        "median": float(np.median(arr)), "ci": bootstrap_ci(seed_means, seed=seed),
+        "n_valid": len(seed_means), "n_undefined": len(by_seed) - len(seed_means),
+        "values": seed_means, "resampling_unit": "seed",
     }
 
 

@@ -23,13 +23,16 @@ from .metrics import bootstrap_ci
 # ─── Statistical comparison ────────────────────────────────────────────────────
 
 def _paired_values(folds_a: List[dict], folds_b: List[dict], metric_key: str):
+    """Returns [(seed, value_a, value_b), ...] for folds where both models
+    produced a defined value, matched by (seed, fold) — keeps the seed so
+    callers can aggregate to the seed level (see compare_models)."""
     idx_a = {(f["seed"], f["fold"]): f.get(metric_key) for f in folds_a}
     idx_b = {(f["seed"], f["fold"]): f.get(metric_key) for f in folds_b}
     pairs = []
     for key in sorted(set(idx_a) & set(idx_b)):
         va, vb = idx_a[key], idx_b[key]
         if va is not None and vb is not None:
-            pairs.append((va, vb))
+            pairs.append((key[0], va, vb))
     return pairs
 
 
@@ -37,23 +40,40 @@ def compare_models(
     results: Dict[str, dict], metric_key: str, model_a: str, model_b: str, seed: int = 42,
 ) -> Dict:
     """
-    Paired fold-level comparison of model_a vs model_b on metric_key, using
-    only folds where BOTH models produced a defined value. Never claims
-    superiority from a numerically-higher mean alone — see
-    summarize_comparison for the compound criterion the spec requires.
+    Paired comparison of model_a vs model_b on metric_key, using only folds
+    where BOTH models produced a defined value. Never claims superiority
+    from a numerically-higher mean alone — see summarize_comparison for the
+    compound criterion the spec requires.
+
+    Two confidence intervals are reported for the paired difference:
+      - `ci_diff` (resampling_unit="fold"): bootstraps raw per-fold diffs.
+        Folds from repeated seeds over the same subject pool overlap (a
+        subject reappears across many folds), so this treats non-independent
+        observations as independent — descriptive only, not rigorous.
+      - `ci_diff_by_seed` (resampling_unit="seed"): averages each seed's
+        paired diffs into one per-seed diff first, then bootstraps across
+        seeds — genuinely independent samples, at the cost of very few of
+        them (one per seed). Prefer this one; `summarize_comparison` does.
     """
     pairs = _paired_values(results[model_a]["folds"], results[model_b]["folds"], metric_key)
     if not pairs:
         return {"model_a": model_a, "model_b": model_b, "metric": metric_key,
                 "n_pairs": 0, "reason": "no fold had a defined value for both models"}
 
-    diffs = [a - b for a, b in pairs]
+    seeds_seen = [p[0] for p in pairs]
+    diffs = [a - b for _, a, b in pairs]
     wins  = sum(1 for d in diffs if d > 1e-9)
     ties  = sum(1 for d in diffs if abs(d) <= 1e-9)
     losses= sum(1 for d in diffs if d < -1e-9)
     mean_diff = float(np.mean(diffs))
     std_diff  = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
     effect_size = mean_diff / std_diff if std_diff > 0 else None
+
+    by_seed: Dict[int, list] = {}
+    for s, d in zip(seeds_seen, diffs):
+        by_seed.setdefault(s, []).append(d)
+    per_seed_diffs = [float(np.mean(v)) for v in by_seed.values()]
+    ci_diff_by_seed = bootstrap_ci(per_seed_diffs, seed=seed) if len(per_seed_diffs) >= 2 else None
 
     exploratory_p = None
     if len(diffs) >= 5 and any(d != 0 for d in diffs):
@@ -66,10 +86,13 @@ def compare_models(
 
     return {
         "model_a": model_a, "model_b": model_b, "metric": metric_key,
-        "n_pairs": len(pairs), "wins_a": wins, "ties": ties, "losses_a": losses,
+        "n_pairs": len(pairs), "n_seeds": len(by_seed),
+        "wins_a": wins, "ties": ties, "losses_a": losses,
         "mean_diff": mean_diff, "std_diff": std_diff, "effect_size_cohens_d": effect_size,
         "ci_diff": bootstrap_ci(diffs, seed=seed),
+        "ci_diff_by_seed": ci_diff_by_seed,
         "exploratory_wilcoxon_p": exploratory_p,
+        "exploratory_wilcoxon_note": "does not account for overlapping folds across repeated seeds — exploratory only",
     }
 
 
@@ -78,18 +101,33 @@ def summarize_comparison(comparison: Dict, min_win_fraction: float = 0.7) -> Dic
     "Meaningfully better" requires ALL of: enough paired folds, a
     consistent win direction across them, and a CI on the paired difference
     that excludes zero. A higher mean alone never qualifies.
+
+    Prefers `ci_diff_by_seed` (bootstraps independent per-seed diffs, see
+    compare_models) over `ci_diff` (bootstraps overlapping raw fold diffs,
+    descriptive only) whenever >=2 seeds were run — falls back to the
+    fold-level CI, explicitly marked non-rigorous, only when just one seed
+    is available (no independent-seed evidence exists yet).
     """
     if comparison.get("n_pairs", 0) < 3:
         return {"meaningfully_better": False, "reason": "fewer than 3 paired folds — not enough evidence"}
     win_fraction = comparison["wins_a"] / comparison["n_pairs"]
-    ci = comparison.get("ci_diff")
+    ci = comparison.get("ci_diff_by_seed") or comparison.get("ci_diff")
+    ci_is_rigorous = comparison.get("ci_diff_by_seed") is not None
     ci_excludes_zero = ci is not None and (ci["lo"] > 0 or ci["hi"] < 0)
+    if ci is not None and not ci_is_rigorous:
+        ci_excludes_zero = False  # a single-seed fold-level CI is not sufficient evidence on its own
     if win_fraction >= min_win_fraction and ci_excludes_zero and comparison["mean_diff"] > 0:
-        return {"meaningfully_better": True, "reason": f"won {win_fraction:.0%} of paired folds, CI excludes zero"}
+        return {"meaningfully_better": True,
+                "reason": f"won {win_fraction:.0%} of paired folds, seed-level CI excludes zero "
+                          f"({comparison.get('n_seeds', 1)} independent seeds)"}
+    if not ci_is_rigorous:
+        return {"meaningfully_better": False,
+                "reason": f"only 1 seed run — no independent-seed evidence yet (win_fraction={win_fraction:.0%} "
+                          "over overlapping folds is not sufficient on its own); run >=2 seeds"}
     return {
         "meaningfully_better": False,
         "reason": f"win_fraction={win_fraction:.0%} (need >={min_win_fraction:.0%}), "
-                  f"ci_excludes_zero={ci_excludes_zero}",
+                  f"seed_level_ci_excludes_zero={ci_excludes_zero}",
     }
 
 
