@@ -510,26 +510,62 @@ pool overlap and aren't independent — descriptive only) and a seed-level one
 (bootstraps independent per-seed means — the one `summarize_comparison`
 actually requires to call a model "meaningfully better").
 
+**Fixed in the second pass** (see git history for the exact commits): the
+snapshot CV/OOD refit from (`normalized_adata_for_refit`) is now captured
+AFTER cell-type annotation runs, not before — every fold and OOD evaluation
+used to silently see `cell_type_id=0` for every cell regardless of its real
+CellTypist annotation (see [preprocess.py](src/preprocess.py) and
+[fold_preprocessing.py](src/benchmarks/fold_preprocessing.py)). The declared
+`SMOKE_SEARCH_SPACE`/`CANCER_SEARCH_SPACE` are now consulted by real,
+leakage-free nested grouped-CV selection
+(`hyperparameter_search.py::select_hyperparameters_nested`) — wired into Task
+B's final frozen-test path, computed strictly within the outer-train
+partition; a model with no declared search space is recorded as such
+explicitly, never silently skipped. `features.py::cap_cells_per_subject` is
+now wired into the neural adapter's per-fold cell-level training
+(deterministic, computed independently per split — see
+`cross_validation.py::run_smoke_cv`'s `feature_mode`/`max_cells_per_subject`
+fold fields). Leave-one-source-out no longer infers its reference
+species/cohort from whichever source sorts first lexicographically — an
+explicit `reference_species` is now required whenever `species_by_source` is
+declared — and a subject assigned to more than one `dataset_source` is
+rejected outright rather than silently resolved. `ExperimentContext` now
+rejects a manifest subject *missing* from its cell dataset (previously only
+the reverse direction — an unexpected subject — was checked), rejects
+blank/placeholder bag subject IDs, and exposes fingerprinted `run_identity()`
+(manifest + preprocessing-artifact + label-mapping + config fingerprints)
+that a checkpoint/result reload can verify against
+(`validate_run_identity()`). A durable, restart-and-concurrency-safe one-time
+frozen-test guard (`test_guard.py::FrozenTestGuard`, atomic
+`O_CREAT|O_EXCL` file creation) is available and wired into Task B's final
+path as an **opt-in** feature (`benchmarks.frozen_test_guard_dir` in
+config) — left off by default so repeated CI/test invocations against the
+same context aren't blocked by a guard meant for one-shot publication runs.
+
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
-section for the same list, generated fresh per run): the declared
-hyperparameter search spaces (`baselines.py`'s `SMOKE_SEARCH_SPACE`/
-`CANCER_SEARCH_SPACE`) are not yet wired into a nested-CV selection loop —
-every baseline currently trains with its default hyperparameters only; Task
-A baselines run in subject-summary mode only (one feature vector per
-subject) — a true cell-level mode with per-subject cell capping
-(`features.py::cap_cells_per_subject`, already implemented but unused by the
-CV runner) is not wired in, so "cell-weighted" metrics for baselines are
-explicitly marked not-applicable rather than presented as real per-cell
-scores; the final frozen-threshold test evaluation is wired for baseline
-models only (the neural/MIL adapter isn't yet plugged into that same
-one-shot path); the immutable artifact directory does not yet contain every
-file the ideal schema calls for (per-model OOF prediction CSVs, a
-consolidated `hyperparameters.json`, a separate `preprocessing/` subdir) —
-what's written today (`run_manifest.json`, `eligibility.json`,
-`metrics/*_folds.{json,csv}`, `calibration/`, `comparisons.json`,
-`summary.json`, `report.md`) is real and complete for what it covers, just
-not the full target layout; attention weights remain an interpretability
-aid, not a causal explanation, in every pooling variant.
+section for the same list, generated fresh per run): nested hyperparameter
+selection covers the classical sklearn baselines only — the neural/MIL
+models are not included in any nested search (that would mean a full inner-
+CV training loop per candidate, many times the cost of one Phase 1 + Phase 2
+run); Task A baselines still run in subject-summary mode only (one feature
+vector per subject) for their own training/prediction — the neural adapter
+is the only model exercising true cell-level training, now with per-subject
+capping — so "cell-weighted" metrics for baselines remain explicitly marked
+not-applicable rather than presented as real per-cell scores; the final
+frozen-threshold test evaluation is wired for baseline models only (the
+neural/MIL adapter isn't yet plugged into that same one-shot path — this is
+the largest remaining gap, since it would require training a neural/MIL
+candidate to convergence per hyperparameter/model choice before freezing);
+the immutable artifact directory now additionally writes
+`hyperparameters.json` and `metrics/*_folds_partitions.json` (outer subject
+partitions per fold) but still does not contain every file the ideal schema
+calls for (per-model OOF prediction CSVs, a separate `preprocessing/`
+subdir, an environment snapshot) — what's written today is real and
+complete for what it covers, just not the full target layout; the frozen
+test guard is opt-in, not enabled by default, so a real run must explicitly
+set `benchmarks.frozen_test_guard_dir` to get durable one-time-evaluation
+protection; attention weights remain an interpretability aid, not a causal
+explanation, in every pooling variant.
 
 ## Pipeline
 
@@ -589,7 +625,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (288 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 10 `test_benchmarks_*.py` files |
+| `tests/*` | All modules covered (325 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 18 `test_benchmarks_*.py` files |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |

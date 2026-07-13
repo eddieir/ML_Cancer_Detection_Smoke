@@ -690,5 +690,30 @@ positive-class column (`baselines.py::positive_class_proba` maps via
 scoped to each call's own data; and statistical comparison now reports a
 seed-level bootstrap CI (independent samples) alongside the descriptive
 fold-level one (overlapping, not independent) that `summarize_comparison`
-actually requires before calling a model "meaningfully better". Full list of
-what's fixed vs. still open: README's Benchmarking framework section.
+actually requires before calling a model "meaningfully better".
+
+A third pass fixed a related second-order instance of the same fold-level
+leakage class: the refit snapshot (`normalized_adata_for_refit`) used to be
+captured BEFORE `annotate_cell_types()` ran, so every fold/OOD
+reconstruction silently saw `cell_type_id=0` for every cell regardless of
+its real CellTypist annotation — fixed by moving that call to run exactly
+once, before the snapshot (`preprocess.py`), since CellTypist's
+majority-voting step is sensitive to which cells are present in a given call
+and must never run per-fold. This pass also added: real nested grouped-CV
+hyperparameter selection for the classical baselines
+(`benchmarks/hyperparameter_search.py`, computed strictly within the
+outer-train partition, wired into Task B's final frozen-test path — neural/
+MIL models are explicitly out of scope, see README); `cap_cells_per_subject`
+wired into the neural adapter's per-fold cell-level training, applied
+independently per split; leave-one-source-out now requires an explicit
+`reference_species` (never inferred from lexicographic source-name order)
+and rejects a subject assigned to more than one `dataset_source`;
+`ExperimentContext` now rejects a manifest subject missing from its cell
+dataset (previously checked only the reverse direction), rejects blank/
+placeholder bag subject IDs, and exposes fingerprinted `run_identity()` that
+a checkpoint/result reload can verify against; and a durable, restart/
+concurrency-safe one-time frozen-test guard (`benchmarks/test_guard.py`,
+atomic `O_CREAT|O_EXCL` file creation) is available and wired into Task B's
+final path as an opt-in (`benchmarks.frozen_test_guard_dir`) feature. Full
+list of what's fixed vs. still open: README's Benchmarking framework
+section.
