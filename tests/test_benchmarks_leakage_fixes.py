@@ -165,6 +165,7 @@ def test_ood_species_mismatch_rejected():
     ctx = build_synthetic_context(seed=1, fast=True)
     result = run_leave_one_source_out(
         ctx, ["majority"], species_by_source={"sourceA": "human", "sourceB": "mouse"},
+        reference_species="human",
     )
     assert result["sourceB"]["status"] == "NOT_COMPARABLE"
     assert "species" in result["sourceB"]["reason"]

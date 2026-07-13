@@ -34,14 +34,48 @@ from .metrics import full_smoke_metrics_report
 MIN_SUBJECTS_PER_SOURCE = 3
 
 
+def _find_cross_source_subjects(pool_subject_arr: np.ndarray, pool_source: np.ndarray) -> Dict[str, List[str]]:
+    """
+    A subject_id assigned to more than one distinct dataset_source within the
+    pool is a data-assembly inconsistency (e.g. a subject_id collision across
+    two GEO accessions, or an assembly bug), not a normal occurrence — never
+    silently pick one source for it. Returns {subject_id: [sources...]} for
+    every conflicting subject, empty if none.
+    """
+    by_subject: Dict[str, set] = {}
+    for sid, src in zip(pool_subject_arr.tolist(), pool_source.tolist()):
+        by_subject.setdefault(sid, set()).add(src)
+    return {sid: sorted(srcs) for sid, srcs in by_subject.items() if len(srcs) > 1}
+
+
 def run_leave_one_source_out(
     context, model_names: Iterable[str], device: str = "cpu",
     incompatible_sources: Optional[List[str]] = None,
     species_by_source: Optional[Dict[str, str]] = None,
+    reference_species: Optional[str] = None,
 ) -> Dict:
+    """
+    reference_species: the species every other declared source is compared
+    against for compatibility. MUST be passed explicitly whenever
+    species_by_source is non-empty — it is never inferred from whichever
+    source happens to sort first lexicographically (that would make
+    "compatible vs not" depend on dataset_source string spelling, an
+    accidental and undocumented policy). Pass it explicitly (e.g. the
+    species of your primary/training cohort) to get real EVALUATED results;
+    omitting it while declaring species_by_source is a configuration error,
+    not something to silently default.
+    """
     normalized_adata = require_normalized_adata(context)
     incompatible_sources = set(incompatible_sources or [])
     species_by_source = species_by_source or {}
+    if species_by_source and reference_species is None:
+        raise ValueError(
+            "run_leave_one_source_out: species_by_source was given but reference_species was "
+            "not. The reference cohort's species must be declared explicitly — inferring it from "
+            "whichever source sorts first lexicographically is exactly the undocumented, "
+            "spelling-dependent policy this parameter exists to remove. Pass reference_species="
+            "'<species>' explicitly (e.g. the species of your primary/training cohort)."
+        )
     num_classes = context.num_smoke_classes
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
     n_hvgs = context.preprocessing_artifact.n_hvgs
@@ -53,8 +87,18 @@ def run_leave_one_source_out(
     pool_source = obs["source"].astype(str).values[pool_mask]
     pool_subject_arr = subj_series.values[pool_mask]
 
+    conflicts = _find_cross_source_subjects(pool_subject_arr, pool_source)
+    if conflicts:
+        raise ValueError(
+            f"run_leave_one_source_out: {len(conflicts)} subject(s) are assigned to more than one "
+            f"dataset_source in the train+val pool — e.g. {dict(list(conflicts.items())[:3])} — "
+            "leave-one-source-out isolation is undefined when a subject can't be uniquely assigned "
+            "to exactly one held-out/training side. This indicates a data-assembly inconsistency "
+            "(duplicate subject_id across sources, or a merge bug) and must be fixed upstream, not "
+            "silently resolved by picking one source per subject here."
+        )
+
     sources = sorted(set(pool_source.tolist()))
-    default_species = species_by_source.get(sources[0]) if sources else None
     results: Dict[str, Dict] = {}
 
     for src in sources:
@@ -72,10 +116,10 @@ def run_leave_one_source_out(
             }
             continue
         src_species = species_by_source[src]
-        if default_species is not None and src_species != default_species:
+        if reference_species is not None and src_species != reference_species:
             results[src] = {"status": "NOT_COMPARABLE",
-                             "reason": f"species mismatch ({src_species} vs pool default {default_species}) — "
-                                       "species are kept separate by default"}
+                             "reason": f"species mismatch ({src_species} vs declared reference "
+                                       f"{reference_species}) — species are kept separate by default"}
             continue
 
         held_out_subjects = sorted(set(pool_subject_arr[pool_source == src].tolist()))

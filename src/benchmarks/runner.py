@@ -24,14 +24,26 @@ from typing import List, Optional
 
 import numpy as np
 
-from .baselines import CANCER_BASELINES, SMOKE_BASELINES, positive_class_proba
+from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, positive_class_proba
 from .calibration import build_frozen_policy
 from .context import ExperimentContext
 from .cross_validation import run_cancer_cv, run_smoke_cv
 from .eligibility import check_task_a_eligibility, check_task_b_eligibility
 from .features import build_cancer_subject_features
+from .hyperparameter_search import select_hyperparameters_nested
 from .reporting import compare_models, new_run_dir, write_benchmark_report
 from .ood import run_leave_one_source_out
+from .test_guard import FrozenTestGuard
+
+
+def _cancer_inner_score_fn(model, X_val, y_val):
+    """AUROC on an inner fold's validation rows; None (excluded from the
+    mean, never coerced to 0.5) if the inner fold's val split has only one
+    class present."""
+    if len(set(y_val.tolist())) < 2:
+        return None
+    from sklearn.metrics import roc_auc_score
+    return roc_auc_score(y_val, positive_class_proba(model, X_val))
 
 
 def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentContext:
@@ -102,7 +114,8 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
         "model": {"embedding_dim": 16, "attention_dim": 8, "num_cell_types": n_ct},
         "train": {"phase1_epochs": 1, "phase2_epochs": 1, "phase1_batch_size": 64,
                   "checkpoint_dir": "checkpoints/benchmarks_synthetic"},
-        "benchmarks": {"species_by_source": {"sourceA": "human", "sourceB": "human"}},
+        "benchmarks": {"species_by_source": {"sourceA": "human", "sourceB": "human"},
+                       "reference_species": "human"},
     }
 
     # Pre-HVG, pre-scaling "normalized" AnnData standing in for what
@@ -150,6 +163,7 @@ def _run_manifest(context: ExperimentContext, seeds: List[int], synthetic: bool,
     return {
         "run_id": run_id, "git_sha": context.git_sha, "seeds": seeds,
         "split_fingerprint": context.fingerprint(),
+        "run_identity": context.run_identity(run_id),
         "transductive_batch_correction": context.transductive_batch_correction,
         "num_smoke_classes": context.num_smoke_classes,
         "label_mapping": context.label_mapping.to_dict(),
@@ -182,6 +196,7 @@ def run_smoke_task(context, args, run_dir) -> dict:
             context, ood_models, device=args.device,
             incompatible_sources=bench_cfg.get("incompatible_sources"),
             species_by_source=bench_cfg.get("species_by_source"),
+            reference_species=bench_cfg.get("reference_species"),
         )
         from .reporting import write_json
         write_json(run_dir / "metrics" / "leave_one_source_out.json", ood_report)
@@ -217,18 +232,59 @@ def run_cancer_task(context, args, run_dir) -> dict:
             key=lambda n: cv_report["results"][n]["auroc"]["mean"] if cv_report["results"][n]["auroc"]["mean"] is not None else -1,
         )
         num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
-        Xtr, ytr, _, _ = build_cancer_subject_features(context.train_bags, num_cell_types)
+        Xtr, ytr, train_subj, _ = build_cancer_subject_features(context.train_bags, num_cell_types)
         Xva, yva, _, _ = build_cancer_subject_features(context.val_bags, num_cell_types)
         Xte, yte, _, _ = build_cancer_subject_features(context.test_bags, num_cell_types)
 
-        model = CANCER_BASELINES[best_name]()
+        # Nested, leakage-free hyperparameter selection: inner grouped-CV
+        # computed ENTIRELY from the outer-train partition (train_subj) —
+        # never touches val or test labels. A model with no declared search
+        # space (e.g. "prevalence") is recorded as such, not silently
+        # skipped. Calibration/threshold below still uses ONLY val (not
+        # train), a stricter separation than fitting the final model on
+        # train+val: it guarantees the frozen threshold is evaluated on data
+        # the model never saw during fitting OR selection, at the
+        # documented cost of not incorporating val's rows into the model
+        # fit itself (see README's Benchmarking framework limitations).
+        hp_search = select_hyperparameters_nested(
+            CANCER_BASELINES[best_name], CANCER_SEARCH_SPACE.get(best_name, {}),
+            Xtr, ytr, train_subj, score_fn=_cancer_inner_score_fn, seed=args.seeds[0],
+        )
+        model = CANCER_BASELINES[best_name](**hp_search["selected_params"])
         model.fit(Xtr, ytr, seed=args.seeds[0])
         prob_val = positive_class_proba(model, Xva)
         policy = build_frozen_policy(yva, prob_val, calibration_method=args.calibration,
                                       threshold_strategy=args.threshold_strategy)
-        prob_test = positive_class_proba(model, Xte)
-        test_result = policy.apply_to_test(yte, prob_test)
-        calibration_report = {"selected_model": best_name, "test_result": test_result}
+
+        # Durable one-time test guard — OPT-IN via
+        # benchmarks.frozen_test_guard_dir in config. A stable guard path
+        # (keyed by this context's own run_identity fingerprints, not the
+        # ephemeral run_dir) means repeated invocations against the SAME
+        # manifest/preprocessing/config are refused after the first
+        # completed evaluation, across process restarts. Left disabled by
+        # default so repeated CI/test invocations against the same
+        # synthetic context (an intentional, expected test pattern) aren't
+        # blocked by a guard meant for real, one-shot publication runs — see
+        # test_benchmarks_test_guard.py for the guard's own dedicated tests.
+        guard_dir = context.config.get("benchmarks", {}).get("frozen_test_guard_dir")
+        guard = None
+        if guard_dir:
+            fp = context.config_fingerprint
+            guard = FrozenTestGuard(Path(guard_dir) / f"{fp}.json")
+            guard.acquire(context.run_identity(run_dir.name), selected_model=best_name)
+        try:
+            prob_test = positive_class_proba(model, Xte)
+            test_result = policy.apply_to_test(yte, prob_test)
+        except Exception as e:
+            if guard is not None:
+                guard.mark_failed(str(e))
+            raise
+        if guard is not None:
+            import hashlib
+            result_fp = hashlib.sha256(str(sorted(test_result.items())).encode()).hexdigest()
+            guard.mark_completed(threshold=policy.threshold, test_result_fingerprint=result_fp)
+        calibration_report = {"selected_model": best_name, "test_result": test_result,
+                               "hyperparameter_search": hp_search}
 
     return {"eligibility": eligibility, "cv_reports": {"cancer_prediction": cv_report},
             "comparisons": comparisons, "calibration_report": calibration_report}
