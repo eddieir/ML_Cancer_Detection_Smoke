@@ -51,4 +51,28 @@ def test_baseline_never_sees_data_it_is_not_given():
     X2, y2 = _toy(seed=2, k=2)
     m1 = CANCER_BASELINES["logistic"]().fit(X1, y1, seed=42)
     m2 = CANCER_BASELINES["logistic"]().fit(X2, y2, seed=42)
-    assert not np.array_equal(m1.model.coef_, m2.model.coef_)
+    # logistic regression is now wrapped in Pipeline(StandardScaler, model)
+    # to give it fold-only-fitted feature scaling — see baselines.py.
+    assert not np.array_equal(m1.model.named_steps["model"].coef_, m2.model.named_steps["model"].coef_)
+
+
+def test_scaled_baselines_fit_scaler_only_on_given_training_data():
+    """Changing 'validation' feature magnitude after fitting must not alter
+    the fitted scaler's mean/variance — proves the scaler is fit once, on
+    fit()'s X only, not refit or updated when predict() sees different data."""
+    X, y = _toy(seed=3, k=2, n=80)
+    model = CANCER_BASELINES["logistic"]().fit(X, y, seed=42)
+    scaler = model.model.named_steps["scaler"]
+    mean_before, var_before = scaler.mean_.copy(), scaler.var_.copy()
+
+    X_huge = X * 1000 + 500  # wildly different magnitude "validation" data
+    model.predict_proba(X_huge)
+
+    assert np.array_equal(scaler.mean_, mean_before)
+    assert np.array_equal(scaler.var_, var_before)
+
+
+def test_scaled_small_mlp_also_uses_fold_only_scaler():
+    X, y = _toy(seed=4, k=2, n=80)
+    model = CANCER_BASELINES["small_mlp"]().fit(X, y, seed=42)
+    assert "scaler" in model.model.named_steps
