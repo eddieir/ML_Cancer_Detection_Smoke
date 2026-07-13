@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 import yaml
 
 from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
@@ -36,18 +36,57 @@ class CellLevelDataset(Dataset):
         cell_type_ids:     np.ndarray,              # [N]         int64
         exposure_dose:     Optional[np.ndarray] = None,  # [N]  float32, DOSE_UNKNOWN if absent
         malignancy_known:  Optional[np.ndarray] = None,  # [N]  bool, False if absent (see labellers.py)
+        subject_ids:       Optional[np.ndarray] = None,  # [N]  str — required unless diagnostic_mode
+        split_name:        Optional[str] = None,          # "train" | "val" | "test" | None
+        dataset_source:    Optional[np.ndarray] = None,  # [N]  str, e.g. GEO accession per cell
+        diagnostic_mode:   bool = False,
     ):
+        """
+        subject_ids is required for any dataset used in real training/
+        evaluation: without it, nothing can verify that a subject's cells
+        weren't split across train/val/test (see subset_by_subjects,
+        assert_disjoint_subjects). Pass diagnostic_mode=True only to build a
+        purely synthetic dataset (e.g. a smoke test with random data and no
+        real subjects) — in that mode missing/"unknown" subject_ids are
+        allowed and no disjointness guarantee is implied.
+        """
+        n = len(gene_matrix)
         self.X     = torch.FloatTensor(gene_matrix)
         self.smoke = torch.LongTensor(smoke_labels)
         self.malig = torch.FloatTensor(malignancy_labels)
         self.ctype = torch.LongTensor(cell_type_ids)
         self.dose  = torch.FloatTensor(
             exposure_dose if exposure_dose is not None
-            else np.full(len(gene_matrix), DOSE_UNKNOWN, dtype=np.float32)
+            else np.full(n, DOSE_UNKNOWN, dtype=np.float32)
         )
         self.malig_known = torch.BoolTensor(
             malignancy_known if malignancy_known is not None
-            else np.zeros(len(gene_matrix), dtype=bool)
+            else np.zeros(n, dtype=bool)
+        )
+
+        self.diagnostic_mode = diagnostic_mode
+        if subject_ids is None:
+            if not diagnostic_mode:
+                raise ValueError(
+                    "CellLevelDataset requires subject_ids for real training/evaluation "
+                    "— without them, leakage across train/val/test splits cannot be "
+                    "verified. Pass diagnostic_mode=True only for synthetic smoke tests."
+                )
+            subject_ids = np.full(n, "unknown", dtype=object)
+        subject_ids = np.array([str(s) for s in subject_ids], dtype=object)
+        if not diagnostic_mode:
+            missing = np.isin(subject_ids, ["unknown", "", "none", "None", "nan"])
+            if missing.any():
+                raise ValueError(
+                    f"{int(missing.sum())}/{n} cell(s) have a missing or 'unknown' "
+                    "subject_id — real training/evaluation requires a real subject_id "
+                    "per cell. Pass diagnostic_mode=True only for synthetic smoke tests."
+                )
+        self.subject_ids = subject_ids
+        self.split_name = split_name
+        self.dataset_source = (
+            np.array([str(s) for s in dataset_source], dtype=object)
+            if dataset_source is not None else np.full(n, "unknown", dtype=object)
         )
 
     def __len__(self):  return len(self.X)
@@ -60,14 +99,50 @@ class CellLevelDataset(Dataset):
             "malignancy_known": self.malig_known[idx],
             "cell_type_id":    self.ctype[idx],
             "exposure_dose":   self.dose[idx],
+            "subject_id":      self.subject_ids[idx],
         }
 
+    def subset_by_subjects(self, subject_list) -> "CellLevelDataset":
+        """
+        Build a new CellLevelDataset containing only cells whose subject_id
+        is in subject_list, preserving cell order and label alignment. This
+        is the ONLY sanctioned way to derive a train/val/test cell dataset
+        from a manifest — never a random per-cell split.
+        """
+        wanted = {str(s) for s in subject_list}
+        mask = np.isin(self.subject_ids, list(wanted))
+        return CellLevelDataset(
+            gene_matrix       = self.X[mask].numpy(),
+            smoke_labels      = self.smoke[mask].numpy(),
+            malignancy_labels = self.malig[mask].numpy(),
+            cell_type_ids     = self.ctype[mask].numpy(),
+            exposure_dose     = self.dose[mask].numpy(),
+            malignancy_known  = self.malig_known[mask].numpy(),
+            subject_ids       = self.subject_ids[mask],
+            dataset_source    = self.dataset_source[mask],
+            diagnostic_mode   = self.diagnostic_mode,
+        )
+
     @classmethod
-    def from_dir(cls, processed_dir: Union[str, Path]) -> "CellLevelDataset":
+    def from_dir(
+        cls, processed_dir: Union[str, Path], diagnostic_mode: bool = False,
+    ) -> "CellLevelDataset":
         """Load directly from the directory written by export_cell_dataset()."""
+        import pandas as pd
         d = Path(processed_dir)
         dose_path = d / "exposure_dose.npy"
         malig_known_path = d / "malignancy_known.npy"
+        meta_path = d / "cell_metadata.csv"
+
+        subject_ids = None
+        dataset_source = None
+        if meta_path.exists():
+            meta = pd.read_csv(meta_path)
+            if "subject_id" in meta.columns:
+                subject_ids = meta["subject_id"].astype(str).values
+            if "source" in meta.columns:
+                dataset_source = meta["source"].astype(str).values
+
         return cls(
             gene_matrix       = np.load(d / "gene_matrix.npy"),
             smoke_labels      = np.load(d / "smoke_labels.npy"),
@@ -75,6 +150,9 @@ class CellLevelDataset(Dataset):
             cell_type_ids     = np.load(d / "cell_type_ids.npy"),
             exposure_dose     = np.load(dose_path) if dose_path.exists() else None,
             malignancy_known  = np.load(malig_known_path) if malig_known_path.exists() else None,
+            subject_ids       = subject_ids,
+            dataset_source    = dataset_source,
+            diagnostic_mode   = diagnostic_mode,
         )
 
     def smoke_class_weights(self, num_classes: int = N_SMOKE_CLASSES) -> torch.Tensor:
@@ -95,6 +173,34 @@ class CellLevelDataset(Dataset):
         present = counts > 0
         weights[present] = n / (num_classes * counts[present])
         return torch.FloatTensor(weights)
+
+
+def assert_disjoint_subjects(*datasets, names: Optional[List[str]] = None) -> None:
+    """
+    Raise if any two datasets share a subject_id. Accepts CellLevelDataset
+    instances, SubjectLevelDataset instances, or plain iterables of subject
+    ids. This is the leakage guard actually invoked before training so a
+    manifest bug or a manual dataset-construction mistake fails loudly
+    instead of silently letting a subject's cells appear in two splits.
+    """
+    def _ids(ds) -> set:
+        if isinstance(ds, CellLevelDataset):
+            return set(ds.subject_ids.tolist())
+        if isinstance(ds, SubjectLevelDataset):
+            return {str(b["subject_id"]) for b in ds.bags}
+        return {str(s) for s in ds}
+
+    names = names or [f"dataset_{i}" for i in range(len(datasets))]
+    id_sets = [_ids(ds) for ds in datasets]
+    for i in range(len(id_sets)):
+        for j in range(i + 1, len(id_sets)):
+            overlap = id_sets[i] & id_sets[j]
+            if overlap:
+                raise ValueError(
+                    f"Subject leakage: {names[i]!r} and {names[j]!r} share "
+                    f"{len(overlap)} subject(s): {sorted(overlap)[:10]}"
+                    + (" ..." if len(overlap) > 10 else "")
+                )
 
 
 class SubjectLevelDataset(Dataset):
@@ -156,6 +262,25 @@ def subject_collate_fn(batch: list) -> list:
     be stacked. Each item in the DataLoader remains an individual dict.
     """
     return batch
+
+
+def load_checkpoint_into(model: nn.Module, ckpt_path: Union[str, Path], device: str = "cpu") -> Dict:
+    """
+    Shared checkpoint loader used by Evaluator/Predictor/Trainer so all
+    three understand both the structured format written by
+    Trainer._save (format_version>=2: {"model_state_dict": ..., metadata...})
+    and legacy bare state_dict checkpoints from before this format existed.
+    Legacy checkpoints load with a printed warning and no metadata.
+    Returns the full checkpoint dict (empty dict for legacy checkpoints).
+    """
+    obj = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if isinstance(obj, dict) and "model_state_dict" in obj:
+        model.load_state_dict(obj["model_state_dict"])
+        return obj
+    print(f"[checkpoint] WARNING: {ckpt_path} is a legacy raw state_dict checkpoint "
+          "(no split/preprocessing/seed metadata). Loading weights only.")
+    model.load_state_dict(obj)
+    return {}
 
 
 # ─── MIL eligibility ──────────────────────────────────────────────────────────
@@ -232,6 +357,16 @@ class Trainer:
 
     DRY utilities (_grad_step, _save, _load_best, _log) are shared
     across all phases — no repeated optimizer / checkpoint logic.
+
+    Every phase takes EXPLICIT train and validation datasets, already
+    subsetted from a subject-level SplitManifest (data/splitting.py) via
+    CellLevelDataset.subset_by_subjects / the bag-filtering done when
+    building SubjectLevelDataset per split. No phase ever internally
+    re-splits a dataset — that was the source of subject-level leakage this
+    class used to have (a subject's cells could land in both the internal
+    train and validation partition). Test datasets are never accepted by
+    any phaseN method; see final_test_evaluation() for the one sanctioned
+    place test data is used, after training/checkpoint-selection is done.
     """
 
     def __init__(
@@ -239,9 +374,11 @@ class Trainer:
         model:     MultiSmokeCancerNet,
         config:    dict,
         device:    str = "cpu",
+        seed:      int = 42,
     ):
         self.model     = model.to(device)
         self.device    = device
+        self.full_cfg  = config
         self.cfg       = config.get("train", config)
         ckpt_dir = self.cfg.get("checkpoint_dir", "checkpoints")
         self.ckpt_dir  = (
@@ -250,6 +387,16 @@ class Trainer:
         )
         self.grad_clip = self.cfg.get("grad_clip", 1.0)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.seed = seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Experiment metadata carried into every saved checkpoint (section 8/22).
+        self.split_manifest_path:      Optional[str] = None
+        self.preprocessing_artifact_path: Optional[str] = None
+        self.effective_label_mapping:  Optional[Dict] = None
+        self.rare_class_policy:        Optional[str] = None
+        self.transductive_batch_correction: bool = False
 
     @classmethod
     def from_config(
@@ -257,16 +404,23 @@ class Trainer:
         model:  MultiSmokeCancerNet,
         config: Union[dict, str, Path],
         device: str = "cpu",
+        seed:   int = 42,
     ) -> "Trainer":
         if isinstance(config, (str, Path)):
             with open(config) as f:
                 config = yaml.safe_load(f)
-        return cls(model, config, device)
+        return cls(model, config, device, seed=seed)
 
     # ── Shared utilities ──────────────────────────────────────────────────────
 
     def _log(self, msg: str) -> None:
         print(msg)
+
+    def _generator(self) -> torch.Generator:
+        """Deterministic per-call generator so DataLoader shuffling is reproducible."""
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        return g
 
     def _grad_step(
         self,
@@ -280,16 +434,79 @@ class Trainer:
         nn.utils.clip_grad_norm_(params, self.grad_clip)
         optimizer.step()
 
-    def _save(self, phase: int, metric: float) -> None:
-        path = self.ckpt_dir / f"phase{phase}_best.pt"
-        torch.save(self.model.state_dict(), path)
-        self._log(f"    ✓ checkpoint saved  (metric={metric:.4f})")
+    def _validate_train_val(
+        self,
+        train_ds, val_ds,
+        train_name: str = "train", val_name: str = "val",
+    ) -> None:
+        """
+        Fail loudly before training anything if the split is unusable:
+        empty train/val, or (for real, non-diagnostic datasets) a subject
+        shared between train and val. This is the enforcement point for
+        "test/val data is never used for the wrong purpose" at the Trainer
+        boundary — see assert_disjoint_subjects.
+        """
+        if len(train_ds) == 0:
+            raise ValueError(f"Trainer: {train_name} dataset is empty — nothing to train on.")
+        if len(val_ds) == 0:
+            raise ValueError(f"Trainer: {val_name} dataset is empty — cannot select checkpoints.")
+        diagnostic = getattr(train_ds, "diagnostic_mode", False) or getattr(val_ds, "diagnostic_mode", False)
+        if not diagnostic:
+            assert_disjoint_subjects(train_ds, val_ds, names=[train_name, val_name])
 
-    def _load_best(self, phase: int) -> None:
+    def _save(self, phase: int, metric: float, metric_name: str = "metric", extra: Optional[Dict] = None) -> None:
+        """
+        Save a structured checkpoint: model_state_dict plus the metadata
+        needed to reproduce or safely re-load this experiment later
+        (section 8/22) — not just a bare state_dict.
+        """
+        import json, subprocess
+
+        git_sha = None
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parents[1],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            pass
+
+        payload = {
+            "format_version":     2,
+            "model_state_dict":   self.model.state_dict(),
+            "model_config":       self.full_cfg.get("model", {}),
+            "training_config":    self.cfg,
+            "split_manifest_path": self.split_manifest_path,
+            "preprocessing_artifact_path": self.preprocessing_artifact_path,
+            "effective_label_mapping": self.effective_label_mapping,
+            "rare_class_policy":  self.rare_class_policy,
+            "transductive_batch_correction": self.transductive_batch_correction,
+            "random_seed":        self.seed,
+            "metric_name":        metric_name,
+            "metric_value":       metric,
+            "phase":              phase,
+            "input_dim":          getattr(self.model, "input_dim", None),
+            "git_commit_sha":     git_sha,
+        }
+        if extra:
+            payload.update(extra)
+
         path = self.ckpt_dir / f"phase{phase}_best.pt"
-        self.model.load_state_dict(
-            torch.load(path, map_location=self.device, weights_only=True)
-        )
+        torch.save(payload, path)
+        self._log(f"    ✓ checkpoint saved  ({metric_name}={metric:.4f})")
+
+    def _load_best(self, phase: int, unsafe_legacy_mode: bool = False) -> Dict:
+        """
+        Load the best checkpoint for `phase`. Supports both the structured
+        format written by _save() (format_version>=2) and bare state_dict
+        checkpoints from before this change — loading the latter prints a
+        clear warning and returns an empty metadata dict, since none of the
+        reproducibility metadata exists for them. unsafe_legacy_mode is
+        accepted for symmetry with Predictor's safe-inference gate but has
+        no additional effect here (Trainer always loads what's on disk).
+        """
+        path = self.ckpt_dir / f"phase{phase}_best.pt"
+        return load_checkpoint_into(self.model, path, self.device)
 
     def _save_history(self, history: Dict, name: str) -> None:
         """Persist training history to JSON for later plotting."""
@@ -301,43 +518,46 @@ class Trainer:
     def _make_optimizer(self, params, lr: float, wd: float = 1e-4):
         return torch.optim.Adam(params, lr=lr, weight_decay=wd)
 
-    def _split(self, ds: Dataset, val_frac: float):
-        n_val   = max(1, int(len(ds) * val_frac))
-        n_train = len(ds) - n_val
-        return random_split(ds, [n_train, n_val])
-
     # ── Phase 1: Cell-level pre-training ─────────────────────────────────────
 
     def phase1(
         self,
-        cell_dataset: CellLevelDataset,
+        train_cell_dataset: CellLevelDataset,
+        val_cell_dataset:   CellLevelDataset,
         smoke_class_weights: Optional[torch.Tensor] = None,
     ) -> Dict:
         """
         Train encoder + both heads on labeled single cells.
         Aggregator is NOT updated.
 
+        train_cell_dataset / val_cell_dataset must already be disjoint
+        subject-level subsets (CellLevelDataset.subset_by_subjects against a
+        SplitManifest) — this method does not split anything itself.
+
         smoke_class_weights defaults to inverse-frequency weights computed
-        from cell_dataset itself (CellLevelDataset.smoke_class_weights) —
-        pass an explicit tensor only to override that. Unweighted CE lets
-        the loss minimize by predicting only the majority class(es), which
-        is exactly the collapse README.md documents (77% accuracy, 0.27
-        macro-F1, zero F1 on vape/cannabis/cigar/unexposed).
+        from TRAIN data only (CellLevelDataset.smoke_class_weights on
+        train_cell_dataset) — pass an explicit tensor only to override that.
+        Unweighted CE lets the loss minimize by predicting only the
+        majority class(es), which is exactly the collapse README.md
+        documents (77% accuracy, 0.27 macro-F1, zero F1 on vape/cannabis/
+        cigar/unexposed).
         """
         self._log("\n=== Phase 1 — Cell-Level Pre-training ===")
+        self._validate_train_val(train_cell_dataset, val_cell_dataset)
 
         epochs     = self.cfg.get("phase1_epochs",     15)
         lr         = self.cfg.get("phase1_lr",         1e-3)
         batch_size = self.cfg.get("phase1_batch_size", 512)
 
         if smoke_class_weights is None:
-            smoke_class_weights = cell_dataset.smoke_class_weights()
-            self._log(f"  smoke class weights (auto, inverse-freq): "
+            smoke_class_weights = train_cell_dataset.smoke_class_weights()
+            self._log(f"  smoke class weights (auto, inverse-freq, train-only): "
                        f"{[round(w, 3) for w in smoke_class_weights.tolist()]}")
 
-        train_ds, val_ds = self._split(cell_dataset, 0.15)
-        train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
-        val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+        train_dl = DataLoader(train_cell_dataset, batch_size=batch_size, shuffle=True,
+                               drop_last=len(train_cell_dataset) >= batch_size,
+                               generator=self._generator())
+        val_dl   = DataLoader(val_cell_dataset,   batch_size=batch_size, shuffle=False)
 
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.50, lambda_malignancy=0.50,
@@ -389,7 +609,7 @@ class Trainer:
             # macro-F1 doesn't.
             if f1 > best_f1:
                 best_f1 = f1
-                self._save(1, f1)
+                self._save(1, f1, metric_name="val_smoke_macro_f1")
 
         self._load_best(1)
         self._save_history({"phase1": history}, "phase1")
@@ -398,21 +618,36 @@ class Trainer:
 
     # ── Phase 2: Aggregator training (encoder frozen) ─────────────────────────
 
-    def phase2(self, subject_dataset: SubjectLevelDataset, skip_eligibility_check: bool = False) -> Dict:
+    def phase2(
+        self,
+        train_subject_dataset: SubjectLevelDataset,
+        val_subject_dataset:   SubjectLevelDataset,
+        skip_eligibility_check: bool = False,
+    ) -> Dict:
         """
         Freeze encoder + heads. Train only the MIL aggregator on
         subject-level cancer outcomes (NLST / TCGA labels).
 
-        Raises MILEligibilityError before training anything if there aren't
-        enough independent subjects with a known, class-balanced outcome —
-        see check_mil_eligibility(). Pass skip_eligibility_check=True only
-        for a deliberate small-scale diagnostic run.
+        train_subject_dataset / val_subject_dataset must already be
+        disjoint subject-level subsets of a SplitManifest — this method
+        does not split anything itself.
+
+        MIL eligibility (check_mil_eligibility) is checked separately on
+        BOTH train and val, since a phase can have enough total subjects
+        while still having e.g. zero known-positive subjects in val, which
+        would make val_AUC undefined all the same. Pass
+        skip_eligibility_check=True only for a deliberate small-scale
+        diagnostic run.
         """
         self._log("\n=== Phase 2 — Aggregator Training ===")
+        self._validate_train_val(train_subject_dataset, val_subject_dataset)
         if not skip_eligibility_check:
-            elig = check_mil_eligibility(subject_dataset)
-            self._log(f"  MIL eligibility ✓  {elig['n_total']} subjects "
-                       f"({elig['n_positive']} positive, {elig['n_negative']} negative)")
+            elig_tr = check_mil_eligibility(train_subject_dataset)
+            elig_va = check_mil_eligibility(val_subject_dataset)
+            self._log(f"  MIL eligibility ✓  train={elig_tr['n_total']} subjects "
+                       f"({elig_tr['n_positive']} pos, {elig_tr['n_negative']} neg)  "
+                       f"val={elig_va['n_total']} subjects "
+                       f"({elig_va['n_positive']} pos, {elig_va['n_negative']} neg)")
 
         epochs = self.cfg.get("phase2_epochs", 12)
         lr     = self.cfg.get("phase2_lr",     5e-4)
@@ -423,9 +658,10 @@ class Trainer:
                   *self.model.malignancy_head.parameters()]:
             p.requires_grad = False
 
-        train_ds, val_ds = self._split(subject_dataset, 0.20)
-        train_dl = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=subject_collate_fn)
-        val_dl   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=subject_collate_fn)
+        train_dl = DataLoader(train_subject_dataset, batch_size=1, shuffle=True,
+                               collate_fn=subject_collate_fn, generator=self._generator())
+        val_dl   = DataLoader(val_subject_dataset,   batch_size=1, shuffle=False,
+                               collate_fn=subject_collate_fn)
 
         loss_fn = MultiTaskLoss()
         params  = list(self.model.aggregator.parameters())
@@ -452,7 +688,7 @@ class Trainer:
 
             if auc > best_auc:
                 best_auc = auc
-                self._save(2, auc)
+                self._save(2, auc, metric_name="val_cancer_auc")
             if stopper.step(auc):
                 self._log("  early stop")
                 break
@@ -470,8 +706,10 @@ class Trainer:
 
     def phase3(
         self,
-        cell_dataset:    CellLevelDataset,
-        subject_dataset: SubjectLevelDataset,
+        train_cell_dataset:    CellLevelDataset,
+        val_cell_dataset:      CellLevelDataset,
+        train_subject_dataset: SubjectLevelDataset,
+        val_subject_dataset:   SubjectLevelDataset,
         skip_eligibility_check: bool = False,
     ) -> Dict:
         """
@@ -479,25 +717,38 @@ class Trainer:
         Alternates cell-level and subject-level steps each iteration.
         Early stopping on subject-level validation AUC.
 
-        See phase2's docstring — same MIL eligibility check applies here.
+        All four datasets must already be disjoint subject-level subsets of
+        the SAME SplitManifest used by phase1/phase2 — this method does not
+        split anything itself. See phase2's docstring for the MIL
+        eligibility check semantics (checked on train and val separately).
         """
         self._log("\n=== Phase 3 — End-to-End Fine-Tuning ===")
+        self._validate_train_val(train_cell_dataset, val_cell_dataset,
+                                  "train_cell", "val_cell")
+        self._validate_train_val(train_subject_dataset, val_subject_dataset,
+                                  "train_subject", "val_subject")
         if not skip_eligibility_check:
-            elig = check_mil_eligibility(subject_dataset)
-            self._log(f"  MIL eligibility ✓  {elig['n_total']} subjects "
-                       f"({elig['n_positive']} positive, {elig['n_negative']} negative)")
+            elig_tr = check_mil_eligibility(train_subject_dataset)
+            elig_va = check_mil_eligibility(val_subject_dataset)
+            self._log(f"  MIL eligibility ✓  train={elig_tr['n_total']} subjects "
+                       f"({elig_tr['n_positive']} pos, {elig_tr['n_negative']} neg)  "
+                       f"val={elig_va['n_total']} subjects "
+                       f"({elig_va['n_positive']} pos, {elig_va['n_negative']} neg)")
 
         epochs = self.cfg.get("phase3_epochs", 8)
         lr     = self.cfg.get("phase3_lr",     1e-4)
 
-        train_sub, val_sub = self._split(subject_dataset, 0.20)
-        cell_dl  = DataLoader(cell_dataset, batch_size=256, shuffle=True, drop_last=True)
-        sub_dl   = DataLoader(train_sub,    batch_size=1,   shuffle=True, collate_fn=subject_collate_fn)
-        val_dl   = DataLoader(val_sub,      batch_size=1,   shuffle=False, collate_fn=subject_collate_fn)
+        cell_dl  = DataLoader(train_cell_dataset, batch_size=256, shuffle=True,
+                               drop_last=len(train_cell_dataset) >= 256,
+                               generator=self._generator())
+        sub_dl   = DataLoader(train_subject_dataset, batch_size=1, shuffle=True,
+                               collate_fn=subject_collate_fn, generator=self._generator())
+        val_dl   = DataLoader(val_subject_dataset,   batch_size=1, shuffle=False,
+                               collate_fn=subject_collate_fn)
 
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.30, lambda_malignancy=0.30, lambda_subject=0.40,
-            smoke_class_weights=cell_dataset.smoke_class_weights().to(self.device),
+            smoke_class_weights=train_cell_dataset.smoke_class_weights().to(self.device),
         )
         params  = list(self.model.parameters())
         opt     = self._make_optimizer(params, lr, wd=1e-5)
@@ -549,7 +800,7 @@ class Trainer:
 
             if auc > best_auc:
                 best_auc = auc
-                self._save(3, auc)
+                self._save(3, auc, metric_name="val_cancer_auc")
             if stopper.step(auc):
                 self._log("  early stop")
                 break
@@ -558,6 +809,47 @@ class Trainer:
         self._save_history({"phase3": history}, "phase3")
         self._log(f"Phase 3 done.  best_AUC={best_auc:.3f}")
         return {"history": history, "best_auc": best_auc}
+
+    # ── Final held-out test evaluation ────────────────────────────────────────
+
+    def final_test_evaluation(
+        self,
+        test_cell_dataset:    CellLevelDataset,
+        test_subject_dataset: SubjectLevelDataset,
+        phase: int = 3,
+        out_dir: Optional[Union[str, Path]] = None,
+    ) -> Dict:
+        """
+        The ONE sanctioned place test data is used: load the validation-
+        selected checkpoint for `phase` and evaluate it ONCE on the
+        untouched test split. Never call this more than once per experiment
+        and never feed its output back into model/hyperparameter/threshold
+        selection — doing so turns the test set into a second validation
+        set and invalidates the "held out" label on the result.
+
+        Returns evaluate.py's cell_level/subject_level metrics wrapped with
+        describe_split()-style provenance so the result is unambiguously
+        labeled held-out test performance and can't be confused with
+        training-set or validation-set numbers.
+        """
+        from evaluate import Evaluator  # local import — evaluate.py imports from this module
+
+        self._load_best(phase)
+        ev = Evaluator(self.model, self.device)
+        report, raw = ev.full_report(
+            test_cell_dataset, test_subject_dataset,
+            out_dir=out_dir or self.ckpt_dir,
+        )
+        report["provenance"] = {
+            "split_name":  "test",
+            "is_held_out": True,
+            "checkpoint":  f"phase{phase}_best.pt",
+            "note": "Final held-out test evaluation — run once, not used for model/"
+                    "threshold/hyperparameter selection.",
+        }
+        self._log("[train] final_test_evaluation complete — this is a HELD-OUT TEST result, "
+                   "not a validation or training-set number.")
+        return report
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -608,28 +900,50 @@ class Trainer:
 # ─── Sanity check ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── SYNTHETIC DIAGNOSTIC RUN ────────────────────────────────────────────
+    # Random data, random labels, no real subjects. This exercises the
+    # Trainer plumbing (subject-disjoint train/val datasets, checkpointing,
+    # inference) end-to-end quickly. It is NOT a real training run and its
+    # metrics are meaningless — see evaluate.py's __main__ for the same
+    # caveat spelled out for evaluation metrics. Real experiments must
+    # build train/val/test datasets from preprocess.py::run_pipeline_split_aware
+    # and a real SplitManifest, never from this block.
     import random
+    from data.splitting import subject_train_val_test_split
+
     torch.manual_seed(42)
     np.random.seed(42)
 
-    GENES, N_CELLS, N_SUBJ = 2000, 1000, 20
+    GENES, N_SUBJ, CELLS_PER_SUBJ = 2000, 40, 25
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}\n")
 
-    # Synthetic datasets — half the cells carry a known exposure dose, so
+    subject_ids_list = [f"sub_{i}" for i in range(N_SUBJ)]
+    manifest = subject_train_val_test_split(
+        subject_ids_list, labels=None, train_frac=0.6, val_frac=0.2, test_frac=0.2, seed=42,
+    )
+
+    # Synthetic per-cell data — half the cells carry a known exposure dose, so
     # Phase 1 actually exercises the dose-response head + loss end to end.
+    n_cells = N_SUBJ * CELLS_PER_SUBJ
+    cell_subject_ids = np.repeat(subject_ids_list, CELLS_PER_SUBJ)
     dose = np.where(
-        np.random.rand(N_CELLS) < 0.5,
-        np.random.rand(N_CELLS).astype("float32"),
+        np.random.rand(n_cells) < 0.5,
+        np.random.rand(n_cells).astype("float32"),
         DOSE_UNKNOWN,
     ).astype("float32")
-    cell_ds = CellLevelDataset(
-        gene_matrix       = np.random.randn(N_CELLS, GENES).astype("float32"),
-        smoke_labels      = np.random.randint(0, N_SMOKE_CLASSES, N_CELLS),
-        malignancy_labels = np.random.randint(0, 2, N_CELLS).astype("float32"),
-        cell_type_ids     = np.random.randint(0, N_CELL_TYPES, N_CELLS),
-        exposure_dose     = dose,
+    full_cell_ds = CellLevelDataset(
+        gene_matrix       = np.random.randn(n_cells, GENES).astype("float32"),
+        smoke_labels       = np.random.randint(0, N_SMOKE_CLASSES, n_cells),
+        malignancy_labels  = np.random.randint(0, 2, n_cells).astype("float32"),
+        cell_type_ids      = np.random.randint(0, N_CELL_TYPES, n_cells),
+        exposure_dose      = dose,
+        subject_ids        = cell_subject_ids,
     )
+    train_cell_ds = full_cell_ds.subset_by_subjects(manifest.train_subjects)
+    val_cell_ds   = full_cell_ds.subset_by_subjects(manifest.val_subjects)
+    test_cell_ds  = full_cell_ds.subset_by_subjects(manifest.test_subjects)
+
     def _bag(n):
         return {
             "gene_matrix":   np.random.randn(n, GENES).astype("float32"),
@@ -637,23 +951,28 @@ if __name__ == "__main__":
             "smoke_labels":  np.random.randint(0, N_SMOKE_CLASSES, n),
             "malig_labels":  np.random.randint(0, 2, n).astype("float32"),
             "cancer_label":  random.randint(0, 1),
+            "cancer_label_known": True,
         }
 
-    subject_ds = SubjectLevelDataset([
-        {"subject_id": f"sub_{i}", **_bag(random.randint(30, 80))}
-        for i in range(N_SUBJ)
-    ])
+    all_bags = {sid: {"subject_id": sid, **_bag(random.randint(30, 80))} for sid in subject_ids_list}
+    train_subject_ds = SubjectLevelDataset([all_bags[s] for s in manifest.train_subjects])
+    val_subject_ds   = SubjectLevelDataset([all_bags[s] for s in manifest.val_subjects])
+    test_subject_ds  = SubjectLevelDataset([all_bags[s] for s in manifest.test_subjects])
 
     CFG = Path(__file__).parents[1] / "configs" / "default.yaml"
     model   = MultiSmokeCancerNet.from_config(CFG)
     trainer = Trainer.from_config(model, CFG, device)
+    trainer.split_manifest_path = "synthetic-diagnostic-run (no manifest file saved)"
 
     # Override epochs for speed
     trainer.cfg.update({"phase1_epochs": 2, "phase2_epochs": 2, "phase3_epochs": 2})
 
-    r1 = trainer.phase1(cell_ds)
-    r2 = trainer.phase2(subject_ds)
-    r3 = trainer.phase3(cell_ds, subject_ds)
+    r1 = trainer.phase1(train_cell_ds, val_cell_ds)
+    r2 = trainer.phase2(train_subject_ds, val_subject_ds, skip_eligibility_check=True)
+    r3 = trainer.phase3(train_cell_ds, val_cell_ds, train_subject_ds, val_subject_ds,
+                         skip_eligibility_check=True)
+    test_report = trainer.final_test_evaluation(test_cell_ds, test_subject_ds, phase=3)
+    print(f"\nfinal_test_evaluation provenance: {test_report['provenance']}")
 
     # Inference
     result = trainer.predict(

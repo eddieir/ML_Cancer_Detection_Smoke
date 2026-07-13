@@ -43,6 +43,7 @@ def _cell_ds_with_known_mask(malig_known):
         malignancy_labels = torch.zeros(n).numpy(),
         cell_type_ids     = torch.zeros(n, dtype=torch.long).numpy(),
         malignancy_known  = malig_known,
+        diagnostic_mode    = True,
     )
 
 

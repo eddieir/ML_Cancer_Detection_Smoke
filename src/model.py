@@ -208,6 +208,7 @@ class MultiSmokeCancerNet(nn.Module):
         attention_dim:  int   = 128,
     ):
         super().__init__()
+        self.input_dim      = input_dim
         self.embedding_dim  = embedding_dim
         self.num_smoke      = num_smoke
         self.num_cell_types = num_cell_types

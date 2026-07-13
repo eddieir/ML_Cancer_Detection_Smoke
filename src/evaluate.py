@@ -22,7 +22,7 @@ import yaml
 
 from constants import CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES
 from model import MultiSmokeCancerNet
-from train import CellLevelDataset, SubjectLevelDataset, subject_collate_fn
+from train import CellLevelDataset, SubjectLevelDataset, load_checkpoint_into, subject_collate_fn
 
 
 def describe_split(
@@ -180,10 +180,7 @@ class Evaluator:
         ckpt_dir = Path(config.get("train", config).get("checkpoint_dir", "checkpoints"))
         if not ckpt_dir.is_absolute():
             ckpt_dir = Path(__file__).parents[1] / ckpt_dir
-        model.load_state_dict(
-            torch.load(ckpt_dir / f"phase{phase}_best.pt",
-                       map_location=device, weights_only=True)
-        )
+        load_checkpoint_into(model, ckpt_dir / f"phase{phase}_best.pt", device)
         print(f"[evaluate] loaded phase {phase} checkpoint  ({ckpt_dir}/)")
         return cls(model, device)
 
@@ -431,6 +428,7 @@ if __name__ == "__main__":
         smoke_labels      = np.random.randint(0, N_SMOKE_CLASSES, N_CELLS),
         malignancy_labels = np.random.randint(0, 2, N_CELLS).astype("float32"),
         cell_type_ids     = np.random.randint(0, N_CELL_TYPES, N_CELLS),
+        diagnostic_mode    = True,
     )
 
     def _bag(n):

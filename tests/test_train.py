@@ -9,8 +9,12 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import pytest
 
-from constants import N_SMOKE_CLASSES
-from train import CellLevelDataset, SubjectLevelDataset, MILEligibilityError, check_mil_eligibility
+from constants import N_SMOKE_CLASSES, N_CELL_TYPES
+from model import MultiSmokeCancerNet
+from train import (
+    CellLevelDataset, SubjectLevelDataset, MILEligibilityError, Trainer,
+    assert_disjoint_subjects, check_mil_eligibility,
+)
 
 GENES = 20
 
@@ -22,6 +26,7 @@ def _dataset(smoke_labels: np.ndarray) -> CellLevelDataset:
         smoke_labels      = smoke_labels,
         malignancy_labels = np.random.randint(0, 2, n).astype("float32"),
         cell_type_ids     = np.zeros(n, dtype="int64"),
+        diagnostic_mode    = True,
     )
 
 
@@ -113,3 +118,197 @@ def test_mil_eligibility_passes_balanced_sufficient_data():
     report = check_mil_eligibility(ds, min_subjects=10, min_positive=2, min_negative=2)
     assert report["n_total"] == 20
     assert report["problems"] == []
+
+
+# ─── Real subject_ids required outside diagnostic_mode ─────────────────────
+
+def test_cell_level_dataset_rejects_missing_subject_ids_by_default():
+    with pytest.raises(ValueError):
+        CellLevelDataset(
+            gene_matrix=np.random.randn(5, GENES).astype("float32"),
+            smoke_labels=np.zeros(5, dtype="int64"),
+            malignancy_labels=np.zeros(5, dtype="float32"),
+            cell_type_ids=np.zeros(5, dtype="int64"),
+        )
+
+
+def test_cell_level_dataset_rejects_unknown_subject_id_outside_diagnostic_mode():
+    with pytest.raises(ValueError):
+        CellLevelDataset(
+            gene_matrix=np.random.randn(3, GENES).astype("float32"),
+            smoke_labels=np.zeros(3, dtype="int64"),
+            malignancy_labels=np.zeros(3, dtype="float32"),
+            cell_type_ids=np.zeros(3, dtype="int64"),
+            subject_ids=["sub_a", "unknown", "sub_b"],
+        )
+
+
+def test_cell_level_dataset_diagnostic_mode_allows_missing_subject_ids():
+    ds = CellLevelDataset(
+        gene_matrix=np.random.randn(5, GENES).astype("float32"),
+        smoke_labels=np.zeros(5, dtype="int64"),
+        malignancy_labels=np.zeros(5, dtype="float32"),
+        cell_type_ids=np.zeros(5, dtype="int64"),
+        diagnostic_mode=True,
+    )
+    assert len(ds) == 5
+
+
+# ─── subset_by_subjects keeps a subject's cells together ────────────────────
+
+def test_subset_by_subjects_keeps_one_subjects_cells_entirely_in_one_split():
+    n_per_subject = 40
+    subject_ids = np.repeat(["sub_a", "sub_b", "sub_c"], n_per_subject)
+    n = len(subject_ids)
+    ds = CellLevelDataset(
+        gene_matrix=np.random.randn(n, GENES).astype("float32"),
+        smoke_labels=np.random.randint(0, N_SMOKE_CLASSES, n),
+        malignancy_labels=np.random.randint(0, 2, n).astype("float32"),
+        cell_type_ids=np.zeros(n, dtype="int64"),
+        subject_ids=subject_ids,
+    )
+    train_ds = ds.subset_by_subjects(["sub_a", "sub_b"])
+    val_ds   = ds.subset_by_subjects(["sub_c"])
+    assert len(train_ds) == 2 * n_per_subject
+    assert len(val_ds) == n_per_subject
+    assert set(train_ds.subject_ids.tolist()) == {"sub_a", "sub_b"}
+    assert set(val_ds.subject_ids.tolist()) == {"sub_c"}
+
+
+def test_subset_by_subjects_preserves_label_alignment():
+    subject_ids = np.array(["a", "a", "b", "b", "b"])
+    smoke = np.array([0, 1, 2, 3, 4])
+    ds = CellLevelDataset(
+        gene_matrix=np.arange(5 * GENES, dtype="float32").reshape(5, GENES),
+        smoke_labels=smoke,
+        malignancy_labels=np.zeros(5, dtype="float32"),
+        cell_type_ids=np.zeros(5, dtype="int64"),
+        subject_ids=subject_ids,
+    )
+    sub_b = ds.subset_by_subjects(["b"])
+    assert sub_b.smoke.tolist() == [2, 3, 4]
+    # gene rows must still correspond to the same original cells
+    assert torch.equal(sub_b.X[0], ds.X[2])
+
+
+# ─── assert_disjoint_subjects / Trainer leakage guard ───────────────────────
+
+def test_assert_disjoint_subjects_passes_for_disjoint_sets():
+    assert_disjoint_subjects(["a", "b"], ["c", "d"])  # no raise
+
+
+def test_assert_disjoint_subjects_raises_on_overlap():
+    with pytest.raises(ValueError):
+        assert_disjoint_subjects(["a", "b"], ["b", "c"])
+
+
+def _real_cell_ds(subject_ids, n_per_subject=20):
+    n = len(subject_ids) * n_per_subject
+    sid_col = np.repeat(subject_ids, n_per_subject)
+    return CellLevelDataset(
+        gene_matrix=np.random.randn(n, GENES).astype("float32"),
+        smoke_labels=np.random.randint(0, N_SMOKE_CLASSES, n),
+        malignancy_labels=np.random.randint(0, 2, n).astype("float32"),
+        cell_type_ids=np.zeros(n, dtype="int64"),
+        subject_ids=sid_col,
+    )
+
+
+def _trainer():
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    return Trainer(model, {"train": {"phase1_epochs": 1, "checkpoint_dir": "/tmp/_test_ckpt_leakage"}})
+
+
+def test_trainer_phase1_rejects_overlapping_train_val_subjects():
+    trainer = _trainer()
+    shared = _real_cell_ds(["s1", "s2"])
+    with pytest.raises(ValueError):
+        trainer.phase1(shared, shared)  # same subjects in "train" and "val"
+
+
+def test_trainer_phase1_rejects_empty_train_dataset():
+    trainer = _trainer()
+    empty = _real_cell_ds([])
+    val = _real_cell_ds(["s1"])
+    with pytest.raises(ValueError):
+        trainer.phase1(empty, val)
+
+
+def test_trainer_phase1_accepts_disjoint_train_val_subjects():
+    trainer = _trainer()
+    trainer.cfg["phase1_epochs"] = 1
+    train_ds = _real_cell_ds(["s1", "s2", "s3"])
+    val_ds   = _real_cell_ds(["s4"])
+    result = trainer.phase1(train_ds, val_ds)
+    assert "best_smoke_macro_f1" in result
+
+
+# ─── Structured checkpoints ──────────────────────────────────────────────────
+
+def test_trainer_save_writes_structured_checkpoint_with_metadata(tmp_path):
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(tmp_path)}}, seed=7)
+    trainer.split_manifest_path = "some/manifest.json"
+    trainer.rare_class_policy = "keep_with_warning"
+    trainer._save(1, 0.42, metric_name="val_smoke_macro_f1")
+
+    obj = torch.load(tmp_path / "phase1_best.pt", weights_only=False)
+    assert obj["format_version"] >= 2
+    assert "model_state_dict" in obj
+    assert obj["metric_name"] == "val_smoke_macro_f1"
+    assert obj["metric_value"] == 0.42
+    assert obj["random_seed"] == 7
+    assert obj["split_manifest_path"] == "some/manifest.json"
+    assert obj["rare_class_policy"] == "keep_with_warning"
+    assert obj["input_dim"] == GENES
+
+
+def test_trainer_load_best_round_trips_structured_checkpoint(tmp_path):
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(tmp_path)}})
+    trainer._save(1, 0.9, metric_name="val_smoke_macro_f1")
+    original_weight = next(model.parameters()).clone()
+
+    # Perturb the live model, then reload — should restore the saved weights.
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    meta = trainer._load_best(1)
+    assert torch.allclose(next(model.parameters()), original_weight)
+    assert meta["metric_value"] == 0.9
+
+
+def test_trainer_load_best_handles_legacy_raw_state_dict_checkpoint(tmp_path):
+    """A checkpoint saved before structured format existed (bare
+    state_dict) must still load, with a warning, and no crash."""
+    model = MultiSmokeCancerNet(input_dim=GENES, embedding_dim=16, attention_dim=8)
+    ckpt_dir = tmp_path
+    torch.save(model.state_dict(), ckpt_dir / "phase1_best.pt")  # legacy format
+
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(ckpt_dir)}})
+    meta = trainer._load_best(1)
+    assert meta == {}  # no metadata available for legacy checkpoints
+
+
+def test_trainer_phase1_class_weights_computed_from_train_only():
+    """Class weights must reflect ONLY the train dataset, never validation."""
+    trainer = _trainer()
+    trainer.cfg["phase1_epochs"] = 1
+    n_tr, n_va = 60, 60
+    train_ds = CellLevelDataset(
+        gene_matrix=np.random.randn(n_tr, GENES).astype("float32"),
+        smoke_labels=np.zeros(n_tr, dtype="int64"),  # all class 0
+        malignancy_labels=np.zeros(n_tr, dtype="float32"),
+        cell_type_ids=np.zeros(n_tr, dtype="int64"),
+        subject_ids=np.array(["s1"] * n_tr),
+    )
+    val_ds = CellLevelDataset(
+        gene_matrix=np.random.randn(n_va, GENES).astype("float32"),
+        smoke_labels=np.ones(n_va, dtype="int64"),  # all class 1 — must NOT affect weights
+        malignancy_labels=np.zeros(n_va, dtype="float32"),
+        cell_type_ids=np.zeros(n_va, dtype="int64"),
+        subject_ids=np.array(["s2"] * n_va),
+    )
+    expected = train_ds.smoke_class_weights()
+    result = trainer.phase1(train_ds, val_ds)
+    assert torch.allclose(expected, train_ds.smoke_class_weights())
