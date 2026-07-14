@@ -228,6 +228,19 @@ class ExperimentContext:
         from .fold_preprocessing import artifact_fingerprint
         return artifact_fingerprint(self.preprocessing_artifact)
 
+    @property
+    def test_membership_fingerprint(self) -> str:
+        """SHA-256 of the frozen test-subject membership list, derived
+        exclusively from split_manifest.test_subjects — never from
+        test_bags/test_cell_dataset. Reading which subject IDs constitute
+        the test split is not the same as reading their labels or
+        expression, and the split manifest is fixed at split time, so this
+        is safe to compute before the frozen-test guard is acquired and
+        used as part of the guard's identity (blocker 2)."""
+        ids = sorted(str(s) for s in self.split_manifest.test_subjects)
+        blob = json.dumps(ids, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
     def run_identity(self, run_id: str) -> Dict[str, Optional[str]]:
         """
         The full set of fingerprints/identifiers a reproducibility artifact

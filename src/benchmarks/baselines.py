@@ -52,6 +52,12 @@ class Baseline:
             "sklearn_version": sklearn.__version__,
         }
 
+    def model_state_fingerprint(self) -> str:
+        """Deterministic SHA-256 of this baseline's actual fitted weights —
+        see model_fingerprint.py. Contains no timing/identity metadata."""
+        from .model_fingerprint import sklearn_model_state_fingerprint
+        return sklearn_model_state_fingerprint(self.model)
+
 
 def positive_class_proba(model: Baseline, X: np.ndarray) -> np.ndarray:
     """

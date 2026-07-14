@@ -147,6 +147,31 @@ def test_each_oof_fold_has_its_own_fold_local_hyperparameter_search():
             assert set(inner["val"]) <= oof_train
 
 
+def test_oof_fold_records_carry_real_sha256_fingerprints():
+    """Issue 4: training/validation subject fingerprints must be actual
+    SHA-256 hashes (64 hex chars), not raw JSON subject lists, and every
+    successful fold must record a model-state fingerprint."""
+    ctx = build_synthetic_context(seed=3, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    oof = generate_subject_oof_predictions(
+        ctx, "logistic", dev_subjects, outcomes, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42, n_folds=3, n_inner_folds=2,
+    )
+    import re
+    hexpat = re.compile(r"^[0-9a-f]{64}$")
+    for fold in oof["fold_membership"]:
+        if fold.get("skipped_reason"):
+            continue
+        assert hexpat.match(fold["training_subjects_fingerprint"])
+        assert hexpat.match(fold["validation_subjects_fingerprint"])
+        assert hexpat.match(fold["inner_selection_fingerprint"])
+        assert hexpat.match(fold["selected_params_fingerprint"])
+        assert hexpat.match(fold["model_state_fingerprint"])
+        # not the raw subject list serialized under a "fingerprint" name
+        assert fold["training_subjects_fingerprint"] != str(sorted(fold["train_subject_ids"]))
+
+
 def test_corrupting_a_subject_outside_the_oof_training_set_does_not_change_fold_selection():
     """An OOF-held-out (or otherwise excluded) subject's outcome must not
     influence the hyperparameters selected for a fold whose OOF-training set
@@ -202,6 +227,50 @@ def test_final_dev_fit_artifact_fit_only_on_dev_subjects():
     assert isinstance(fitted, FittedFinalCandidate)
     assert fitted.preprocessing_artifact.fit_n_subjects == len(dev_subjects)
     assert set(fitted.dev_subject_ids) <= set(dev_subjects)
+
+
+# ─── model-state fingerprints (blocker 2) ──────────────────────────────────
+
+def test_final_fit_carries_a_deterministic_model_state_fingerprint():
+    ctx = build_synthetic_context(seed=4, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    fitted = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    )
+    assert isinstance(fitted.model_state_fingerprint, str)
+    assert len(fitted.model_state_fingerprint) == 64  # sha256 hex digest
+
+
+def test_model_state_fingerprint_reproducible_for_identical_seeded_fits():
+    """Two independent fits with identical data/config/seed must produce the
+    SAME model-state fingerprint — this is what makes it usable as part of a
+    deterministic guard identity, unlike fit_seconds."""
+    ctx = build_synthetic_context(seed=4, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    fitted1 = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    )
+    fitted2 = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    )
+    assert fitted1.model_state_fingerprint == fitted2.model_state_fingerprint
+
+
+def test_different_fitted_weights_produce_different_model_state_fingerprints():
+    ctx = build_synthetic_context(seed=4, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    fitted_c1 = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {"C": 0.01}, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42,
+    )
+    fitted_c2 = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {"C": 100.0}, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42,
+    )
+    assert fitted_c1.model_state_fingerprint != fitted_c2.model_state_fingerprint
 
 
 def test_evaluate_frozen_test_transforms_but_never_refits_the_dev_artifact():

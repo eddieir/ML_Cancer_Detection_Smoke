@@ -20,11 +20,13 @@ mode and the run refuses to be mistaken for a real-data result.
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 
+from .atomic_io import read_and_verify_csv_rows, read_and_verify_json
 from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES
 from .calibration import build_frozen_policy
 from .context import ExperimentContext
@@ -36,7 +38,7 @@ from .cross_validation import (
     run_cancer_cv,
     run_smoke_cv,
 )
-from .eligibility import check_task_a_eligibility, check_task_b_eligibility
+from .eligibility import check_task_a_eligibility, check_task_b_development_eligibility, check_test_evaluability
 from .final_evaluation import (
     NoEligibleFinalCandidateError,
     evaluate_frozen_test,
@@ -235,57 +237,106 @@ def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outco
     )
 
 
-def _write_oof_predictions_csv(run_dir, oof: dict, outcomes_by_subject: dict, candidate_name: str, pooling: str) -> None:
+_OOF_CSV_COLUMNS = [
+    "subject_id", "target", "probability", "seed", "outer_oof_fold", "candidate_name",
+    "candidate_type", "pooling", "selected_params_json", "selected_params_fingerprint",
+    "inner_selection_fingerprint", "training_subjects_fingerprint", "validation_subjects_fingerprint",
+    "preprocessing_fingerprint", "model_state_fingerprint", "prediction_status", "undefined_reason",
+]
+
+
+def _write_oof_predictions_csv(run_dir, oof: dict, outcomes_by_subject: dict, candidate_name: str, pooling: str) -> str:
     """
     Persist ONE row per development subject with a validated OOF prediction
     (generate_subject_oof_predictions already rejected missing/duplicate/
     in-fold-leaked coverage before returning `oof`) to
     predictions/cancer_<candidate>_oof.csv — the actual subject-level
-    probabilities, not just the fold-membership counts calibration_report's
-    "oof_summary" carries. write_json/write_csv_table (reporting.py) write
-    complete files in one shot (json.dump / csv.DictWriter.writerows over
-    an already-fully-built object), never a partially-written file that
-    could be mistaken for a complete one.
+    probabilities and every real SHA-256 fingerprint
+    generate_subject_oof_predictions already computed per fold (training/
+    validation subject-list fingerprints, inner-selection fingerprint,
+    selected-params fingerprint, fold model-state fingerprint) — never a
+    raw JSON blob under a field named "fingerprint" (issue 4). Writes are
+    atomic (write_csv_table/write_json -> atomic_io.py); the file is
+    reloaded and its row count verified immediately after writing, and the
+    complete-file's own SHA-256 is computed and returned so calibration can
+    reference exactly this artifact.
     """
-    import json as _json
-
     fold_by_subject = {}
     for fold in oof["fold_membership"]:
-        fp = fold.get("preprocessing_fingerprint")
         hp = fold.get("hyperparameter_search", {})
-        selected_params_json = _json.dumps(hp.get("selected_params", {}), sort_keys=True)
-        inner_selection_fp = hashlib.sha256(_json.dumps(hp, sort_keys=True, default=str).encode()).hexdigest()
-        training_fp = _json.dumps(fold.get("train_subject_ids", []), sort_keys=True)
+        selected_params_json = json.dumps(hp.get("selected_params", {}), sort_keys=True)
         for sid in fold.get("val_subject_ids", []):
             fold_by_subject[sid] = {
-                "outer_oof_fold": fold["fold"], "preprocessing_fingerprint": fp,
+                "outer_oof_fold": fold["fold"],
+                "preprocessing_fingerprint": fold.get("preprocessing_fingerprint"),
                 "selected_params_json": selected_params_json,
-                "inner_selection_fingerprint": inner_selection_fp,
-                "training_subjects_fingerprint": training_fp,
+                "selected_params_fingerprint": fold.get("selected_params_fingerprint"),
+                "inner_selection_fingerprint": fold.get("inner_selection_fingerprint"),
+                "training_subjects_fingerprint": fold.get("training_subjects_fingerprint"),
+                "validation_subjects_fingerprint": fold.get("validation_subjects_fingerprint"),
+                "model_state_fingerprint": fold.get("model_state_fingerprint"),
             }
 
     rows = []
     for sid in oof["dev_subjects"]:
         meta = fold_by_subject.get(sid, {})
         proba = oof["oof_by_subject"].get(sid)
-        rows.append({
+        status = "predicted" if proba is not None else "undefined"
+        if status == "predicted" and not meta.get("model_state_fingerprint"):
+            raise RuntimeError(
+                f"_write_oof_predictions_csv: subject {sid!r} has a successful prediction but no "
+                "recorded fold model-state fingerprint — refusing to persist an OOF row that "
+                "claims a prediction without provenance for the model that produced it."
+            )
+        row = {col: "" for col in _OOF_CSV_COLUMNS}
+        row.update({
             "subject_id": sid, "target": outcomes_by_subject.get(sid),
             "probability": proba, "seed": oof.get("seed"),
             "outer_oof_fold": meta.get("outer_oof_fold"), "candidate_name": candidate_name,
             "candidate_type": "mil" if is_mil_candidate(candidate_name) else "baseline",
             "pooling": pooling if is_mil_candidate(candidate_name) else "",
             "selected_params_json": meta.get("selected_params_json", ""),
+            "selected_params_fingerprint": meta.get("selected_params_fingerprint", ""),
+            "inner_selection_fingerprint": meta.get("inner_selection_fingerprint", ""),
             "training_subjects_fingerprint": meta.get("training_subjects_fingerprint", ""),
+            "validation_subjects_fingerprint": meta.get("validation_subjects_fingerprint", ""),
             "preprocessing_fingerprint": meta.get("preprocessing_fingerprint", ""),
-            "prediction_status": "predicted" if proba is not None else "undefined",
+            "model_state_fingerprint": meta.get("model_state_fingerprint", ""),
+            "prediction_status": status,
             "undefined_reason": "" if proba is not None else "subject never received an OOF prediction",
         })
-    write_csv_table(run_dir / "predictions" / f"cancer_{candidate_name}_oof.csv", rows)
-    write_json(run_dir / "metrics" / "cancer_oof_folds.json", oof["fold_membership"])
+        rows.append(row)
+
+    # Reject duplicate/missing coverage explicitly here too (belt-and-braces
+    # on top of generate_subject_oof_predictions's own checks) before ever
+    # writing the file.
+    seen_subjects = [r["subject_id"] for r in rows]
+    if len(seen_subjects) != len(set(seen_subjects)):
+        raise RuntimeError("_write_oof_predictions_csv: duplicate subject rows detected before write.")
+    missing = sorted(set(oof["dev_subjects"]) - set(seen_subjects))
+    if missing:
+        raise RuntimeError(f"_write_oof_predictions_csv: missing rows for development subjects: {missing[:5]}")
+
+    oof_path = run_dir / "predictions" / f"cancer_{candidate_name}_oof.csv"
+    write_csv_table(oof_path, rows)
+    read_and_verify_csv_rows(oof_path, expected_row_count=len(rows))
+    oof_file_fingerprint = hashlib.sha256(oof_path.read_bytes()).hexdigest()
+
+    folds_path = run_dir / "metrics" / "cancer_oof_folds.json"
+    write_json(folds_path, oof["fold_membership"])
+    read_and_verify_json(folds_path, oof["fold_membership"])
+
+    return oof_file_fingerprint
 
 
 def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
-    eligibility = {"cancer_prediction": check_task_b_eligibility(context)}
+    # Development-only eligibility (blocker 1): reads ONLY train_bags/
+    # val_bags — check_task_b_development_eligibility's signature doesn't
+    # even accept test_bags, so test composition can never influence
+    # whether this experiment proceeds. Whether test metrics end up
+    # mathematically defined is decided later, by check_test_evaluability,
+    # strictly inside the guarded stage below.
+    eligibility = {"cancer_prediction": check_task_b_development_eligibility(context.train_bags, context.val_bags)}
     if not eligibility["cancer_prediction"].eligible:
         print(f"[benchmarks] Task B NOT_EVALUABLE: {eligibility['cancer_prediction'].reasons}")
         return {"eligibility": eligibility, "cv_reports": {}, "comparisons": [], "calibration_report": None}
@@ -352,7 +403,7 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     # membership counts) — one row per development subject, atomically
     # written once fold_membership/oof_by_subject have both already passed
     # generate_subject_oof_predictions's own coverage/leakage validation.
-    _write_oof_predictions_csv(run_dir, oof, outcomes_by_subject, best_name, pooling)
+    oof_file_fingerprint = _write_oof_predictions_csv(run_dir, oof, outcomes_by_subject, best_name, pooling)
 
     # ONE final preprocessing + model fit on ALL development subjects, using
     # the dev-pool-selected configuration (never reselected here). This is
@@ -383,46 +434,94 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             "benchmarks.disable_frozen_test_guard=True is only permitted for --synthetic runs — "
             "refusing to disable the durable frozen-test guard for this non-synthetic run."
         )
+    # Deterministic, non-volatile calibration/model fingerprints for the
+    # guard identity (blocker 2) — no fit_seconds, no timestamps, no
+    # parameter counts standing in for actual fitted weights.
+    calibration_fingerprint = hashlib.sha256(
+        json.dumps(policy.calibrator.to_dict(), sort_keys=True, default=str).encode()
+    ).hexdigest()
+    # test_membership_fingerprint reads ONLY split_manifest.test_subjects
+    # (never test_bags/labels) — safe to compute before guard acquisition,
+    # and included so a changed frozen test membership changes identity.
+    test_membership_fp = context.test_membership_fingerprint
+
     guard = None
+    identity_fp = None
     if not (synthetic and disable_guard):
         guard_dir = bench_cfg.get("frozen_test_guard_dir") or default_guard_dir(run_dir.parent)
         identity_fp = context.guard_identity_fingerprint(best_name, extra={
             "selected_hyperparameters": selected_params,
             "final_preprocessing_artifact_fingerprint": fitted.preprocessing_artifact_fingerprint,
-            "final_model_metadata": fitted.model_metadata,
-            "calibration": policy.calibrator.to_dict(),
+            "final_model_state_fingerprint": fitted.model_state_fingerprint,
+            "calibration_fingerprint": calibration_fingerprint,
             "threshold": policy.threshold,
+            "test_membership_fingerprint": test_membership_fp,
         })
         guard = FrozenTestGuard(Path(guard_dir) / f"{identity_fp}.json")
         guard.acquire(context.run_identity(run_dir.name), selected_model=best_name)
 
     try:
-        # Test subject IDs and test labels are resolved here — the first
-        # point in this function's entire execution where either is touched.
+        # ══════════════════════════════════════════════════════════════
+        # The complete guarded transaction (blocker 3): resolve test
+        # membership/labels, transform+predict, calibrate/threshold,
+        # compute metrics, build the immutable frozen-test result object,
+        # persist it atomically, reload and verify it, and ONLY THEN mark
+        # the guard completed. Any failure at any step below marks the
+        # guard failed instead (the `except` clause) — mark_completed is
+        # never reached unless persistence+verification both succeeded.
+        # ══════════════════════════════════════════════════════════════
         test_subjects = context.subjects_for("test")
         test_outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"]
                                      for b in context.test_bags if b.get("cancer_label_known")}
+        test_evaluability = check_test_evaluability(context.test_bags)
         raw = evaluate_frozen_test(fitted, context, test_subjects, test_outcomes_by_subject,
                                     num_cell_types, min_cells)
         test_result = policy.apply_to_test(raw["test_labels"], raw["test_proba"])
+
+        frozen_result = {
+            "scientific_identity_fingerprint": identity_fp,
+            "selected_model": best_name,
+            "candidate_type": "mil" if is_mil_candidate(best_name) else "baseline",
+            "model_state_fingerprint": fitted.model_state_fingerprint,
+            "preprocessing_fingerprint": fitted.preprocessing_artifact_fingerprint,
+            "calibration_fingerprint": calibration_fingerprint,
+            "threshold": policy.threshold,
+            "metrics": test_result,
+            "test_evaluability": test_evaluability,
+            "test_membership_fingerprint": test_membership_fp,
+            "n_evaluated_subjects": len(raw["test_subject_ids"]),
+            "synthetic": synthetic,
+        }
+        frozen_result["artifact_fingerprint"] = hashlib.sha256(
+            json.dumps(frozen_result, sort_keys=True, default=str).encode()
+        ).hexdigest()
+
+        result_path = run_dir / "calibration" / "frozen_test_result.json"
+        write_json(result_path, frozen_result)
+        read_and_verify_json(result_path, frozen_result)
     except Exception as e:
         if guard is not None:
             guard.mark_failed(str(e))
         raise
     if guard is not None:
-        result_fp = hashlib.sha256(str(sorted(test_result.items())).encode()).hexdigest()
-        guard.mark_completed(threshold=policy.threshold, test_result_fingerprint=result_fp)
+        guard.mark_completed(threshold=policy.threshold,
+                              test_result_fingerprint=frozen_result["artifact_fingerprint"])
 
     calibration_report = {
         "selected_model": best_name, "selection_report": selection_report,
         "hyperparameter_search": hp_search, "test_result": test_result,
+        "test_evaluability": test_evaluability,
         "oof_summary": {
             "candidate": oof["candidate"], "n_dev_subjects": len(oof["dev_subjects"]),
             "fold_membership": oof["fold_membership"],
+            "oof_artifact_fingerprint": oof_file_fingerprint,
         },
         "final_model_metadata": fitted.model_metadata,
+        "final_model_state_fingerprint": fitted.model_state_fingerprint,
         "final_preprocessing_artifact_fingerprint": fitted.preprocessing_artifact_fingerprint,
         "test_subject_ids": raw["test_subject_ids"],
+        "frozen_test_result_artifact_fingerprint": frozen_result["artifact_fingerprint"],
+        "frozen_test_result_path": str(run_dir / "calibration" / "frozen_test_result.json"),
         "guard": {"enabled": guard is not None,
                    "path": str(guard.guard_path) if guard is not None else None,
                    "synthetic_disabled": bool(synthetic and disable_guard)},

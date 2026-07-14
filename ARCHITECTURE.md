@@ -811,5 +811,49 @@ the full list):
    (`runner.py::_write_oof_predictions_csv`) — previously only fold
    membership counts were written under `calibration_report["oof_summary"]`.
 
+A sixth pass closed five further problems (see README's Benchmarking
+framework section for the full list):
+
+1. **Task B eligibility no longer reads test labels/class counts.**
+   `eligibility.check_task_b_eligibility` is replaced by
+   `check_task_b_development_eligibility(train_bags, val_bags)` — a
+   signature that structurally cannot accept `test_bags` — as the sole gate
+   run before the guard, plus `check_test_evaluability(test_bags)`, run only
+   inside the guarded stage, which reports (never rejects on) undefined
+   AUROC/AUPRC for a one-class test split.
+2. **Guard identity is now deterministic across runs of the same
+   configuration.** It previously embedded `fitted.model_metadata`
+   (`fit_seconds` for neural/MIL candidates — real wall-clock timing).
+   `benchmarks/model_fingerprint.py` adds `torch_state_dict_fingerprint`
+   (canonicalized `state_dict` tensor bytes) and
+   `sklearn_model_state_fingerprint` (canonicalized fitted attributes);
+   `run_cancer_task` now passes `final_model_state_fingerprint` plus a
+   `calibration_fingerprint` and the new `ExperimentContext.
+   test_membership_fingerprint` (derived only from `split_manifest.
+   test_subjects`) into `guard_identity_fingerprint`'s `extra` payload,
+   never the raw metadata dict.
+3. **The guarded transaction now persists a complete, verified frozen-test
+   result before `mark_completed`.** `calibration/frozen_test_result.json`
+   (fingerprints, threshold, aggregate metrics, membership fingerprint, its
+   own `artifact_fingerprint` — no raw labels/probabilities) is written
+   atomically, reloaded, and verified; the guard's completed record
+   references that exact fingerprint. Any failure in evaluation,
+   calibration, serialization, or verification marks the guard failed.
+4. **Every JSON/CSV write is now genuinely atomic.** `benchmarks/atomic_io.py`
+   (temp file in the destination directory, fsync, `os.replace()`) backs
+   `reporting.py::write_json`/`write_csv_table` and
+   `test_guard.py::FrozenTestGuard.mark_completed`/`mark_failed` (acquisition
+   itself still uses `O_CREAT | O_EXCL`, a separate exclusive-creation
+   primitive). The guard also records a per-acquisition `owner_token`;
+   `FrozenTestGuardOwnershipError` is raised if a `FrozenTestGuard` instance
+   that never itself acquired the guard tries to finalize it.
+5. **OOF CSV fingerprints are now real hashes, not raw JSON.**
+   `training_subjects_fingerprint`/`validation_subjects_fingerprint` are
+   SHA-256 of the canonical sorted subject list; every predicted row also
+   carries `selected_params_fingerprint` and the fold's
+   `model_state_fingerprint`. The file is written atomically, reloaded and
+   row-count-verified, and its own SHA-256 is recorded as
+   `oof_summary.oof_artifact_fingerprint` in `calibration/frozen_policy.json`.
+
 Full list of what's fixed vs. still open: README's Benchmarking framework
 section.

@@ -32,6 +32,8 @@ fold fits, which still use the normal validation-selected phase1/phase2.
 """
 
 import dataclasses
+import hashlib
+import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -58,6 +60,20 @@ DEFAULT_OOF_INNER_FOLDS = 2
 
 def is_mil_candidate(name: str) -> bool:
     return name in MIL_CANDIDATE_NAMES
+
+
+def _canonical_hash(obj) -> str:
+    """SHA-256 of a canonical (sorted-keys) JSON encoding — used for every
+    subject-list / selected-params fingerprint here, never a raw JSON blob
+    stored under a field literally named "fingerprint" (issue 4)."""
+    blob = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _subject_list_fingerprint(subject_ids: Sequence[str]) -> str:
+    return _canonical_hash(sorted(str(s) for s in subject_ids))
+
+
 
 
 class NoEligibleFinalCandidateError(ValueError):
@@ -209,11 +225,16 @@ def generate_subject_oof_predictions(
         train_bags = bags_from_fold_cell_dataset(train_ds, outcomes_by_subject, min_cells_per_subject)
         val_bags = bags_from_fold_cell_dataset(val_ds, outcomes_by_subject, min_cells_per_subject)
 
+        train_ids = sorted(str(s) for s in oof_train_subjects)
+        val_ids = sorted(str(s) for s in oof_val_subjects)
         record = {
-            "fold": fold_idx, "train_subject_ids": sorted(str(s) for s in oof_train_subjects),
-            "val_subject_ids": sorted(str(s) for s in oof_val_subjects),
+            "fold": fold_idx, "train_subject_ids": train_ids, "val_subject_ids": val_ids,
+            "training_subjects_fingerprint": _subject_list_fingerprint(train_ids),
+            "validation_subjects_fingerprint": _subject_list_fingerprint(val_ids),
             "preprocessing_fingerprint": artifact_fingerprint(artifact),
             "hyperparameter_search": hp_search,
+            "selected_params_fingerprint": _canonical_hash(selected_params),
+            "inner_selection_fingerprint": _canonical_hash(hp_search),
         }
         if not train_bags or not val_bags:
             record["skipped_reason"] = "fold has no subject with >= min_cells_per_subject cells"
@@ -227,6 +248,7 @@ def generate_subject_oof_predictions(
                 val_sd = SubjectLevelDataset(val_bags)
                 proba = adapter.predict_proba(val_sd)
                 subj_order = [str(b["subject_id"]) for b in val_sd.bags]
+                record["model_state_fingerprint"] = adapter.model_state_fingerprint()
             except MILEligibilityError as e:
                 record["skipped_reason"] = f"MIL ineligible: {e}"
                 fold_membership.append(record)
@@ -237,6 +259,7 @@ def generate_subject_oof_predictions(
             model = _fit_baseline(candidate_name, selected_params, Xtr, ytr, seed)
             proba = _predict_baseline(model, Xva)
             subj_order = subj_va
+            record["model_state_fingerprint"] = model.model_state_fingerprint()
 
         for sid, p in zip(subj_order, proba):
             sid = str(sid)
@@ -285,6 +308,7 @@ class FittedFinalCandidate:
     preprocessing_artifact_fingerprint: str
     dev_subject_ids: List[str]
     model_metadata: Dict
+    model_state_fingerprint: str
     predictor: object  # a fitted baseline model, or a fitted NeuralCancerAdapter
 
 
@@ -325,11 +349,13 @@ def fit_final_candidate_on_dev_pool(
         adapter.fit_final(fold_ctx, dev_ds, dev_sd, seed=seed,
                            pretrain_epochs=selected_params.get("pretrain_epochs"))
         model_metadata = adapter.metadata()
+        model_state_fp = adapter.model_state_fingerprint()
         predictor = adapter
     else:
         Xtr, ytr, _, _ = build_cancer_subject_features(dev_bags, num_cell_types)
         model = _fit_baseline(candidate_name, selected_params, Xtr, ytr, seed)
         model_metadata = model.metadata()
+        model_state_fp = model.model_state_fingerprint()
         predictor = model
 
     return FittedFinalCandidate(
@@ -337,7 +363,7 @@ def fit_final_candidate_on_dev_pool(
         selected_params=selected_params, preprocessing_artifact=final_artifact,
         preprocessing_artifact_fingerprint=artifact_fingerprint(final_artifact),
         dev_subject_ids=sorted({str(b["subject_id"]) for b in dev_bags}),
-        model_metadata=model_metadata, predictor=predictor,
+        model_metadata=model_metadata, model_state_fingerprint=model_state_fp, predictor=predictor,
     )
 
 

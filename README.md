@@ -655,6 +655,73 @@ inaccurate — see git history for the exact commits):
   alongside `calibration/frozen_policy.json`'s `oof_summary` (which still
   carries fold membership only, for the markdown report).
 
+**Fixed in the fifth pass** (see git history for the exact commits):
+
+- **Task B eligibility no longer reads test labels or test class counts.**
+  `check_task_b_eligibility` previously computed known-outcome/class counts
+  from `context.test_bags` and rejected the whole run if the test split had
+  only one class — test composition could change whether an experiment
+  proceeded at all. It is now split into
+  `eligibility.py::check_task_b_development_eligibility(train_bags, val_bags)`
+  (the only gate run before the guard; its signature structurally cannot
+  accept `test_bags`) and `check_test_evaluability(test_bags)` (run only
+  inside the guarded stage, after `FrozenTestGuard.acquire()`): a one-class
+  test split now produces `auroc_auprc_defined=False` with a recorded
+  reason, and the run continues rather than being rejected pre-guard.
+- **The frozen-test guard identity is now deterministic across runs of the
+  same scientific configuration.** It previously included
+  `fitted.model_metadata`, which for neural/MIL candidates carries
+  `fit_seconds` — real wall-clock timing that differs on every run, making
+  the guard identity itself non-reproducible. The identity now uses
+  `context.guard_identity_fingerprint`'s `extra` payload with
+  `final_model_state_fingerprint` — a SHA-256 of the ACTUAL fitted model
+  weights (`benchmarks/model_fingerprint.py`: canonicalized `state_dict`
+  bytes for neural/MIL models via `torch_state_dict_fingerprint`, canonicalized
+  fitted sklearn attributes via `sklearn_model_state_fingerprint` for
+  baselines) — plus a deterministic `calibration_fingerprint` and a new
+  `test_membership_fingerprint` (`ExperimentContext.test_membership_fingerprint`,
+  derived only from `split_manifest.test_subjects`, never from `test_bags`).
+  No timestamp, run ID, or output directory name enters the identity.
+- **The guarded frozen-test transaction is now complete, not just guarded
+  metric computation.** `run_cancer_task` now builds an immutable
+  `calibration/frozen_test_result.json` (identity/model-state/preprocessing/
+  calibration fingerprints, the frozen threshold, aggregate metrics, test
+  membership fingerprint, evaluated-subject count, synthetic flag, and its
+  own `artifact_fingerprint` — no raw test labels or probabilities),
+  persists it atomically, reloads and verifies it, and only then calls
+  `guard.mark_completed(...)`, which now references that exact artifact
+  fingerprint. Any failure in this sequence (evaluation, calibration,
+  serialization, or verification) marks the guard failed instead — `mark_completed`
+  is structurally unreachable unless persistence and reload verification
+  both succeeded.
+- **Every JSON/CSV artifact this framework writes is now genuinely atomic.**
+  `benchmarks/atomic_io.py` writes a uniquely named temp file in the
+  destination directory, fsyncs it, and calls `os.replace()` onto the final
+  path — `reporting.py::write_json`/`write_csv_table` and
+  `test_guard.py::FrozenTestGuard.mark_completed`/`mark_failed` all use it
+  now, replacing the previous direct `open(path, "w")` writes that offered
+  no atomicity guarantee. `FrozenTestGuard.acquire()` still uses
+  `O_CREAT | O_EXCL` (a different, exclusive-creation primitive, not
+  replace-based) since that is what makes first-acquisition itself race-free.
+  The guard also now records a per-acquisition `owner_token`; a
+  `FrozenTestGuard` instance that never itself called `acquire()` (or whose
+  token doesn't match what's on disk) raises `FrozenTestGuardOwnershipError`
+  from `mark_completed`/`mark_failed` rather than being able to finalize a
+  guard file it does not own.
+- **The OOF CSV now carries real fingerprints instead of raw JSON under a
+  "fingerprint" column name.** `training_subjects_fingerprint` and
+  `validation_subjects_fingerprint` are now SHA-256 hashes of the canonical
+  sorted subject list (previously `training_subjects_fingerprint` was a raw
+  JSON-serialized list). Every successfully predicted row now also carries
+  `selected_params_fingerprint`, `inner_selection_fingerprint` (already
+  present), and `model_state_fingerprint` for the exact fold model that
+  produced that subject's OOF probability — writing refuses to proceed if a
+  "predicted" row is missing its model-state fingerprint. The CSV is
+  written atomically, reloaded, and its row count verified; the file's own
+  SHA-256 is recorded as `oof_summary.oof_artifact_fingerprint` in
+  `calibration/frozen_policy.json`, so calibration output references the
+  exact OOF artifact it was fit from.
+
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
 section for the same list, generated fresh per run): the neural/MIL bounded
 search spaces compared inside nested CV (both the outer-CV-fold and the
@@ -736,7 +803,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (364 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 20 `test_benchmarks_*.py` files (including `test_benchmarks_nested_cv_selection.py` and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (394 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 22 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_nested_cv_selection.py`, and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |

@@ -27,8 +27,11 @@ A "completed" guard can NEVER be superseded, regardless of any flag.
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, Optional, Union
+
+from .atomic_io import atomic_write_json
 
 
 def default_guard_dir(output_root: Union[str, Path]) -> Path:
@@ -62,9 +65,17 @@ class FrozenTestInProgressError(RuntimeError):
     an explicit, auditable decision."""
 
 
+class FrozenTestGuardOwnershipError(RuntimeError):
+    """Raised when a FrozenTestGuard instance that did not itself acquire
+    the guard (or whose acquisition token doesn't match what's on disk)
+    tries to mark it completed/failed — prevents one process/instance from
+    finalizing a guard it never legitimately owned."""
+
+
 class FrozenTestGuard:
     def __init__(self, guard_path: Union[str, Path]):
         self.guard_path = Path(guard_path)
+        self._owner_token: Optional[str] = None
 
     def _read(self) -> Optional[Dict]:
         if not self.guard_path.exists():
@@ -111,41 +122,60 @@ class FrozenTestGuard:
                     "policy."
                 )
 
+        token = uuid.uuid4().hex
         payload = {
             "status": "in_progress", "run_identity": run_identity,
             "selected_model": selected_model, "started_at": time.time(),
+            "owner_token": token,
         }
         self.guard_path.parent.mkdir(parents=True, exist_ok=True)
         # O_CREAT | O_EXCL: atomically fails with FileExistsError if the
         # file already exists — closes the race window between "check if
         # it exists" and "create it" that a plain open()/exists() pair has.
+        # This exclusive-creation primitive is what makes acquisition
+        # itself race-free; it is deliberately NOT replaced by the
+        # temp-file+os.replace() pattern used for terminal-state updates
+        # below, since that pattern is atomic for REPLACING a file, not for
+        # exclusively creating one.
         fd = os.open(str(self.guard_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
             os.write(fd, json.dumps(payload, indent=2).encode("utf-8"))
+            os.fsync(fd)
         finally:
             os.close(fd)
+        self._owner_token = token
+
+    def _require_ownership(self, existing: Dict) -> None:
+        if self._owner_token is None or existing.get("owner_token") != self._owner_token:
+            raise FrozenTestGuardOwnershipError(
+                f"FrozenTestGuard at {self.guard_path}: this instance did not acquire the "
+                "guard currently on disk (owner_token mismatch or never acquired) — refusing "
+                "to update a guard it does not own. Only the FrozenTestGuard instance whose "
+                "acquire() call created this file may mark it completed/failed."
+            )
 
     def mark_completed(self, threshold: float, test_result_fingerprint: str) -> None:
-        """Overwrite the (already-acquired, in_progress) guard file with a
-        terminal "completed" record. Once written, acquire() on this path
-        can never succeed again."""
+        """Atomically replace the (already-acquired, in_progress) guard
+        file with a terminal "completed" record, and only if this exact
+        instance is the one that acquired it. Once written, acquire() on
+        this path can never succeed again."""
         existing = self._read()
         if existing is None or existing.get("status") != "in_progress":
             raise RuntimeError(
                 f"FrozenTestGuard.mark_completed called without a matching in_progress "
                 f"guard at {self.guard_path} — acquire() must be called first."
             )
+        self._require_ownership(existing)
         existing.update({
             "status": "completed", "threshold": threshold,
             "test_result_fingerprint": test_result_fingerprint, "completed_at": time.time(),
         })
-        with open(self.guard_path, "w") as f:
-            json.dump(existing, f, indent=2)
+        atomic_write_json(self.guard_path, existing)
 
     def mark_failed(self, error: str) -> None:
         existing = self._read()
         if existing is None:
             return
+        self._require_ownership(existing)
         existing.update({"status": "failed", "error": str(error), "failed_at": time.time()})
-        with open(self.guard_path, "w") as f:
-            json.dump(existing, f, indent=2)
+        atomic_write_json(self.guard_path, existing)

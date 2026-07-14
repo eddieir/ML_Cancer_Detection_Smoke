@@ -7,7 +7,6 @@ overwritten (see new_run_dir) — a run_id collision raises rather than
 silently clobbering a previous, possibly-audited run.
 """
 
-import csv
 import json
 import time
 import uuid
@@ -16,6 +15,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from .atomic_io import atomic_write_bytes, atomic_write_csv_rows, atomic_write_json
 from .context import get_git_sha
 from .metrics import bootstrap_ci
 
@@ -144,34 +144,20 @@ def new_run_dir(base_dir: str = "artifacts/benchmarks", run_id: Optional[str] = 
 
 
 def write_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
+    """Atomically writes `obj` as JSON: a temp file in the same directory is
+    written, fsynced, and os.replace()'d onto `path` — a concurrent reader
+    always sees either the previous complete file or the new one, never a
+    partial write (see atomic_io.py)."""
+    atomic_write_json(path, obj)
 
 
 def write_csv_table(path: Path, rows: List[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        with open(path, "w") as f:
-            f.write("")
-        return
-    # Different models' fold records carry different keys (e.g. the neural
-    # adapter's cell-capping fields aren't present on baseline records) —
-    # using only rows[0]'s keys as the fieldname set crashes DictWriter the
-    # moment a later row has a key the first row didn't. The union of every
-    # row's keys, in first-seen order, covers all of them; a row missing a
-    # given key gets restval (empty), not a crash.
-    fieldnames: List[str] = []
-    seen = set()
-    for row in rows:
-        for k in row.keys():
-            if k not in seen:
-                seen.add(k)
-                fieldnames.append(k)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
-        writer.writeheader()
-        writer.writerows(rows)
+    """Atomically writes `rows` as a CSV table (see atomic_io.py). Different
+    models' fold records carry different keys (e.g. the neural adapter's
+    cell-capping fields aren't present on baseline records) — the union of
+    every row's keys, in first-seen order, is used as the fieldname set; a
+    row missing a given key gets restval (empty), not a crash."""
+    atomic_write_csv_rows(path, rows)
 
 
 def cv_results_to_csv_rows(cv_report: Dict) -> List[dict]:

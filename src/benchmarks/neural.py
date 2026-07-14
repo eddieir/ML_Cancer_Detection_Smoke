@@ -146,5 +146,12 @@ class NeuralCancerAdapter:
             "fit_seconds": self.fit_seconds,
         }
 
+    def model_state_fingerprint(self) -> str:
+        """Deterministic SHA-256 of the actual fitted network weights — see
+        model_fingerprint.py. Device placement and fit_seconds never affect
+        this value; only the learned state_dict does."""
+        from .model_fingerprint import torch_state_dict_fingerprint
+        return torch_state_dict_fingerprint(self.trainer.model)
+
 
 MIL_POOLINGS = ("attention", "mean", "max")

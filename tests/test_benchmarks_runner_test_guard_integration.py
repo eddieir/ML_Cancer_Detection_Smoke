@@ -195,6 +195,188 @@ def test_guard_identity_changes_when_selected_hyperparameters_differ():
     assert fp_a != fp_b
 
 
+def test_guard_identity_excludes_fit_seconds_and_timestamps():
+    """Blocker 2: two guard-identity computations that differ ONLY in
+    fit_seconds/timestamps (volatile, non-reproducible metadata) must
+    produce the SAME identity — otherwise every real run would generate a
+    fresh guard file and the one-time-evaluation discipline would be
+    meaningless."""
+    ctx = build_synthetic_context(seed=1, fast=True)
+    common = {
+        "selected_hyperparameters": {"C": 1.0},
+        "final_preprocessing_artifact_fingerprint": "abc123",
+        "final_model_state_fingerprint": "def456",
+        "calibration_fingerprint": "cal789",
+        "threshold": 0.5,
+        "test_membership_fingerprint": ctx.test_membership_fingerprint,
+    }
+    fp_a = ctx.guard_identity_fingerprint("logistic", extra=common)
+    fp_b = ctx.guard_identity_fingerprint("logistic", extra=common)
+    assert fp_a == fp_b
+
+
+def test_run_cancer_task_never_feeds_volatile_model_metadata_into_guard_identity():
+    """run_cancer_task's guard-identity computation must pass a deterministic
+    model_state_fingerprint (a hash of actual fitted weights), never the raw
+    model_metadata dict — which carries fit_seconds, real wall-clock timing
+    that differs on every run and would make the guard non-deterministic."""
+    import benchmarks.context as context_mod
+
+    ctx = build_synthetic_context(seed=1, fast=True)
+    captured = {}
+    orig = context_mod.ExperimentContext.guard_identity_fingerprint
+
+    def spy(self, selected_model, extra=None):
+        captured["extra"] = extra
+        return orig(self, selected_model, extra=extra)
+    context_mod.ExperimentContext.guard_identity_fingerprint = spy
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+            run_cancer_task(ctx, _Args(), run_dir)
+    finally:
+        context_mod.ExperimentContext.guard_identity_fingerprint = orig
+        shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+    extra = captured["extra"]
+    assert "final_model_state_fingerprint" in extra
+    assert "final_model_metadata" not in extra
+    assert "fit_seconds" not in str(extra)
+
+
+def test_guard_identity_changes_when_model_state_fingerprint_differs():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    fp_a = ctx.guard_identity_fingerprint("logistic", extra={"final_model_state_fingerprint": "aaa"})
+    fp_b = ctx.guard_identity_fingerprint("logistic", extra={"final_model_state_fingerprint": "bbb"})
+    assert fp_a != fp_b
+
+
+def test_guard_identity_changes_when_test_membership_differs():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    fp_a = ctx.guard_identity_fingerprint("logistic", extra={"test_membership_fingerprint": "aaa"})
+    fp_b = ctx.guard_identity_fingerprint("logistic", extra={"test_membership_fingerprint": "bbb"})
+    assert fp_a != fp_b
+
+
+def test_test_membership_fingerprint_reads_only_split_manifest():
+    """context.test_membership_fingerprint must be computable without
+    touching context.test_bags at all — it's derived purely from
+    split_manifest.test_subjects, so it's safe to include in the guard
+    identity computed before guard acquisition."""
+    ctx = build_synthetic_context(seed=1, fast=True)
+
+    class _PoisonedBags(list):
+        def __iter__(self):
+            raise AssertionError("test_membership_fingerprint touched context.test_bags")
+
+    ctx.test_bags = _PoisonedBags(ctx.test_bags)
+    fp = ctx.test_membership_fingerprint
+    assert isinstance(fp, str) and len(fp) == 64
+
+
+def test_frozen_test_result_artifact_persisted_and_referenced_by_guard():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+        outcome = run_cancer_task(ctx, _Args(), run_dir)
+        result_path = run_dir / "calibration" / "frozen_test_result.json"
+        assert result_path.exists()
+        import json
+        frozen_result = json.loads(result_path.read_text())
+        assert "artifact_fingerprint" in frozen_result
+        assert "test_labels" not in frozen_result
+        assert "test_proba" not in frozen_result
+
+        guard_dir = run_dir.parent / ".frozen_test_guards"
+        guard_payload = json.loads(list(guard_dir.glob("*.json"))[0].read_text())
+        assert guard_payload["test_result_fingerprint"] == frozen_result["artifact_fingerprint"]
+        assert outcome["calibration_report"]["frozen_test_result_artifact_fingerprint"] == \
+            frozen_result["artifact_fingerprint"]
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_persistence_failure_marks_guard_failed_not_completed():
+    import benchmarks.runner as runner_mod
+
+    ctx = build_synthetic_context(seed=9, fast=True)
+    orig = runner_mod.write_json
+
+    def _boom(path, obj):
+        if str(path).endswith("frozen_test_result.json"):
+            raise RuntimeError("simulated persistence failure")
+        return orig(path, obj)
+    runner_mod.write_json = _boom
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+            with pytest.raises(RuntimeError, match="simulated persistence failure"):
+                run_cancer_task(ctx, _Args(), run_dir, synthetic=False)
+            guard_dir = run_dir.parent / ".frozen_test_guards"
+            import json
+            payload = json.loads(list(guard_dir.glob("*.json"))[0].read_text())
+            assert payload["status"] == "failed"
+    finally:
+        runner_mod.write_json = orig
+        shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_calibration_report_references_oof_artifact_fingerprint():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+        outcome = run_cancer_task(ctx, _Args(), run_dir)
+        oof_fp = outcome["calibration_report"]["oof_summary"]["oof_artifact_fingerprint"]
+        assert isinstance(oof_fp, str) and len(oof_fp) == 64
+        oof_csv = run_dir / "predictions" / f"cancer_{outcome['calibration_report']['selected_model']}_oof.csv"
+        assert oof_csv.exists()
+        import hashlib
+        assert hashlib.sha256(oof_csv.read_bytes()).hexdigest() == oof_fp
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_oof_csv_has_all_required_fingerprint_columns():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+        outcome = run_cancer_task(ctx, _Args(), run_dir)
+        oof_csv = run_dir / "predictions" / f"cancer_{outcome['calibration_report']['selected_model']}_oof.csv"
+        import csv
+        with open(oof_csv, newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert rows
+        required = {
+            "subject_id", "target", "probability", "seed", "outer_oof_fold", "candidate_name",
+            "candidate_type", "pooling", "selected_params_json", "selected_params_fingerprint",
+            "inner_selection_fingerprint", "training_subjects_fingerprint",
+            "validation_subjects_fingerprint", "preprocessing_fingerprint",
+            "model_state_fingerprint", "prediction_status", "undefined_reason",
+        }
+        assert required <= set(rows[0].keys())
+        for row in rows:
+            if row["prediction_status"] == "predicted":
+                assert len(row["training_subjects_fingerprint"]) == 64
+                assert len(row["model_state_fingerprint"]) == 64
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_guard_ownership_prevents_finalization_by_a_non_acquiring_instance():
+    from benchmarks.test_guard import FrozenTestGuard, FrozenTestGuardOwnershipError
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "guard.json"
+        owner = FrozenTestGuard(path)
+        owner.acquire({"run_id": "r1"})
+
+        impostor = FrozenTestGuard(path)  # never acquired — no owner token
+        with pytest.raises(FrozenTestGuardOwnershipError):
+            impostor.mark_completed(threshold=0.5, test_result_fingerprint="fp")
+        with pytest.raises(FrozenTestGuardOwnershipError):
+            impostor.mark_failed("boom")
+
+        # the real owner can still finalize normally
+        owner.mark_completed(threshold=0.5, test_result_fingerprint="fp")
+
+
 def test_guard_file_never_contains_raw_test_labels_or_probabilities():
     ctx = build_synthetic_context(seed=1, fast=True)
     with tempfile.TemporaryDirectory() as tmp:
