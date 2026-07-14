@@ -1,3 +1,11 @@
+# Exact versions this project's CI is tested against: Python 3.11.15,
+# pytest 9.1.1, scikit-learn 1.9.0, celltypist 1.7.1. CellTypist's published
+# Immune_All_Low.pkl pretrained model was serialized with scikit-learn
+# 0.24.1 and emits scikit-learn's InconsistentVersionWarning when unpickled
+# under 1.9.0 — a disclosed, unresolved upstream compatibility gap this
+# project does not control (see data/transforms.py::annotate_cell_types and
+# CellTypistCompatibilityError). No newer CellTypist-published model
+# resklearn'd against a matching scikit-learn version has been identified.
 torch>=2.2.0
 scanpy>=1.9.8
 anndata>=0.10.0

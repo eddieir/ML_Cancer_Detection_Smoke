@@ -722,6 +722,52 @@ inaccurate — see git history for the exact commits):
   `calibration/frozen_policy.json`, so calibration output references the
   exact OOF artifact it was fit from.
 
+**Fixed in the sixth pass** (see git history for the exact commits):
+
+- **`atomic_write_bytes` now guarantees complete writes.** `os.write()` is
+  only guaranteed to write *up to* the requested number of bytes — a short
+  write is normal OS behavior, not an error. `benchmarks/atomic_io.py` now
+  loops (`_write_all`) until every byte is written, retries
+  `InterruptedError` explicitly, and treats zero-byte progress as a hard
+  error rather than looping forever. A failure anywhere before the
+  temp-to-destination `os.replace()` (write, fsync, or close) now always
+  removes the temp file and leaves the previous destination content
+  untouched.
+- **`model_fingerprint.py` no longer falls back to `repr()` for unsupported
+  fitted state.** The fallback was unsafe for a scientific identity: fitted
+  `sklearn.tree._tree.Tree` objects (used by every random forest, including
+  `random_forest` in both `SMOKE_BASELINES`/`CANCER_BASELINES`) are a Cython
+  extension type with no `__dict__`, so they previously fell all the way
+  through to `repr(obj)`, which embeds the object's memory address —
+  different every process, meaning two identically fitted forests could
+  fingerprint differently. Canonicalization now explicitly handles
+  `sklearn.tree._tree.Tree` (node/threshold/feature/value arrays),
+  `sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor` (whose
+  fitted fields don't follow sklearn's trailing-underscore convention, so a
+  generic reflection walk silently collected nothing for it),
+  `HistGradientBoostingClassifier` itself (whose actual learned trees live
+  in the private `_predictors`/`_baseline_prediction`/`_bin_mapper`
+  attributes, not any public trailing-underscore attribute), and
+  `DummyClassifier` (whose `strategy="constant"` predicted value lives in
+  the constructor parameter `constant`, not a fitted attribute — the model
+  used for this framework's single-training-class fallback path). Any
+  fitted value with no defined canonicalization now raises
+  `UnsupportedModelStateError` instead of silently using `repr()`.
+- **CellTypist/scikit-learn pretrained-model version compatibility is now
+  detected and surfaced explicitly, not silently absorbed.** CellTypist's
+  published `Immune_All_Low.pkl` model was serialized with scikit-learn
+  0.24.1; loading it under this project's scikit-learn (>=1.4, 1.9.0 in CI)
+  always emits scikit-learn's own `InconsistentVersionWarning` — a known,
+  disclosed, *upstream* compatibility gap this project cannot fix directly
+  (it does not control CellTypist's published model artifact, and no
+  scikit-learn-1.x-compatible replacement has been identified). The warning
+  was already present in every prior passing CI run, so `annotate_cell_types`
+  does not fail on it by default — that would be a functional regression,
+  not a fix. `strict_sklearn_compatibility=True` (or the
+  `CELLTYPIST_STRICT_SKLEARN_COMPAT=1` environment variable) turns it into a
+  hard `CellTypistCompatibilityError` for anyone who wants to enforce
+  matching versions; the warning itself is never suppressed either way.
+
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
 section for the same list, generated fresh per run): the neural/MIL bounded
 search spaces compared inside nested CV (both the outer-CV-fold and the
@@ -803,7 +849,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (394 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 22 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_nested_cv_selection.py`, and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (442 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 22 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_nested_cv_selection.py`, and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |

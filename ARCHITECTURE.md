@@ -855,5 +855,37 @@ framework section for the full list):
    row-count-verified, and its own SHA-256 is recorded as
    `oof_summary.oof_artifact_fingerprint` in `calibration/frozen_policy.json`.
 
+A seventh pass closed three further problems (see README's Benchmarking
+framework section for the full list):
+
+1. **`atomic_write_bytes` now guarantees complete writes.** `os.write()` is
+   only guaranteed to write up to the requested byte count — a short write
+   is expected OS behavior, not an error. `_write_all` now loops until every
+   byte is written, retries `InterruptedError`, and raises on zero-byte
+   progress; any failure before `os.replace()` (write/fsync/close) now
+   always removes the temp file and leaves the previous destination intact.
+2. **`model_fingerprint.py` no longer falls back to `repr()`.** The
+   fallback was unsafe: `sklearn.tree._tree.Tree` (every random forest's
+   actual tree structure) is a Cython extension type with no `__dict__`, so
+   it previously reached `repr(obj)`, which embeds a memory address —
+   non-deterministic across processes. Canonicalization now explicitly
+   handles `Tree`, `HistGradientBoostingClassifier`'s
+   `TreePredictor`/private `_predictors`/`_bin_mapper` state (none of which
+   follow the trailing-underscore convention a generic reflection walk
+   relies on), and `DummyClassifier`'s `constant` (a constructor parameter,
+   not a fitted attribute, that nonetheless determines
+   `strategy="constant"`'s predictions — the single-training-class fallback
+   model). Anything unsupported now raises `UnsupportedModelStateError`.
+3. **CellTypist/scikit-learn pretrained-model compatibility is now detected
+   and surfaced, not silently absorbed.** CellTypist's `Immune_All_Low.pkl`
+   was serialized with scikit-learn 0.24.1; loading it under 1.9.0 always
+   emits `InconsistentVersionWarning` — an unresolved upstream gap this
+   project cannot fix directly. `annotate_cell_types` does not fail on it by
+   default (that warning was already present in every prior passing CI run;
+   defaulting to a hard failure would be a regression, not a fix);
+   `strict_sklearn_compatibility=True` / `CELLTYPIST_STRICT_SKLEARN_COMPAT=1`
+   turns it into `CellTypistCompatibilityError` for callers who want to
+   enforce matching versions. The warning itself is never suppressed.
+
 Full list of what's fixed vs. still open: README's Benchmarking framework
 section.

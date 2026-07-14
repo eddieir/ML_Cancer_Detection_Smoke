@@ -261,3 +261,113 @@ def test_preprocessing_artifact_persists_cell_type_map_fingerprint():
     assert d["cell_type_map_fingerprint"] == cell_type_map_fingerprint()
     reloaded = PreprocessingArtifact(**d)
     assert reloaded.cell_type_annotation_mode == "inductive_per_cell"
+
+
+# ─── scikit-learn / CellTypist pretrained-model version compatibility ────────
+
+def _install_version_mismatched_celltypist(monkeypatch, calls):
+    """Fake celltypist whose Model.load() emits the exact
+    InconsistentVersionWarning scikit-learn raises when unpickling an
+    estimator serialized under a different scikit-learn version — mirrors
+    the real Immune_All_Low.pkl compatibility situation without depending on
+    a downloaded model file."""
+    import warnings
+
+    from sklearn.exceptions import InconsistentVersionWarning
+
+    def fake_load(model):
+        warnings.warn(
+            InconsistentVersionWarning(
+                estimator_name="LogisticRegression",
+                current_sklearn_version="1.9.0",
+                original_sklearn_version="0.24.1",
+            )
+        )
+        return object()
+
+    labels_fn = lambda x0: "Basal cell" if x0 >= 0 else "Macrophage"
+
+    class _FakeResult:
+        def __init__(self, adata):
+            labels = [labels_fn(float(row[0])) for row in np.asarray(adata.X)]
+            self.predicted_labels = pd.DataFrame({
+                "predicted_labels": labels,
+                "majority_voting": ["Fibroblast"] * len(labels),
+            })
+
+    def fake_annotate(adata, model, majority_voting):
+        calls.append({"n_cells": adata.n_obs, "majority_voting": majority_voting})
+        return _FakeResult(adata)
+
+    fake_models = types.SimpleNamespace(Model=types.SimpleNamespace(load=fake_load))
+    fake_celltypist = types.SimpleNamespace(annotate=fake_annotate, models=fake_models)
+    monkeypatch.setitem(sys.modules, "celltypist", fake_celltypist)
+    monkeypatch.setitem(sys.modules, "celltypist.models", fake_models)
+
+
+def test_sklearn_version_mismatch_does_not_raise_by_default(monkeypatch):
+    """Default behavior (strict_sklearn_compatibility=False) must not
+    regress — this project's own CI has always passed with this exact
+    warning present, so a silent default hard-fail would be a functional
+    regression, not a fix."""
+    from data.transforms import annotate_cell_types
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata)
+    assert out.uns["cell_type_annotation_degraded"] is False
+
+
+def test_sklearn_version_mismatch_still_emits_the_warning(monkeypatch):
+    """The InconsistentVersionWarning must never be silently swallowed, even
+    when it isn't turned into a hard failure."""
+    from data.transforms import annotate_cell_types
+    from sklearn.exceptions import InconsistentVersionWarning
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    with pytest.warns(InconsistentVersionWarning):
+        annotate_cell_types(adata)
+
+
+def test_strict_sklearn_compatibility_raises_on_version_mismatch(monkeypatch):
+    from data.transforms import CellTypeAnnotationError, annotate_cell_types
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    with pytest.raises(CellTypeAnnotationError):
+        annotate_cell_types(adata, strict_sklearn_compatibility=True)
+
+
+def test_strict_sklearn_compatibility_does_not_raise_when_versions_match(monkeypatch):
+    from data.transforms import annotate_cell_types
+
+    calls = []
+    _install_fake_celltypist(monkeypatch, calls)  # no version-mismatch warning
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata, strict_sklearn_compatibility=True)
+    assert out.uns["cell_type_annotation_degraded"] is False
+
+
+def test_environment_override_enables_strict_compatibility(monkeypatch):
+    from data.transforms import CellTypeAnnotationError, annotate_cell_types
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    monkeypatch.setenv("CELLTYPIST_STRICT_SKLEARN_COMPAT", "1")
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    with pytest.raises(CellTypeAnnotationError):
+        annotate_cell_types(adata)

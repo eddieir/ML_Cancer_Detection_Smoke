@@ -23,16 +23,53 @@ def _temp_path(path: Path) -> Path:
     return path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of `data` to `fd`. `os.write()` is only guaranteed to
+    write *up to* the requested number of bytes — a short write (partial
+    progress) is normal, expected OS behavior, not an error, and must be
+    retried with the remaining slice. A return of 0 with bytes still pending
+    is treated as a hard error rather than retried forever (it does not
+    happen in practice for a regular file, but looping on it would hang).
+    `InterruptedError` (EINTR) is retried explicitly as defense in depth,
+    even though CPython's os.write() already retries EINTR internally per
+    PEP 475."""
+    view = memoryview(data)
+    total = len(view)
+    written = 0
+    while written < total:
+        try:
+            n = os.write(fd, view[written:])
+        except InterruptedError:
+            continue
+        if n == 0:
+            raise OSError(
+                f"os.write() made no progress with {total - written} of "
+                f"{total} bytes remaining"
+            )
+        written += n
+
+
 def atomic_write_bytes(path: Union[str, Path], data: bytes) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _temp_path(path)
-    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        try:
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        # Any failure before the file is fully written, flushed and closed
+        # must never leave the (unfinished, unreferenced) temp file behind,
+        # and must never touch the destination — it is still exactly what
+        # it was before this call started.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     try:
         os.replace(str(tmp), str(path))
     except BaseException:

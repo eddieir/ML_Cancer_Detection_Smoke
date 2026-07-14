@@ -14,15 +14,62 @@ Two entry points:
     state_dict (sorted keys, CPU, contiguous, exact tensor bytes) and hashes
     it. Device placement never changes the fingerprint.
   * `sklearn_model_state_fingerprint(model)` — canonicalizes every fitted
-    attribute (scikit-learn's trailing-underscore convention) of a fitted
-    estimator or Pipeline, recursively, and hashes it.
+    attribute of a fitted estimator or Pipeline, recursively, and hashes it.
+
+Canonicalization is an explicit whitelist of every estimator type this
+framework's registered baselines (see baselines.SMOKE_BASELINES /
+CANCER_BASELINES) can produce, plus the tree/ensemble internals sklearn
+represents through non-Python-object (Cython extension) or non-public
+(leading-underscore, not trailing-underscore) attributes:
+
+  * `sklearn.tree._tree.Tree` is a Cython extension type with no `__dict__`
+    at all — falling back to `repr()` for it produces a string containing
+    the object's memory address (`<sklearn.tree._tree.Tree object at
+    0x...>`), which is different every process and would make identically
+    fitted random forests hash differently.
+  * `sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor` has a
+    `__dict__`, but its fitted fields (`nodes`, `raw_left_cat_bitsets`,
+    `binned_left_cat_bitsets`) do not follow sklearn's trailing-underscore
+    convention, so a generic "collect trailing-underscore attributes" walk
+    silently collects nothing for it.
+  * `HistGradientBoostingClassifier` itself stores its actual learned trees
+    in the private `_predictors` attribute (and `_baseline_prediction`,
+    `_bin_mapper`), none of which end in a trailing underscore — its public
+    trailing-underscore attributes (`classes_`, `train_score_`, etc.) do not
+    include the learned trees at all.
+
+Any fitted value this module does not know how to canonicalize raises
+`UnsupportedModelStateError` rather than silently falling back to `repr()`.
 """
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Tuple
 
 import numpy as np
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble._hist_gradient_boosting.predictor import TreePredictor
+from sklearn.pipeline import Pipeline
+from sklearn.tree._tree import Tree as SklearnTree
+
+
+class UnsupportedModelStateError(TypeError):
+    """A fitted value had no defined deterministic canonicalization. Never
+    caught internally — an unsupported estimator type must fail loudly
+    rather than silently fall back to a non-deterministic repr()."""
+
+
+def _canonicalize_fitted_attrs(obj: Any, extra_private: Tuple[str, ...] = ()) -> dict:
+    """Every attribute sklearn's convention marks as fit-derived (trailing
+    underscore, not a dunder), plus any explicitly named private attributes
+    that hold real learned state under a non-conventional name."""
+    fitted_attrs = {k: v for k, v in vars(obj).items()
+                     if k.endswith("_") and not k.startswith("__")}
+    for name in extra_private:
+        if hasattr(obj, name):
+            fitted_attrs[name] = getattr(obj, name)
+    return {"__class__": type(obj).__qualname__, "fitted": _canonicalize(fitted_attrs)}
 
 
 def _canonicalize(obj: Any) -> Any:
@@ -32,33 +79,88 @@ def _canonicalize(obj: Any) -> Any:
         arr = np.ascontiguousarray(obj)
         return {"__ndarray__": True, "dtype": str(arr.dtype), "shape": list(arr.shape),
                 "data": arr.tobytes().hex()}
-    if isinstance(obj, (np.integer,)):
+    if isinstance(obj, np.integer):
         return int(obj)
-    if isinstance(obj, (np.floating,)):
+    if isinstance(obj, np.floating):
         return float(obj)
     if isinstance(obj, dict):
         return {str(k): _canonicalize(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
     if isinstance(obj, (list, tuple)):
         return [_canonicalize(v) for v in obj]
-    # sklearn-style fitted estimator (BaseEstimator or Pipeline): recurse
-    # into every attribute sklearn's convention marks as fit-derived (a
-    # trailing underscore, not a dunder) — covers Pipeline.steps' nested
-    # estimators automatically since each step's estimator is itself an
-    # object with fitted trailing-underscore attributes.
+    if isinstance(obj, Pipeline):
+        return {"__class__": "sklearn.pipeline.Pipeline",
+                "steps": [[name, _canonicalize(step)] for name, step in obj.steps]}
+    if isinstance(obj, SklearnTree):
+        # A Cython extension type with no __dict__: every field that
+        # distinguishes one fitted tree from another must be listed
+        # explicitly rather than discovered via reflection.
+        return {
+            "__class__": "sklearn.tree._tree.Tree",
+            "node_count": int(obj.node_count),
+            "capacity": int(obj.capacity),
+            "max_depth": int(obj.max_depth),
+            "n_leaves": int(obj.n_leaves),
+            "children_left": _canonicalize(obj.children_left),
+            "children_right": _canonicalize(obj.children_right),
+            "feature": _canonicalize(obj.feature),
+            "threshold": _canonicalize(obj.threshold),
+            "impurity": _canonicalize(obj.impurity),
+            "n_node_samples": _canonicalize(obj.n_node_samples),
+            "weighted_n_node_samples": _canonicalize(obj.weighted_n_node_samples),
+            "value": _canonicalize(obj.value),
+        }
+    if isinstance(obj, TreePredictor):
+        # Has a __dict__, but none of its fitted fields end in a trailing
+        # underscore, so the generic reflection path below would silently
+        # collect nothing for it.
+        return {
+            "__class__": "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor",
+            "nodes": _canonicalize(obj.nodes),
+            "raw_left_cat_bitsets": _canonicalize(obj.raw_left_cat_bitsets),
+            "binned_left_cat_bitsets": _canonicalize(obj.binned_left_cat_bitsets),
+        }
+    if isinstance(obj, DummyClassifier):
+        # strategy="constant"'s predicted value lives in the constructor
+        # parameter `constant`, not in any trailing-underscore fitted
+        # attribute — two DummyClassifiers predicting different constants
+        # would otherwise be indistinguishable by their fitted state alone
+        # (this is the actual model used for the single-training-class
+        # fallback path in baselines._sklearn_fit / _scaled_sklearn_fit).
+        return _canonicalize_fitted_attrs(obj, extra_private=("strategy", "constant"))
+    if isinstance(obj, HistGradientBoostingClassifier):
+        # The public trailing-underscore attributes (classes_,
+        # n_trees_per_iteration_, do_early_stopping_, train_score_,
+        # validation_score_, is_categorical_, n_features_in_) do not include
+        # the actual learned trees, which live in these private attributes.
+        return _canonicalize_fitted_attrs(
+            obj,
+            extra_private=("_predictors", "_baseline_prediction", "_bin_mapper", "_n_features"),
+        )
     if hasattr(obj, "__dict__"):
-        fitted_attrs = {k: v for k, v in vars(obj).items()
-                         if k.endswith("_") and not k.startswith("__")}
-        if hasattr(obj, "steps"):  # sklearn.pipeline.Pipeline
-            fitted_attrs["__pipeline_steps__"] = [(name, est) for name, est in obj.steps]
-        return {"__class__": type(obj).__qualname__, "fitted": _canonicalize(fitted_attrs)}
-    return repr(obj)
+        # Covers every other registered baseline's fitted estimator:
+        # DummyClassifier, LogisticRegression, RandomForestClassifier (whose
+        # estimators_ are DecisionTreeClassifier instances, each recursing
+        # into the explicit sklearn.tree._tree.Tree handling above via its
+        # tree_ attribute), MLPClassifier, StandardScaler, and the internal
+        # _BinMapper HistGradientBoostingClassifier stores per-feature bin
+        # thresholds in (all of which expose their learned state through
+        # ordinary trailing-underscore attributes).
+        return _canonicalize_fitted_attrs(obj)
+    raise UnsupportedModelStateError(
+        f"model_fingerprint: no deterministic canonicalization is defined for "
+        f"{type(obj).__module__}.{type(obj).__qualname__}; refusing to fall back "
+        f"to repr() because it may embed a non-deterministic memory address or "
+        f"other run-specific identity."
+    )
 
 
 def sklearn_model_state_fingerprint(model: Any) -> str:
-    """SHA-256 of a canonical representation of every fitted (trailing-
-    underscore) attribute of `model` — a fitted sklearn estimator, Pipeline,
-    or DummyClassifier. No timestamps, memory addresses, or fit_seconds ever
-    enter this representation; only learned numeric state and structure."""
+    """SHA-256 of a canonical representation of every fitted attribute of
+    `model` — a fitted sklearn estimator, Pipeline, or DummyClassifier. No
+    timestamps, memory addresses, or fit_seconds ever enter this
+    representation; only learned numeric state and structure. Raises
+    UnsupportedModelStateError if `model` (or any nested fitted value)
+    contains a type this module has no explicit deterministic handling for."""
     canonical = _canonicalize(model)
     blob = json.dumps(canonical, sort_keys=True).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()

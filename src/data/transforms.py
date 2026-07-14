@@ -207,6 +207,54 @@ def cell_type_map_fingerprint() -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+class CellTypistCompatibilityError(RuntimeError):
+    """Raised only when strict_sklearn_compatibility=True and CellTypist's
+    pretrained model was unpickled with a scikit-learn version different
+    from the one installed. scikit-learn's own model-persistence
+    documentation states cross-version unpickling is unsupported and "may
+    lead to breaking code or invalid results" — this is an unresolved
+    upstream risk (CellTypist's published Immune_All_Low.pkl was serialized
+    with scikit-learn 0.24.1; this project has been tested against
+    scikit-learn >=1.4, currently 1.9.0 in CI) that this project cannot fix
+    by itself, since it does not control CellTypist's published model
+    artifact. Not raised by default so this does not regress every existing
+    pipeline run that already passes with this exact warning present; opt in
+    via strict_sklearn_compatibility=True or the
+    CELLTYPIST_STRICT_SKLEARN_COMPAT=1 environment variable to hard-fail
+    instead of merely warning."""
+
+
+def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, strict: bool):
+    """Loads a CellTypist pretrained model, detecting (never silently
+    hiding) a scikit-learn version mismatch between how the model was
+    pickled and the scikit-learn version installed here. The
+    InconsistentVersionWarning sklearn itself raises during unpickling is
+    always re-emitted so it still reaches the caller/CI logs exactly as
+    before; strict=True additionally turns it into a hard failure."""
+    import os
+    import warnings
+
+    from celltypist import models
+    from sklearn.exceptions import InconsistentVersionWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", InconsistentVersionWarning)
+        model = models.Model.load(model=model_name)
+    version_mismatches = [w for w in caught if issubclass(w.category, InconsistentVersionWarning)]
+    for w in caught:
+        warnings.warn_explicit(w.message, w.category, w.filename or __file__, w.lineno or 0)
+    if version_mismatches and (strict or os.environ.get("CELLTYPIST_STRICT_SKLEARN_COMPAT") == "1"):
+        raise CellTypistCompatibilityError(
+            f"CellTypist pretrained model {model_name!r} was unpickled under a "
+            f"different scikit-learn version than the one installed: "
+            f"{version_mismatches[0].message}. Refusing to continue because "
+            "strict scikit-learn compatibility checking is enabled. This project "
+            "cannot fix the mismatch itself — it does not control CellTypist's "
+            "published model artifact."
+        )
+    return model
+
+
 class CellTypeAnnotationError(RuntimeError):
     """Raised when CellTypist annotation fails and no diagnostic fallback
     was explicitly requested. Real benchmark runs must never silently
@@ -222,6 +270,7 @@ _DIAGNOSTIC_FALLBACK_LABEL = "epithelial"
 
 def annotate_cell_types(
     adata: ad.AnnData, majority_voting: bool = False, allow_diagnostic_fallback: bool = False,
+    strict_sklearn_compatibility: bool = False,
 ) -> ad.AnnData:
     """
     CellTypist per-cell prediction -> coarse 4-class cell_type_id.
@@ -261,6 +310,15 @@ def annotate_cell_types(
     failure reason, so any downstream consumer (ExperimentContext
     validation in particular — see benchmarks/context.py) can detect and
     reject a degraded annotation rather than silently treating it as real.
+
+    scikit-learn/CellTypist compatibility: CellTypist's published
+    Immune_All_Low.pkl model was serialized with an older scikit-learn
+    (0.24.1) than this project runs against (>=1.4, currently 1.9.0 in CI);
+    loading it always emits scikit-learn's own InconsistentVersionWarning,
+    which is never hidden here. strict_sklearn_compatibility=True (or the
+    CELLTYPIST_STRICT_SKLEARN_COMPAT=1 environment variable) turns that
+    warning into a hard CellTypistCompatibilityError instead of merely
+    logging it — see that class's docstring for why this is not the default.
     """
     from constants import CELL_TYPE_MAP
     if adata.obs["is_pseudo_bulk"].all():
@@ -268,7 +326,6 @@ def annotate_cell_types(
         return adata
     try:
         import celltypist
-        from celltypist import models
 
         # CellTypist requires log1p normalized X (CPM → log1p).
         # After merge_sources() X holds z-scores, so we restore lognorm layer.
@@ -276,7 +333,9 @@ def annotate_cell_types(
         if "lognorm" in adata.layers:
             ct_input.X = adata.layers["lognorm"]
 
-        model = models.Model.load(model="Immune_All_Low.pkl")
+        model = _load_celltypist_model_checking_sklearn_compatibility(
+            "Immune_All_Low.pkl", strict=strict_sklearn_compatibility
+        )
         pred  = celltypist.annotate(ct_input, model=model, majority_voting=majority_voting)
         labels = (
             pred.predicted_labels.majority_voting
