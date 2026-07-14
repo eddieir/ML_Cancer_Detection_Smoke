@@ -884,8 +884,10 @@ framework section for the full list):
    default (that warning was already present in every prior passing CI run;
    defaulting to a hard failure would be a regression, not a fix);
    `strict_sklearn_compatibility=True` / `CELLTYPIST_STRICT_SKLEARN_COMPAT=1`
-   turns it into `CellTypistCompatibilityError` for callers who want to
-   enforce matching versions. The warning itself is never suppressed.
+   turned it into `CellTypistCompatibilityError` for callers who wanted to
+   enforce matching versions (a ninth pass below later replaced this with an
+   unconditional fail-closed default for real runs). The warning itself is
+   never suppressed.
 
 An eighth pass closed six further problems (see README's Benchmarking
 framework section for the full list):
@@ -936,6 +938,40 @@ framework section for the full list):
    feature-branch name) and **new reproducibility artifacts**
    (`environment.json`, `preprocessing/final_artifact.json`) added to every
    run directory.
+
+A ninth pass fixed a broken CI job and closed the CellTypist-compatibility
+default-behavior gap the eighth pass had left open (see README's
+Benchmarking framework section for the full list):
+
+1. **CI's test step was actually failing** (`No module named pytest`):
+   `constraints-ci.txt` only narrows an already-requested install, it does
+   not add pytest as a dependency, and `requirements.txt` never listed it.
+   Fixed with `requirements-test.txt` installed alongside `requirements.txt`
+   plus a `python -m pytest --version` verification step.
+2. **CI's "Record environment" step was silently faking its output**: it
+   called `importlib.metadata.version(...)` without importing
+   `importlib.metadata`, looked up the import name `sklearn` instead of the
+   distribution name `scikit-learn`, and was wrapped in `|| true` — so every
+   lookup failed, printed `UNAVAILABLE`, and never failed the build. Replaced
+   with `src/benchmarks/env_versions.py`, a small tested utility shared by
+   CI and by `reporting.py`'s environment-artifact writer, that fails loudly
+   (non-zero exit / raised `RuntimeError`) if a required package is missing.
+3. **Real preprocessing now fails closed on a CellTypist/scikit-learn
+   version mismatch by default.** `strict_sklearn_compatibility` and
+   `CELLTYPIST_STRICT_SKLEARN_COMPAT` are gone; strictness is now tied
+   unconditionally to the existing `allow_diagnostic_fallback` flag (real
+   pipeline entry points never set it). A real call raises
+   `CellTypistCompatibilityError` undisturbed (never wrapped in the generic
+   `CellTypeAnnotationError`); tolerating the mismatch via
+   `allow_diagnostic_fallback=True` now always stamps
+   `cell_type_annotation_degraded=True`, so real `ExperimentContext`
+   construction rejects it through the existing degraded-provenance guard.
+4. **`fold_preprocessing.py::artifact_fingerprint` now includes cell-type
+   and compatibility provenance**, closing the fingerprint-scope gap the
+   eighth pass had disclosed as open.
+5. **CI action versions upgraded** to `actions/checkout@v7` and
+   `actions/setup-python@v6` (both verified on Node 24, resolving the
+   Node 20 deprecation warning).
 
 Full list of what's fixed vs. still open: README's Benchmarking framework
 section.

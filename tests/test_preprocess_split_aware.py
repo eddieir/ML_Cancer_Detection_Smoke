@@ -55,6 +55,13 @@ def test_run_pipeline_split_aware_produces_split_and_artifact():
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
             },
             "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
         })
@@ -89,6 +96,13 @@ def test_run_pipeline_split_aware_test_cells_do_not_affect_gene_scaling():
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
             },
             "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
         }
@@ -130,6 +144,13 @@ def test_run_pipeline_split_aware_returns_explicit_disjoint_per_split_datasets()
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
             },
             "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
         })
@@ -168,6 +189,13 @@ def test_run_pipeline_split_aware_batch_correction_skipped_by_default():
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
             },
             "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
             # preprocessing.batch_correction.allow_transductive_harmony omitted -> defaults False
@@ -200,6 +228,13 @@ def test_rare_class_policy_from_config_changes_effective_smoke_labels():
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
             },
             "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
             "rare_class": {
@@ -244,6 +279,13 @@ def test_rare_class_merge_produces_contiguous_effective_labels_matching_model_k(
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
             },
             "split": {"seed": 1, "train_frac": 0.6, "val_frac": 0.2, "test_frac": 0.2},
             "rare_class": {
@@ -302,6 +344,13 @@ def test_label_transfer_happens_before_split_changes_effective_class():
                 "n_hvgs": 50,
                 "min_cells_per_subject": 5,
                 "out_dir": str(Path(tmp) / "processed"),
+                # See tests/test_pipeline.py for why this disclosed,
+                # always-degraded diagnostic override is used: this
+                # environment's CellTypist model is version-incompatible
+                # with the installed scikit-learn, and this test only
+                # exercises split-aware pipeline mechanics on synthetic
+                # data, not CellTypist compatibility itself.
+                "cell_type_allow_diagnostic_fallback": True,
                 "nlst_csv": str(nlst_csv),
             },
             "split": {"seed": 1, "train_frac": 0.5, "val_frac": 0.25, "test_frac": 0.25},

@@ -760,13 +760,11 @@ inaccurate — see git history for the exact commits):
   always emits scikit-learn's own `InconsistentVersionWarning` — a known,
   disclosed, *upstream* compatibility gap this project cannot fix directly
   (it does not control CellTypist's published model artifact, and no
-  scikit-learn-1.x-compatible replacement has been identified). The warning
-  was already present in every prior passing CI run, so `annotate_cell_types`
-  does not fail on it by default — that would be a functional regression,
-  not a fix. `strict_sklearn_compatibility=True` (or the
-  `CELLTYPIST_STRICT_SKLEARN_COMPAT=1` environment variable) turns it into a
-  hard `CellTypistCompatibilityError` for anyone who wants to enforce
-  matching versions; the warning itself is never suppressed either way.
+  scikit-learn-1.x-compatible replacement has been identified). As of the
+  ninth pass below, real (non-diagnostic) preprocessing fails closed on
+  this mismatch by default — this bullet is retained only as the
+  historical record of when the mismatch was first detected and persisted
+  as provenance; see the ninth pass for the current, fail-closed behavior.
 
 **Fixed in the eighth pass** (see git history for the exact commits):
 
@@ -856,6 +854,64 @@ inaccurate — see git history for the exact commits):
   `PreprocessingArtifact` this run used, cross-referenced with its own
   fingerprint).
 
+**Fixed in the ninth pass** (see git history for the exact commits):
+
+- **CI's dependency installation was actually broken, not just imprecise.**
+  `constraints-ci.txt` only narrows a version pip is already trying to
+  install — it does not add `pytest` as a dependency, and `requirements.txt`
+  never listed it, so the CI job's test step failed with `No module named
+  pytest`. Fixed with a new `requirements-test.txt` (pytest only) installed
+  alongside `requirements.txt` via `pip install -r requirements.txt -r
+  requirements-test.txt -c constraints-ci.txt`, plus a `python -m pytest
+  --version` verification step so a future break in this chain fails at the
+  install step, not silently inside the test step.
+- **CI's "Record environment" step was silently producing fake output.**
+  It called `importlib.metadata.version(...)` without importing
+  `importlib.metadata` (only the parent `importlib` package), so every
+  lookup raised `AttributeError`, caught by a bare `except Exception` that
+  printed `UNAVAILABLE` for every package — and the whole step was wrapped
+  in `|| true`, so this never failed the build. It also looked up the
+  import name `sklearn` instead of the installable distribution name
+  `scikit-learn`, which would have returned `None`/not-found even with the
+  import fixed. Replaced with `src/benchmarks/env_versions.py`
+  (`collect_core_package_versions`), a small tested utility shared by CI
+  (`python -m benchmarks.env_versions`, which now exits non-zero if any
+  required package is missing — no `|| true`) and by
+  `reporting.py::_environment_snapshot`'s reproducibility artifact, so both
+  callers use the same correct distribution-name mapping.
+- **Real (non-diagnostic) preprocessing now fails closed on a
+  CellTypist/scikit-learn version mismatch by default.** The previous
+  passes recorded the mismatch as provenance but left the default
+  behavior permissive (`strict_sklearn_compatibility=False`, an opt-in
+  flag real pipeline entry points never set). `annotate_cell_types` no
+  longer has a `strict_sklearn_compatibility` parameter or a
+  `CELLTYPIST_STRICT_SKLEARN_COMPAT` environment-variable escape hatch —
+  strictness is now tied unconditionally to `allow_diagnostic_fallback`
+  (the same flag that already gated CellTypist *failure* fallback): a real
+  call (the default) raises `CellTypistCompatibilityError` — propagated
+  undisturbed, never wrapped in the generic `CellTypeAnnotationError` —
+  and `allow_diagnostic_fallback=True` is the only way to tolerate the
+  mismatch, which now always stamps `cell_type_annotation_degraded=True`
+  (previously it stayed `False`), so real `ExperimentContext` construction
+  automatically rejects a diagnostic-tolerated mismatch through the
+  existing degraded-provenance guard. `run_pipeline`/`run_pipeline_split_aware`
+  expose this only via an explicit `cell_type_allow_diagnostic_fallback`
+  config key that no real production config sets (absent = fail-closed by
+  default, not dependent on a caller remembering to pass anything).
+- **`fold_preprocessing.py::artifact_fingerprint` now incorporates
+  cell-type/compatibility provenance.** Previously scoped to gene
+  scaling/HVG selection only, so two artifacts with identical gene
+  statistics but different (or stale) cell-type annotation/compatibility
+  status collided on identity. Now includes
+  `cell_type_map_fingerprint`/`cell_type_annotation_mode`/
+  `cell_type_annotation_degraded`/`cell_type_annotation_compatibility` —
+  closing the gap disclosed in the eighth pass's limitations.
+- **CI action versions upgraded.** `actions/checkout@v4` and
+  `actions/setup-python@v5` both still ran on the Node 20 runtime GitHub
+  was warning about; upgraded to `actions/checkout@v7` and
+  `actions/setup-python@v6` (verified via each action's own `action.yml`
+  on its GitHub release tag: both declare `runs.using: node24`).
+
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
 section for the same list, generated fresh per run): the neural/MIL bounded
 search spaces compared inside nested CV (both the outer-CV-fold and the
@@ -869,27 +925,19 @@ adapter is the only Task A model exercising true cell-level training, so
 not-applicable rather than presented as real per-cell scores; the immutable
 artifact directory now has `environment.json` and
 `preprocessing/final_artifact.json` but still does not contain every file
-the ideal schema calls for — a sanitized `configuration.json` snapshot, a
+the ideal schema calls for — a sanitized `configuration.json` snapshot and a
 `models/final_model_manifest.json` recording the final candidate's
-architecture/hyperparameters/model-state fingerprint, and per-CV-fold
-`PreprocessingArtifact` files (as opposed to the fold-local fingerprints
-already recorded in `metrics/*_folds_partitions.json`) are not yet written;
-a real (non-synthetic) run does not yet fail closed by default on a
-CellTypist/scikit-learn pretrained-model version mismatch — the mismatch is
-now fully recorded in provenance (`cell_type_annotation_compatibility`) and
-never silently swallowed, but making strict compatibility the default for
-real runs would currently break the pipeline against CellTypist's own
-published `Immune_All_Low.pkl` model (serialized under scikit-learn 0.24.1,
-an upstream artifact this project does not control) and has not been forced
-through without further validation; the frozen-test guard's identity
-fingerprint (`ExperimentContext.guard_identity_fingerprint`) and
-`fold_preprocessing.py::artifact_fingerprint` do not yet incorporate
-cell-type annotation provenance, so a stale/mismatched cell-type mapping
-would not by itself invalidate a guard identity or be caught purely by
-fingerprint comparison on reload (the strict provenance *validation* at
-context-construction time, described above, is a separate and already-fixed
-mechanism from this fingerprint-scope gap); attention weights remain an
-interpretability aid, not a causal explanation, in every pooling variant.
+architecture/hyperparameters/model-state fingerprint are not yet written
+(per-fold identity is already covered by the fold-local fingerprints in
+`metrics/*_folds_partitions.json`, now provenance-complete per the ninth
+pass above); this project has never had access to a CellTypist model
+reserialized against a matching scikit-learn version, so real (non-
+synthetic) preprocessing genuinely cannot complete in this environment
+without the disclosed `cell_type_allow_diagnostic_fallback` diagnostic
+override — this is the intended, honest fail-closed behavior, not a bug,
+and is not something a future pass can silently "fix" without an actually
+compatible upstream model; attention weights remain an interpretability
+aid, not a causal explanation, in every pooling variant.
 
 ## Pipeline
 
@@ -949,7 +997,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (483 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 23 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_nested_cv_selection.py`, and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (495 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 24 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |

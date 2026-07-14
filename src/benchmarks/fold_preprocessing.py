@@ -45,12 +45,21 @@ def require_normalized_adata(context) -> "object":
 
 
 def artifact_fingerprint(artifact: PreprocessingArtifact) -> str:
+    """Includes cell-type annotation provenance and CellTypist/scikit-learn
+    compatibility status, not just gene scaling — a preprocessing run whose
+    gene means/stds are byte-identical but whose cell-type mapping is stale
+    or whose CellTypist/sklearn compatibility differs is NOT the same
+    scientific run, and two such runs must not collide on this identity."""
     payload = {
         "gene_list": artifact.gene_list, "gene_means": artifact.gene_means,
         "gene_stds": artifact.gene_stds, "fit_n_cells": artifact.fit_n_cells,
         "fit_n_subjects": artifact.fit_n_subjects,
+        "cell_type_map_fingerprint": artifact.cell_type_map_fingerprint,
+        "cell_type_annotation_mode": artifact.cell_type_annotation_mode,
+        "cell_type_annotation_degraded": artifact.cell_type_annotation_degraded,
+        "cell_type_annotation_compatibility": artifact.cell_type_annotation_compatibility,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def refit_artifact_for_fold(

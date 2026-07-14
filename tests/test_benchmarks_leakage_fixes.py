@@ -20,6 +20,45 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from benchmarks.runner import build_synthetic_context
 
 
+# ─── 0. Artifact fingerprint includes cell-type/compatibility provenance ──────
+
+def test_artifact_fingerprint_changes_when_cell_type_compatibility_differs():
+    """Two artifacts with byte-identical gene scaling but different
+    CellTypist/scikit-learn compatibility status must NOT collide on
+    identity — a stale/incompatible cell-type annotation is a materially
+    different scientific run even if the gene-level statistics match."""
+    from benchmarks.fold_preprocessing import artifact_fingerprint
+    from data.preprocessing import PreprocessingArtifact
+
+    base_kwargs = dict(
+        version="1", gene_list=["g0", "g1"], gene_means=[0.0, 0.0], gene_stds=[1.0, 1.0],
+        n_hvgs=2, smoke_marker_genes_forced=[], fit_n_cells=10, fit_n_subjects=2,
+        cell_type_map_fingerprint="a" * 64, cell_type_annotation_mode="inductive_per_cell",
+        cell_type_annotation_degraded=False,
+    )
+    art_compatible = PreprocessingArtifact(
+        **base_kwargs, cell_type_annotation_compatibility={"compatible": True, "diagnostic_override_used": False},
+    )
+    art_incompatible = PreprocessingArtifact(
+        **base_kwargs, cell_type_annotation_compatibility={"compatible": False, "diagnostic_override_used": True},
+    )
+    assert artifact_fingerprint(art_compatible) != artifact_fingerprint(art_incompatible)
+
+
+def test_artifact_fingerprint_changes_when_cell_type_map_fingerprint_differs():
+    from benchmarks.fold_preprocessing import artifact_fingerprint
+    from data.preprocessing import PreprocessingArtifact
+
+    base_kwargs = dict(
+        version="1", gene_list=["g0", "g1"], gene_means=[0.0, 0.0], gene_stds=[1.0, 1.0],
+        n_hvgs=2, smoke_marker_genes_forced=[], fit_n_cells=10, fit_n_subjects=2,
+        cell_type_annotation_mode="inductive_per_cell", cell_type_annotation_degraded=False,
+    )
+    art1 = PreprocessingArtifact(**base_kwargs, cell_type_map_fingerprint="a" * 64)
+    art2 = PreprocessingArtifact(**base_kwargs, cell_type_map_fingerprint="b" * 64)
+    assert artifact_fingerprint(art1) != artifact_fingerprint(art2)
+
+
 # ─── 1. Per-fold preprocessing leakage ─────────────────────────────────────────
 
 def test_fold_artifact_unaffected_by_corrupting_its_own_validation_subjects():
@@ -288,14 +327,35 @@ def test_from_pipeline_result_rejects_gene_count_mismatch():
         ExperimentContext.from_pipeline_result(result, config={})
 
 
-def test_from_pipeline_result_deep_copies_config_snapshot():
+def test_from_pipeline_result_deep_copies_config_snapshot(monkeypatch):
     """Mutating the caller's config dict after building a context must not
     retroactively change the context's own config snapshot."""
+    import sys as _sys
     import tempfile
+    import types
+
     from preprocess import run_pipeline_split_aware
     from benchmarks.context import ExperimentContext
     sys.path.insert(0, str(Path(__file__).parents[0]))
     from test_preprocess_split_aware import _synthetic_h5ad_consistent_labels
+
+    # This test exercises config-snapshot deep-copy semantics, not CellTypist
+    # compatibility — install a fake celltypist with no version mismatch so
+    # a real (non-degraded) ExperimentContext can actually be constructed in
+    # this environment, where the real installed model is version-
+    # incompatible (see data/transforms.py::CellTypistCompatibilityError and
+    # tests/test_transforms_inductive_annotation.py's own fake-celltypist
+    # tests for the exhaustively-covered compatibility behavior itself).
+    def fake_annotate(adata, model, majority_voting):
+        n = adata.n_obs
+        import pandas as _pd
+        return types.SimpleNamespace(predicted_labels=_pd.DataFrame({
+            "predicted_labels": ["Basal cell"] * n, "majority_voting": ["Basal cell"] * n,
+        }))
+    fake_models = types.SimpleNamespace(Model=types.SimpleNamespace(load=lambda model: object()))
+    fake_celltypist = types.SimpleNamespace(annotate=fake_annotate, models=fake_models)
+    monkeypatch.setitem(_sys.modules, "celltypist", fake_celltypist)
+    monkeypatch.setitem(_sys.modules, "celltypist.models", fake_models)
 
     with tempfile.TemporaryDirectory() as tmp:
         h5ad = str(Path(tmp) / "test.h5ad")

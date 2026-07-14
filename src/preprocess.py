@@ -148,7 +148,15 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     merged = merge_sources(*adatas)
     merged = smoke_aware_hvg(merged, n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT))
     merged = batch_correct(merged)
-    merged = annotate_cell_types(merged)
+    # cell_type_allow_diagnostic_fallback defaults to False (fail-closed on
+    # any CellTypist failure or scikit-learn/CellTypist version mismatch —
+    # see data/transforms.py::annotate_cell_types). No real production
+    # config sets this key; it exists only for a deliberate, disclosed
+    # diagnostic run, and any output produced with it set is stamped
+    # degraded and rejected by real ExperimentContext construction.
+    merged = annotate_cell_types(
+        merged, allow_diagnostic_fallback=cfg.get("cell_type_allow_diagnostic_fallback", False)
+    )
 
     if cfg.get("nlst_csv"):
         merged = transfer_nlst_labels(merged, cfg["nlst_csv"])
@@ -347,7 +355,11 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     # fold-reconstructed cell got cell_type_id=0 (the placeholder) instead
     # of its real annotation — silently destroying cell-type proportions and
     # MIL cell-type-id inputs for every benchmark CV fold and OOD evaluation.
-    merged = annotate_cell_types(merged)
+    # See run_pipeline() above for cell_type_allow_diagnostic_fallback's
+    # fail-closed-by-default contract — identical here.
+    merged = annotate_cell_types(
+        merged, allow_diagnostic_fallback=cfg.get("cell_type_allow_diagnostic_fallback", False)
+    )
 
     # Snapshot the full-gene, normalized-but-not-yet-HVG-selected-or-scaled
     # AnnData BEFORE fit_preprocessing/apply_preprocessing run. Neither

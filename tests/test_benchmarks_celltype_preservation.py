@@ -41,7 +41,7 @@ def test_annotate_cell_types_runs_once_before_refit_snapshot(monkeypatch):
     call_count = {"n": 0}
     real_annotate = preprocess_mod.annotate_cell_types
 
-    def fake_annotate(adata):
+    def fake_annotate(adata, allow_diagnostic_fallback=False):
         call_count["n"] += 1
         # Deterministic, subject-derived, multi-class fake annotation —
         # stands in for a real CellTypist prediction without depending on

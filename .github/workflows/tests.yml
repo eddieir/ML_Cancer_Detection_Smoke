@@ -16,9 +16,9 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11.15"
           cache: "pip"
@@ -26,25 +26,21 @@ jobs:
           # cache instead of silently reusing a stale resolution.
           cache-dependency-path: |
             requirements.txt
+            requirements-test.txt
             constraints-ci.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt -c constraints-ci.txt
+          pip install -r requirements.txt -r requirements-test.txt -c constraints-ci.txt
+
+      - name: Verify test runner is installed
+        run: python -m pytest --version
 
       - name: Record environment
-        run: |
-          python --version
-          pip --version
-          python -c "
-          import importlib
-          for pkg in ['numpy', 'pandas', 'scipy', 'sklearn', 'torch', 'scanpy', 'anndata', 'celltypist']:
-              try:
-                  print(pkg, importlib.metadata.version(pkg))
-              except Exception as exc:
-                  print(pkg, 'UNAVAILABLE', exc)
-          " || true
+        run: python -m benchmarks.env_versions
+        env:
+          PYTHONPATH: src
 
       # Every test in tests/ builds its own synthetic fixtures in-process
       # (see tests/test_preprocess_split_aware.py, tests/test_pipeline.py) —

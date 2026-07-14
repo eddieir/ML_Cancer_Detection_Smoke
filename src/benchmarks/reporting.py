@@ -153,16 +153,11 @@ def _environment_snapshot(synthetic: bool) -> dict:
     whether the working tree was dirty at run time (best-effort — `git
     status` may be unavailable outside a git checkout, e.g. an extracted
     release tarball)."""
-    import importlib.metadata
     import platform
     import subprocess
     import sys as _sys
 
-    def _version(pkg: str):
-        try:
-            return importlib.metadata.version(pkg)
-        except importlib.metadata.PackageNotFoundError:
-            return None
+    from .env_versions import collect_core_package_versions
 
     git_sha = get_git_sha()
     git_dirty = None
@@ -181,12 +176,7 @@ def _environment_snapshot(synthetic: bool) -> dict:
         "git_sha": git_sha,
         "git_dirty": git_dirty,
         "synthetic": synthetic,
-        "package_versions": {
-            pkg: _version(pkg) for pkg in (
-                "numpy", "pandas", "scipy", "scikit-learn", "torch", "scanpy",
-                "anndata", "celltypist", "harmonypy", "pytest",
-            )
-        },
+        "package_versions": collect_core_package_versions(required=False),
     }
 
 

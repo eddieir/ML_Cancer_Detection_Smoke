@@ -305,26 +305,57 @@ def _install_version_mismatched_celltypist(monkeypatch, calls):
     monkeypatch.setitem(sys.modules, "celltypist.models", fake_models)
 
 
-def test_sklearn_version_mismatch_does_not_raise_by_default(monkeypatch):
-    """Default behavior (strict_sklearn_compatibility=False) must not
-    regress — this project's own CI has always passed with this exact
-    warning present, so a silent default hard-fail would be a functional
-    regression, not a fix."""
-    from data.transforms import annotate_cell_types
+def test_sklearn_version_mismatch_raises_by_default_real_mode(monkeypatch):
+    """Real (allow_diagnostic_fallback=False, the default) preprocessing
+    must fail closed on a scikit-learn/CellTypist version mismatch — it must
+    never silently continue with a version-inconsistent prediction."""
+    from data.transforms import CellTypistCompatibilityError, annotate_cell_types
 
     calls = []
     _install_version_mismatched_celltypist(monkeypatch, calls)
     n, g = 4, 3
     adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
-    out = annotate_cell_types(adata)
-    assert out.uns["cell_type_annotation_degraded"] is False
+    with pytest.raises(CellTypistCompatibilityError, match="0.24.1"):
+        annotate_cell_types(adata)
 
 
-def test_sklearn_version_mismatch_still_emits_the_warning(monkeypatch):
+def test_sklearn_version_mismatch_error_is_not_wrapped_in_generic_annotation_error(monkeypatch):
+    """The specific, remediation-bearing CellTypistCompatibilityError must
+    reach the caller undisturbed — never hidden inside the generic
+    CellTypeAnnotationError the broad except-Exception fallback raises."""
+    from data.transforms import CellTypeAnnotationError, annotate_cell_types
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    with pytest.raises(Exception) as exc_info:
+        annotate_cell_types(adata)
+    assert not isinstance(exc_info.value, CellTypeAnnotationError)
+
+
+def test_sklearn_version_mismatch_cannot_be_bypassed_by_a_generic_env_var(monkeypatch):
+    """There must be no generic environment variable that weakens real-mode
+    enforcement — CELLTYPIST_STRICT_SKLEARN_COMPAT no longer exists at all,
+    real mode fails closed unconditionally."""
+    from data.transforms import CellTypistCompatibilityError, annotate_cell_types
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    monkeypatch.setenv("CELLTYPIST_STRICT_SKLEARN_COMPAT", "0")
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    with pytest.raises(CellTypistCompatibilityError):
+        annotate_cell_types(adata)
+
+
+def test_sklearn_version_mismatch_still_emits_the_warning_before_raising(monkeypatch):
     """The InconsistentVersionWarning must never be silently swallowed, even
-    when it isn't turned into a hard failure."""
-    from data.transforms import annotate_cell_types
+    though it now also causes a hard failure in real mode."""
+    from data.transforms import CellTypistCompatibilityError, annotate_cell_types
     from sklearn.exceptions import InconsistentVersionWarning
 
     calls = []
@@ -333,22 +364,11 @@ def test_sklearn_version_mismatch_still_emits_the_warning(monkeypatch):
     adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
     with pytest.warns(InconsistentVersionWarning):
-        annotate_cell_types(adata)
+        with pytest.raises(CellTypistCompatibilityError):
+            annotate_cell_types(adata)
 
 
-def test_strict_sklearn_compatibility_raises_on_version_mismatch(monkeypatch):
-    from data.transforms import CellTypeAnnotationError, annotate_cell_types
-
-    calls = []
-    _install_version_mismatched_celltypist(monkeypatch, calls)
-    n, g = 4, 3
-    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
-                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
-    with pytest.raises(CellTypeAnnotationError):
-        annotate_cell_types(adata, strict_sklearn_compatibility=True)
-
-
-def test_strict_sklearn_compatibility_does_not_raise_when_versions_match(monkeypatch):
+def test_matching_versions_do_not_raise_in_real_mode(monkeypatch):
     from data.transforms import annotate_cell_types
 
     calls = []
@@ -356,21 +376,87 @@ def test_strict_sklearn_compatibility_does_not_raise_when_versions_match(monkeyp
     n, g = 4, 3
     adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
-    out = annotate_cell_types(adata, strict_sklearn_compatibility=True)
+    out = annotate_cell_types(adata)
     assert out.uns["cell_type_annotation_degraded"] is False
+    assert out.uns["cell_type_annotation_compatibility"]["compatible"] is True
 
 
-def test_environment_override_enables_strict_compatibility(monkeypatch):
-    from data.transforms import CellTypeAnnotationError, annotate_cell_types
+def test_diagnostic_fallback_tolerates_mismatch_but_stamps_degraded(monkeypatch):
+    """allow_diagnostic_fallback=True may proceed past a version mismatch,
+    but the result must be unambiguously marked degraded/non-scientific —
+    never indistinguishable from a genuinely compatible annotation."""
+    from data.transforms import annotate_cell_types
 
     calls = []
     _install_version_mismatched_celltypist(monkeypatch, calls)
-    monkeypatch.setenv("CELLTYPIST_STRICT_SKLEARN_COMPAT", "1")
     n, g = 4, 3
     adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
-    with pytest.raises(CellTypeAnnotationError):
-        annotate_cell_types(adata)
+    out = annotate_cell_types(adata, allow_diagnostic_fallback=True)
+    assert out.uns["cell_type_annotation_degraded"] is True
+    assert out.uns["cell_type_annotation_compatibility"]["compatible"] is False
+    assert out.uns["cell_type_annotation_compatibility"]["diagnostic_override_used"] is True
+    assert "cell_type_fallback_reason" in out.uns
+
+
+def test_diagnostic_fallback_with_matching_versions_is_not_marked_degraded(monkeypatch):
+    """allow_diagnostic_fallback=True must not itself force a degraded
+    stamp when there was no actual mismatch to tolerate."""
+    from data.transforms import annotate_cell_types
+
+    calls = []
+    _install_fake_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata, allow_diagnostic_fallback=True)
+    assert out.uns["cell_type_annotation_degraded"] is False
+    assert out.uns["cell_type_annotation_compatibility"]["diagnostic_override_used"] is False
+
+
+def test_degraded_compatibility_override_is_rejected_by_real_context():
+    """A diagnostic-mode annotation that tolerated a real version mismatch
+    must be rejected by real (non-synthetic) ExperimentContext construction —
+    the existing degraded-provenance guard already covers this, since the
+    compatibility override always sets cell_type_annotation_degraded=True."""
+    from benchmarks.context import ExperimentContext
+    from data.label_mapping import identity_label_mapping
+    from data.preprocessing import PreprocessingArtifact
+    from data.splitting import SplitManifest
+    from train import CellLevelDataset
+
+    n_genes = 3
+    ds = CellLevelDataset(
+        gene_matrix=np.zeros((2, n_genes), dtype="float32"), smoke_labels=np.array([0, 1]),
+        malignancy_labels=np.zeros(2, dtype="float32"), cell_type_ids=np.zeros(2, dtype=np.int64),
+        subject_ids=np.array(["s0", "s1"], dtype=object), dataset_source=np.array(["a", "a"], dtype=object),
+    )
+    val_ds = CellLevelDataset(
+        gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([0]),
+        malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
+        subject_ids=np.array(["s2"], dtype=object), dataset_source=np.array(["a"], dtype=object),
+    )
+    test_ds = CellLevelDataset(
+        gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([1]),
+        malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
+        subject_ids=np.array(["s3"], dtype=object), dataset_source=np.array(["a"], dtype=object),
+    )
+    artifact = PreprocessingArtifact(
+        version="1", gene_list=[f"g{i}" for i in range(n_genes)], gene_means=[0.0] * n_genes,
+        gene_stds=[1.0] * n_genes, n_hvgs=n_genes, smoke_marker_genes_forced=[],
+        fit_n_cells=2, fit_n_subjects=2, cell_type_annotation_degraded=True,
+        cell_type_annotation_compatibility={"compatible": False, "diagnostic_override_used": True},
+    )
+    manifest = SplitManifest(seed=1, train_subjects=["s0", "s1"], val_subjects=["s2"], test_subjects=["s3"])
+    mapping = identity_label_mapping({0: "cigarette", 1: "vape"})
+    result = {
+        "train_cell_dataset": ds, "val_cell_dataset": val_ds, "test_cell_dataset": test_ds,
+        "train_bags": [], "val_bags": [], "test_bags": [], "split_manifest": manifest,
+        "preprocessing_artifact": artifact, "label_mapping": mapping, "rare_class_report": {},
+        "label_provenance_report": {}, "transductive_batch_correction": False,
+    }
+    with pytest.raises(ValueError, match="cell_type_annotation_degraded"):
+        ExperimentContext.from_pipeline_result(result, config={})
 
 
 def test_compatibility_provenance_persisted_for_a_mismatched_model(monkeypatch):
@@ -386,7 +472,11 @@ def test_compatibility_provenance_persisted_for_a_mismatched_model(monkeypatch):
     n, g = 4, 3
     adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
-    out = annotate_cell_types(adata)
+    # Real mode now fails closed on the mismatch (see
+    # test_sklearn_version_mismatch_raises_by_default_real_mode); use the
+    # explicit diagnostic override to still inspect the persisted
+    # compatibility provenance for a tolerated mismatch.
+    out = annotate_cell_types(adata, allow_diagnostic_fallback=True)
     compat = out.uns["cell_type_annotation_compatibility"]
     assert compat["compatible"] is False
     assert compat["serialized_sklearn_versions"] == ["0.24.1"]

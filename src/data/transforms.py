@@ -208,20 +208,24 @@ def cell_type_map_fingerprint() -> str:
 
 
 class CellTypistCompatibilityError(RuntimeError):
-    """Raised only when strict_sklearn_compatibility=True and CellTypist's
-    pretrained model was unpickled with a scikit-learn version different
-    from the one installed. scikit-learn's own model-persistence
+    """Raised whenever CellTypist's pretrained model was unpickled with a
+    scikit-learn version different from the one installed, UNLESS the
+    caller explicitly opted into a diagnostic run (allow_diagnostic_fallback
+    =True — see annotate_cell_types). scikit-learn's own model-persistence
     documentation states cross-version unpickling is unsupported and "may
     lead to breaking code or invalid results" — this is an unresolved
     upstream risk (CellTypist's published Immune_All_Low.pkl was serialized
     with scikit-learn 0.24.1; this project has been tested against
     scikit-learn >=1.4, currently 1.9.0 in CI) that this project cannot fix
     by itself, since it does not control CellTypist's published model
-    artifact. Not raised by default so this does not regress every existing
-    pipeline run that already passes with this exact warning present; opt in
-    via strict_sklearn_compatibility=True or the
-    CELLTYPIST_STRICT_SKLEARN_COMPAT=1 environment variable to hard-fail
-    instead of merely warning."""
+    artifact. This is a fail-closed default: a real (non-diagnostic)
+    scientific run must never silently treat a version-incompatible
+    prediction as valid. There is deliberately no environment variable that
+    can weaken this for a real run — the only way to proceed past this
+    error is the explicit, always-degraded allow_diagnostic_fallback=True
+    path. If no compatible CellTypist model is available, the honest
+    resolution is that real preprocessing intentionally fails closed until
+    one is: see README.md's documented limitation."""
 
 
 def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, strict: bool):
@@ -237,9 +241,11 @@ def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, stric
     can be treated as scientifically valid on reload — never fabricated,
     never silently dropped: celltypist_version, model_name,
     runtime_sklearn_version, serialized_sklearn_versions (one per estimator
-    sklearn warned about, deduplicated), and compatible (False if any
-    InconsistentVersionWarning fired, True if none did)."""
-    import os
+    sklearn warned about, deduplicated), compatible (False if any
+    InconsistentVersionWarning fired, True if none did), and
+    diagnostic_override_used (True only when a mismatch occurred and strict
+    was False, i.e. the caller's diagnostic opt-out is the only reason this
+    call did not raise)."""
     import warnings
 
     import celltypist as _celltypist_pkg
@@ -264,16 +270,23 @@ def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, stric
         "runtime_sklearn_version": _sklearn_pkg.__version__,
         "serialized_sklearn_versions": serialized_versions,
         "compatible": not version_mismatches,
+        "diagnostic_override_used": bool(version_mismatches) and not strict,
     }
 
-    if version_mismatches and (strict or os.environ.get("CELLTYPIST_STRICT_SKLEARN_COMPAT") == "1"):
+    if version_mismatches and strict:
         raise CellTypistCompatibilityError(
-            f"CellTypist pretrained model {model_name!r} was unpickled under a "
-            f"different scikit-learn version than the one installed: "
-            f"{version_mismatches[0].message}. Refusing to continue because "
-            "strict scikit-learn compatibility checking is enabled. This project "
-            "cannot fix the mismatch itself — it does not control CellTypist's "
-            "published model artifact."
+            f"CellTypist pretrained model {model_name!r} (celltypist "
+            f"{compatibility['celltypist_version']}) was serialized under "
+            f"scikit-learn {serialized_versions}, but this run has scikit-learn "
+            f"{_sklearn_pkg.__version__} installed: {version_mismatches[0].message}. "
+            "Refusing to continue a real scientific run with a version-inconsistent "
+            "estimator. This project cannot fix the mismatch itself — it does not "
+            "control CellTypist's published model artifact. Remediation: obtain or "
+            "publish a CellTypist model reserialized against a matching scikit-learn "
+            "version, or pass allow_diagnostic_fallback=True to annotate_cell_types "
+            "for a deliberate, explicitly degraded, non-scientific diagnostic run only "
+            "(never for a real benchmark — real ExperimentContext construction rejects "
+            "degraded provenance)."
         )
     return model, compatibility
 
@@ -293,7 +306,6 @@ _DIAGNOSTIC_FALLBACK_LABEL = "epithelial"
 
 def annotate_cell_types(
     adata: ad.AnnData, majority_voting: bool = False, allow_diagnostic_fallback: bool = False,
-    strict_sklearn_compatibility: bool = False,
 ) -> ad.AnnData:
     """
     CellTypist per-cell prediction -> coarse 4-class cell_type_id.
@@ -338,10 +350,16 @@ def annotate_cell_types(
     Immune_All_Low.pkl model was serialized with an older scikit-learn
     (0.24.1) than this project runs against (>=1.4, currently 1.9.0 in CI);
     loading it always emits scikit-learn's own InconsistentVersionWarning,
-    which is never hidden here. strict_sklearn_compatibility=True (or the
-    CELLTYPIST_STRICT_SKLEARN_COMPAT=1 environment variable) turns that
-    warning into a hard CellTypistCompatibilityError instead of merely
-    logging it — see that class's docstring for why this is not the default.
+    which is never hidden here. A real (allow_diagnostic_fallback=False,
+    the default) call FAILS CLOSED on that warning — it raises
+    CellTypistCompatibilityError undisturbed, not wrapped in
+    CellTypeAnnotationError, so the specific remediation-bearing error
+    reaches the caller. There is no environment variable that can weaken
+    this for a real run. allow_diagnostic_fallback=True is the only way to
+    tolerate the mismatch, and doing so always stamps the result degraded
+    (cell_type_annotation_degraded=True) so real ExperimentContext
+    construction (benchmarks/context.py, via
+    data/preprocessing.py::validate_cell_type_provenance) rejects it.
     """
     from constants import CELL_TYPE_MAP
     if adata.obs["is_pseudo_bulk"].all():
@@ -375,7 +393,7 @@ def annotate_cell_types(
             ct_input.X = adata.layers["lognorm"]
 
         model, compatibility = _load_celltypist_model_checking_sklearn_compatibility(
-            "Immune_All_Low.pkl", strict=strict_sklearn_compatibility
+            "Immune_All_Low.pkl", strict=not allow_diagnostic_fallback
         )
         pred  = celltypist.annotate(ct_input, model=model, majority_voting=majority_voting)
         labels = (
@@ -391,7 +409,16 @@ def annotate_cell_types(
         )
         adata.uns["cell_type_map_fingerprint"] = cell_type_map_fingerprint()
         adata.uns["cell_type_annotation_mode"] = "majority_voting" if majority_voting else "inductive_per_cell"
-        adata.uns["cell_type_annotation_degraded"] = False
+        # A diagnostic override that tolerated a real version mismatch must
+        # never be indistinguishable from a genuinely compatible run — stamp
+        # it degraded so real ExperimentContext construction rejects it
+        # (see data/preprocessing.py::validate_cell_type_provenance).
+        adata.uns["cell_type_annotation_degraded"] = bool(compatibility["diagnostic_override_used"])
+        if compatibility["diagnostic_override_used"]:
+            adata.uns["cell_type_fallback_reason"] = (
+                "scikit-learn/CellTypist version mismatch tolerated via "
+                "allow_diagnostic_fallback=True: " + repr(compatibility)
+            )
         # Persisted so a checkpoint/reproducibility artifact can record
         # exactly which CellTypist/scikit-learn combination produced this
         # annotation and whether sklearn itself considers it version-
@@ -399,6 +426,11 @@ def annotate_cell_types(
         adata.uns["cell_type_annotation_compatibility"] = compatibility
         print(f"[transform] celltypist  {adata.n_obs:,} cells annotated "
               f"({'majority_voting' if majority_voting else 'inductive per-cell'})")
+    except CellTypistCompatibilityError:
+        # Never wrap this in the generic CellTypeAnnotationError below — its
+        # specific remediation guidance (versions involved, model name, how
+        # to opt into a diagnostic run) must reach the caller undisturbed.
+        raise
     except Exception as e:
         if not allow_diagnostic_fallback:
             raise CellTypeAnnotationError(
