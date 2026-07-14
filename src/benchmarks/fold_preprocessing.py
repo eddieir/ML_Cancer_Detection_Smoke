@@ -70,14 +70,15 @@ def build_fold_cell_dataset(
     baselines, and the neural adapter all work unchanged on fold data.
 
     cell_type_id in normalized_adata_for_refit carries the REAL CellTypist
-    annotation (run_pipeline_split_aware() now runs annotate_cell_types()
-    once, BEFORE capturing this snapshot — see preprocess.py) — every fold
-    and the outer split see the same deterministic cell-type labels.
-    CellTypist is only ever run this one time on the full merged dataset:
-    its majority-voting step is smoothed over whichever cells are present in
-    a given call, so annotating a different subset per fold would silently
-    change individual cells' cell_type_id between folds, breaking the
-    "stable cell-type ID across folds" invariant this module depends on.
+    annotation (run_pipeline_split_aware() runs annotate_cell_types() once,
+    BEFORE capturing this snapshot — see preprocess.py) — every fold and the
+    outer split see the same deterministic cell-type labels.
+    annotate_cell_types() defaults to majority_voting=False (INDUCTIVE):
+    each cell's predicted label is a pure function of that cell's own
+    expression vector, independent of which other cells are present in the
+    same call — so even though annotation runs once here (a performance
+    convenience, not a leakage requirement), reannotating any subset of
+    these same cells alone would reproduce the identical per-cell labels.
     fit_preprocessing/apply_preprocessing only ever touch gene expression
     (.X), never obs["cell_type_id"], so this label survives fold
     reconstruction unchanged.

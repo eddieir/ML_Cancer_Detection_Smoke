@@ -537,35 +537,89 @@ blank/placeholder bag subject IDs, and exposes fingerprinted `run_identity()`
 that a checkpoint/result reload can verify against
 (`validate_run_identity()`). A durable, restart-and-concurrency-safe one-time
 frozen-test guard (`test_guard.py::FrozenTestGuard`, atomic
-`O_CREAT|O_EXCL` file creation) is available and wired into Task B's final
-path as an **opt-in** feature (`benchmarks.frozen_test_guard_dir` in
-config) — left off by default so repeated CI/test invocations against the
-same context aren't blocked by a guard meant for one-shot publication runs.
+`O_CREAT|O_EXCL` file creation) is wired into Task B's final path.
+
+**Fixed in the third pass** (see git history for the exact commits — this
+supersedes the "opt-in guard" / "baseline-only final evaluation" / "search
+space declared but not consulted for neural/MIL" limitations listed above):
+
+- **Cell-type annotation is now inductive.** `annotate_cell_types()`
+  defaults to CellTypist's `majority_voting=False` mode: a cell's predicted
+  label is a pure function of that cell's own expression, independent of
+  which other cells (in particular, held-out validation/test cells) are
+  present in the same call — previously `majority_voting=True` let an
+  over-clustering pass computed across train+val+test cells influence a
+  training cell's own label. The fixed `CELL_TYPE_MAP` label-to-ID table is
+  unchanged (a static dict, never data-derived) but is now fingerprinted and
+  persisted on `PreprocessingArtifact` (`cell_type_map_fingerprint`,
+  `cell_type_annotation_mode`) for audit — see
+  [data/transforms.py](src/data/transforms.py).
+- **Neural/MIL candidates can win the final frozen-test evaluation.**
+  `final_evaluation.py::select_final_candidate` ranks every requested
+  model — classical baseline or MIL (`mean_mil`/`max_mil`/`attention_mil`/
+  `neural`) — by CV/development evidence alone; the winner is never silently
+  swapped for a baseline. A model with an undefined CV metric across every
+  fold is recorded ineligible with a reason, not dropped without a trace.
+- **The frozen-test guard is now mandatory for every non-synthetic run.** A
+  safe default location (`<output>/.frozen_test_guards/`) is derived from
+  the run's own output root when `benchmarks.frozen_test_guard_dir` isn't
+  configured, and the guard is keyed by
+  `ExperimentContext.guard_identity_fingerprint()` (manifest + preprocessing
+  + label-mapping + config + selected-model fingerprints combined) rather
+  than by `run_id`, so a fresh `--run-id` cannot bypass it. Disabling the
+  guard is possible only via the explicit, synthetic-only
+  `benchmarks.disable_frozen_test_guard` config flag (or CLI
+  `--disable-frozen-test-guard`, which `main()` rejects outside
+  `--synthetic`); attempting to disable it for a real run raises
+  `FrozenTestGuardDisabledInRealModeError`.
+- **Hyperparameter selection is integrated into every outer CV fold, for
+  both tasks.** `hyperparameter_search.py::select_nested_hyperparameters_with_refit`
+  runs a real inner grouped-CV — refitting its own `PreprocessingArtifact`
+  from only each inner fold's own training subjects — inside every outer CV
+  fold, for classical baselines (Task A and Task B) and, via a small bounded
+  fixed candidate set (`NEURAL_SEARCH_SPACE`/`MIL_SEARCH_SPACE` in
+  [cross_validation.py](src/benchmarks/cross_validation.py)), for the
+  neural/MIL models too. Every outer-fold record now carries its
+  `hyperparameter_search` result (candidates tried, inner scores, selected
+  params, inner fold partitions); a model with no tunable parameters records
+  `no_search_space: true` explicitly.
+- **The final development/fit/calibration protocol now uses the whole
+  train+val pool, correctly.** `final_evaluation.py` selects one final
+  configuration via nested CV over the entire development pool, generates
+  subject-grouped out-of-fold (OOF) predictions across that same pool (each
+  OOF subject predicted by a fold-refit model/artifact that never saw that
+  subject), fits calibration and selects the threshold from those OOF
+  predictions exclusively (never a plain validation split, never test), then
+  refits ONE final preprocessing artifact and model on all (and only)
+  development subjects before the single, guarded test evaluation. MIL
+  candidates' final refit carves a small internal validation slice out of
+  the development pool for Trainer's own checkpoint-selection bookkeeping
+  (see limitations below) — classical baselines have no such requirement and
+  use every development subject directly.
 
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
-section for the same list, generated fresh per run): nested hyperparameter
-selection covers the classical sklearn baselines only — the neural/MIL
-models are not included in any nested search (that would mean a full inner-
-CV training loop per candidate, many times the cost of one Phase 1 + Phase 2
-run); Task A baselines still run in subject-summary mode only (one feature
-vector per subject) for their own training/prediction — the neural adapter
-is the only model exercising true cell-level training, now with per-subject
-capping — so "cell-weighted" metrics for baselines remain explicitly marked
-not-applicable rather than presented as real per-cell scores; the final
-frozen-threshold test evaluation is wired for baseline models only (the
-neural/MIL adapter isn't yet plugged into that same one-shot path — this is
-the largest remaining gap, since it would require training a neural/MIL
-candidate to convergence per hyperparameter/model choice before freezing);
-the immutable artifact directory now additionally writes
-`hyperparameters.json` and `metrics/*_folds_partitions.json` (outer subject
-partitions per fold) but still does not contain every file the ideal schema
-calls for (per-model OOF prediction CSVs, a separate `preprocessing/`
-subdir, an environment snapshot) — what's written today is real and
-complete for what it covers, just not the full target layout; the frozen
-test guard is opt-in, not enabled by default, so a real run must explicitly
-set `benchmarks.frozen_test_guard_dir` to get durable one-time-evaluation
-protection; attention weights remain an interpretability aid, not a causal
-explanation, in every pooling variant.
+section for the same list, generated fresh per run): the neural/MIL bounded
+search spaces compared inside nested CV are deliberately small (one or two
+fixed candidates, e.g. `phase1_epochs`/`pretrain_epochs`), not a real
+hyperparameter grid — a full grid would mean many more full training runs
+per fold; Task A baselines still run in subject-summary mode only (one
+feature vector per subject) for their own training/prediction — the neural
+adapter is the only Task A model exercising true cell-level training, so
+"cell-weighted" metrics for baselines remain explicitly marked
+not-applicable rather than presented as real per-cell scores; the MIL final
+refit (unlike the classical baselines) does not fit its weights on literally
+every development subject — Trainer's phase1/phase2 curriculum requires its
+own subject-disjoint validation split for checkpoint selection, so a small,
+seed-deterministic internal slice of the development pool (never test) is
+held out from gradient updates for that purpose only, a limitation of reusing
+the existing Trainer architecture rather than a leakage issue; the immutable
+artifact directory still does not contain every file the ideal schema calls
+for (per-model OOF prediction CSVs as a separate file, a dedicated
+`preprocessing/` subdir, an environment snapshot) — OOF predictions and fold
+membership are recorded in `calibration/frozen_policy.json`'s
+`oof_summary`/`hyperparameters.json`, just not yet as standalone files;
+attention weights remain an interpretability aid, not a causal explanation,
+in every pooling variant.
 
 ## Pipeline
 
@@ -625,7 +679,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (325 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 18 `test_benchmarks_*.py` files |
+| `tests/*` | All modules covered (351 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 20 `test_benchmarks_*.py` files (including `test_benchmarks_nested_cv_selection.py` and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |

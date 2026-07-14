@@ -332,17 +332,21 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     # loads a fixed pretrained classifier and only reads obs["is_pseudo_bulk"]
     # and layers["lognorm"] (restored explicitly since merge_sources leaves
     # .X as z-scores) — it never fits/trains on this dataset, so running it
-    # once here adds no leakage risk. It must run exactly ONCE on the full
-    # merged dataset, not per CV fold: CellTypist's majority-voting step
-    # smooths each cell's label using the OTHER cells present in the same
-    # call, so annotating a different cell subset per fold would silently
-    # change individual cells' cell_type_id between folds and break the
-    # "deterministic cell-type label-to-ID mapping across folds" invariant
-    # fold_preprocessing.py depends on. Previously this ran AFTER the
-    # refit-snapshot line below, which meant every fold-reconstructed cell
-    # got cell_type_id=0 (the placeholder) instead of its real annotation —
-    # silently destroying cell-type proportions and MIL cell-type-id inputs
-    # for every benchmark CV fold and OOD evaluation.
+    # here adds no leakage risk. annotate_cell_types() defaults to
+    # majority_voting=False, CellTypist's own inductive mode: each cell's
+    # predicted label is a pure function of that cell's own expression
+    # vector, independent of which other cells are supplied in the same
+    # call. A held-out validation/test cell therefore cannot change a
+    # training cell's annotation, and annotating a different subject subset
+    # per CV fold reproduces the SAME per-cell labels rather than silently
+    # reassigning them — see data/transforms.py::annotate_cell_types for the
+    # full rationale. It is still run exactly once here (not once per fold)
+    # purely as a performance/consistency convenience — inductive per-cell
+    # prediction makes that a choice, not a leakage requirement. Previously
+    # this ran AFTER the refit-snapshot line below, which meant every
+    # fold-reconstructed cell got cell_type_id=0 (the placeholder) instead
+    # of its real annotation — silently destroying cell-type proportions and
+    # MIL cell-type-id inputs for every benchmark CV fold and OOD evaluation.
     merged = annotate_cell_types(merged)
 
     # Snapshot the full-gene, normalized-but-not-yet-HVG-selected-or-scaled
@@ -366,6 +370,11 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT),
     )
     artifact.label_mapping = label_mapping.to_dict()
+    # Persist which fixed label-name -> ID table produced obs["cell_type_id"]
+    # (set by annotate_cell_types above), so a checkpoint/report can verify
+    # on reload that its cell-type IDs mean the same thing this run's did.
+    artifact.cell_type_map_fingerprint = merged.uns.get("cell_type_map_fingerprint")
+    artifact.cell_type_annotation_mode = merged.uns.get("cell_type_annotation_mode")
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────

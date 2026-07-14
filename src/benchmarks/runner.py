@@ -19,31 +19,35 @@ mode and the run refuses to be mistaken for a real-data result.
 """
 
 import argparse
+import hashlib
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 
-from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, positive_class_proba
+from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES
 from .calibration import build_frozen_policy
 from .context import ExperimentContext
-from .cross_validation import run_cancer_cv, run_smoke_cv
+from .cross_validation import (
+    DEFAULT_INNER_FOLDS,
+    MIL_SEARCH_SPACE,
+    _cancer_baseline_fit_score_fn,
+    _mil_fit_score_fn,
+    run_cancer_cv,
+    run_smoke_cv,
+)
 from .eligibility import check_task_a_eligibility, check_task_b_eligibility
-from .features import build_cancer_subject_features
-from .hyperparameter_search import select_hyperparameters_nested
+from .final_evaluation import (
+    NoEligibleFinalCandidateError,
+    generate_subject_oof_predictions,
+    is_mil_candidate,
+    refit_final_candidate_on_dev_pool,
+    select_final_candidate,
+)
+from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
 from .reporting import compare_models, new_run_dir, write_benchmark_report
 from .ood import run_leave_one_source_out
-from .test_guard import FrozenTestGuard
-
-
-def _cancer_inner_score_fn(model, X_val, y_val):
-    """AUROC on an inner fold's validation rows; None (excluded from the
-    mean, never coerced to 0.5) if the inner fold's val split has only one
-    class present."""
-    if len(set(y_val.tolist())) < 2:
-        return None
-    from sklearn.metrics import roc_auc_score
-    return roc_auc_score(y_val, positive_class_proba(model, X_val))
+from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError, default_guard_dir
 
 
 def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentContext:
@@ -205,7 +209,30 @@ def run_smoke_task(context, args, run_dir) -> dict:
             "comparisons": comparisons, "ood_report": ood_report}
 
 
-def run_cancer_task(context, args, run_dir) -> dict:
+def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outcomes_by_subject,
+                                     num_cell_types: int, min_cells: int, n_hvgs: int,
+                                     pooling: str, device: str, seed: int) -> dict:
+    """
+    ONE hyperparameter/config selection for the chosen final candidate,
+    computed by nested nested-CV over the WHOLE development pool (train+val
+    subjects — never test). This selection happens exactly once; both
+    generate_subject_oof_predictions and refit_final_candidate_on_dev_pool
+    reuse its result rather than re-searching.
+    """
+    if is_mil_candidate(best_name):
+        candidates = build_param_grid(MIL_SEARCH_SPACE)
+        fit_score_fn = _mil_fit_score_fn(context, pooling, device, outcomes_by_subject, min_cells)
+    else:
+        candidates = build_param_grid(CANCER_SEARCH_SPACE.get(best_name, {}))
+        fit_score_fn = _cancer_baseline_fit_score_fn(CANCER_BASELINES[best_name], num_cell_types,
+                                                       outcomes_by_subject, min_cells)
+    return select_nested_hyperparameters_with_refit(
+        context, dev_subjects, outcomes_by_subject, candidates, fit_score_fn=fit_score_fn,
+        seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+    )
+
+
+def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     eligibility = {"cancer_prediction": check_task_b_eligibility(context)}
     if not eligibility["cancer_prediction"].eligible:
         print(f"[benchmarks] Task B NOT_EVALUABLE: {eligibility['cancer_prediction'].reasons}")
@@ -220,71 +247,109 @@ def run_cancer_task(context, args, run_dir) -> dict:
             continue
         comparisons.append(compare_models(cv_report["results"], "auroc", name, baseline_ref))
 
-    # Final frozen-threshold test evaluation — baseline models only in this
-    # Phase 1 CLI (see reporting.generate_markdown_report's limitations
-    # section): wiring the neural/MIL adapter into the same one-shot frozen
-    # test path is documented follow-up work, not silently skipped.
-    calibration_report = None
-    baseline_models = [m for m in args.models if m in CANCER_BASELINES]
-    if baseline_models:
-        best_name = max(
-            baseline_models,
-            key=lambda n: cv_report["results"][n]["auroc"]["mean"] if cv_report["results"][n]["auroc"]["mean"] is not None else -1,
-        )
-        num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
-        Xtr, ytr, train_subj, _ = build_cancer_subject_features(context.train_bags, num_cell_types)
-        Xva, yva, _, _ = build_cancer_subject_features(context.val_bags, num_cell_types)
-        Xte, yte, _, _ = build_cancer_subject_features(context.test_bags, num_cell_types)
+    # ── Final one-shot frozen-test evaluation ────────────────────────────
+    # Candidates are ranked using CV/development evidence ONLY (blocker 2):
+    # a classical baseline and a neural/MIL model compete on exactly the
+    # same footing, and the winner is never silently swapped for a baseline.
+    num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
+    n_hvgs = context.preprocessing_artifact.n_hvgs
+    min_cells = context.config.get("data", context.config).get("min_cells_per_subject", 50)
+    all_dev_bags = list(context.train_bags) + list(context.val_bags)
+    outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"] for b in all_dev_bags if b.get("cancer_label_known")}
+    dev_subjects = sorted(outcomes_by_subject.keys())
+    # Test outcomes are needed ONLY by the single sanctioned final test
+    # evaluation below (refit_final_candidate_on_dev_pool's test-side
+    # lookup) — never merged into outcomes_by_subject/dev_subjects, so no
+    # selection, search, or OOF-generation code above can see them.
+    test_outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"]
+                                 for b in context.test_bags if b.get("cancer_label_known")}
+    all_known_outcomes = {**outcomes_by_subject, **test_outcomes_by_subject}
+    pooling_for = {"mean_mil": "mean", "max_mil": "max", "attention_mil": "attention",
+                   "neural": args.pooling or "attention"}
 
-        # Nested, leakage-free hyperparameter selection: inner grouped-CV
-        # computed ENTIRELY from the outer-train partition (train_subj) —
-        # never touches val or test labels. A model with no declared search
-        # space (e.g. "prevalence") is recorded as such, not silently
-        # skipped. Calibration/threshold below still uses ONLY val (not
-        # train), a stricter separation than fitting the final model on
-        # train+val: it guarantees the frozen threshold is evaluated on data
-        # the model never saw during fitting OR selection, at the
-        # documented cost of not incorporating val's rows into the model
-        # fit itself (see README's Benchmarking framework limitations).
-        hp_search = select_hyperparameters_nested(
-            CANCER_BASELINES[best_name], CANCER_SEARCH_SPACE.get(best_name, {}),
-            Xtr, ytr, train_subj, score_fn=_cancer_inner_score_fn, seed=args.seeds[0],
-        )
-        model = CANCER_BASELINES[best_name](**hp_search["selected_params"])
-        model.fit(Xtr, ytr, seed=args.seeds[0])
-        prob_val = positive_class_proba(model, Xva)
-        policy = build_frozen_policy(yva, prob_val, calibration_method=args.calibration,
-                                      threshold_strategy=args.threshold_strategy)
+    try:
+        best_name, selection_report = select_final_candidate(cv_report, args.models, primary_metric="auroc")
+    except NoEligibleFinalCandidateError as e:
+        return {"eligibility": eligibility, "cv_reports": {"cancer_prediction": cv_report},
+                "comparisons": comparisons,
+                "calibration_report": {"selected_model": None, "error": str(e)}}
 
-        # Durable one-time test guard — OPT-IN via
-        # benchmarks.frozen_test_guard_dir in config. A stable guard path
-        # (keyed by this context's own run_identity fingerprints, not the
-        # ephemeral run_dir) means repeated invocations against the SAME
-        # manifest/preprocessing/config are refused after the first
-        # completed evaluation, across process restarts. Left disabled by
-        # default so repeated CI/test invocations against the same
-        # synthetic context (an intentional, expected test pattern) aren't
-        # blocked by a guard meant for real, one-shot publication runs — see
-        # test_benchmarks_test_guard.py for the guard's own dedicated tests.
-        guard_dir = context.config.get("benchmarks", {}).get("frozen_test_guard_dir")
-        guard = None
-        if guard_dir:
-            fp = context.config_fingerprint
-            guard = FrozenTestGuard(Path(guard_dir) / f"{fp}.json")
-            guard.acquire(context.run_identity(run_dir.name), selected_model=best_name)
-        try:
-            prob_test = positive_class_proba(model, Xte)
-            test_result = policy.apply_to_test(yte, prob_test)
-        except Exception as e:
-            if guard is not None:
-                guard.mark_failed(str(e))
-            raise
+    pooling = pooling_for.get(best_name, args.pooling or "attention")
+    seed = args.seeds[0]
+
+    hp_search = _final_dev_pool_hyperparameters(
+        context, best_name, dev_subjects, outcomes_by_subject,
+        num_cell_types, min_cells, n_hvgs, pooling, args.device, seed,
+    )
+    selected_params = hp_search["selected_params"]
+
+    # Subject-grouped OOF predictions across the WHOLE development pool,
+    # using the ALREADY-selected configuration — calibration/threshold below
+    # are fit exclusively from these, never from a plain validation split
+    # and never from test (blocker 5).
+    oof = generate_subject_oof_predictions(
+        context, best_name, dev_subjects, outcomes_by_subject, selected_params,
+        num_cell_types, min_cells, n_hvgs, pooling=pooling, device=args.device,
+        seed=seed, n_folds=args.cv_folds,
+    )
+    y_oof = np.array([outcomes_by_subject[s] for s in oof["dev_subjects"]])
+    prob_oof = np.array([oof["oof_by_subject"][s] for s in oof["dev_subjects"]])
+    policy = build_frozen_policy(y_oof, prob_oof, calibration_method=args.calibration,
+                                  threshold_strategy=args.threshold_strategy)
+
+    # ONE final preprocessing + model fit on ALL development subjects, using
+    # the same already-selected configuration — never reselected here.
+    final = refit_final_candidate_on_dev_pool(
+        context, best_name, dev_subjects, context.subjects_for("test"), all_known_outcomes,
+        selected_params, num_cell_types, min_cells, n_hvgs, pooling=pooling, device=args.device, seed=seed,
+    )
+
+    # Durable one-time test guard — MANDATORY for every non-synthetic run
+    # (blocker 3). A safe default location is derived from this run's own
+    # output root when benchmarks.frozen_test_guard_dir isn't configured, so
+    # a real run can never accidentally proceed without one. Disabling it is
+    # permitted ONLY through the explicit synthetic-only path (repeated
+    # CI/test invocations against the same synthetic context are an
+    # intentional, expected pattern); requesting that disable in a
+    # non-synthetic run is refused outright, not silently honored.
+    bench_cfg = context.config.get("benchmarks", {})
+    disable_guard = bool(bench_cfg.get("disable_frozen_test_guard", False))
+    if disable_guard and not synthetic:
+        raise FrozenTestGuardDisabledInRealModeError(
+            "benchmarks.disable_frozen_test_guard=True is only permitted for --synthetic runs — "
+            "refusing to disable the durable frozen-test guard for this non-synthetic run."
+        )
+    guard = None
+    if not (synthetic and disable_guard):
+        guard_dir = bench_cfg.get("frozen_test_guard_dir") or default_guard_dir(run_dir.parent)
+        identity_fp = context.guard_identity_fingerprint(best_name)
+        guard = FrozenTestGuard(Path(guard_dir) / f"{identity_fp}.json")
+        guard.acquire(context.run_identity(run_dir.name), selected_model=best_name)
+
+    try:
+        test_result = policy.apply_to_test(final["test_labels"], final["test_proba"])
+    except Exception as e:
         if guard is not None:
-            import hashlib
-            result_fp = hashlib.sha256(str(sorted(test_result.items())).encode()).hexdigest()
-            guard.mark_completed(threshold=policy.threshold, test_result_fingerprint=result_fp)
-        calibration_report = {"selected_model": best_name, "test_result": test_result,
-                               "hyperparameter_search": hp_search}
+            guard.mark_failed(str(e))
+        raise
+    if guard is not None:
+        result_fp = hashlib.sha256(str(sorted(test_result.items())).encode()).hexdigest()
+        guard.mark_completed(threshold=policy.threshold, test_result_fingerprint=result_fp)
+
+    calibration_report = {
+        "selected_model": best_name, "selection_report": selection_report,
+        "hyperparameter_search": hp_search, "test_result": test_result,
+        "oof_summary": {
+            "candidate": oof["candidate"], "n_dev_subjects": len(oof["dev_subjects"]),
+            "fold_membership": oof["fold_membership"],
+        },
+        "final_model_metadata": final["model_metadata"],
+        "final_preprocessing_artifact_fingerprint": final["preprocessing_artifact_fingerprint"],
+        "test_subject_ids": final["test_subject_ids"],
+        "guard": {"enabled": guard is not None,
+                   "path": str(guard.guard_path) if guard is not None else None,
+                   "synthetic_disabled": bool(synthetic and disable_guard)},
+    }
 
     return {"eligibility": eligibility, "cv_reports": {"cancer_prediction": cv_report},
             "comparisons": comparisons, "calibration_report": calibration_report}
@@ -306,6 +371,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--run-id", type=str, default=None)
+    # The frozen-test guard is mandatory for every non-synthetic run — this
+    # flag exists ONLY to make repeated CI/test invocations against the same
+    # synthetic context (an intentional, expected pattern, not a real
+    # publication run) skip the durable guard. Using it without --synthetic
+    # is refused by run_cancer_task, not silently honored.
+    parser.add_argument("--disable-frozen-test-guard", action="store_true")
     args = parser.parse_args(argv)
 
     if args.synthetic:
@@ -319,9 +390,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.seeds = args.seeds[:1]
         context = build_synthetic_context(seed=args.seeds[0], fast=args.fast)
         synthetic = True
+        if args.disable_frozen_test_guard:
+            context.config.setdefault("benchmarks", {})["disable_frozen_test_guard"] = True
     else:
         if not args.config or not args.task or not args.models:
             parser.error("--config, --task, and --models are required unless --synthetic is given")
+        if args.disable_frozen_test_guard:
+            parser.error("--disable-frozen-test-guard is only permitted together with --synthetic")
         context = build_real_context(args.config)
         synthetic = False
 
@@ -331,7 +406,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.task == "smoke":
         outcome = run_smoke_task(context, args, run_dir)
     else:
-        outcome = run_cancer_task(context, args, run_dir)
+        outcome = run_cancer_task(context, args, run_dir, synthetic=synthetic)
 
     write_benchmark_report(
         run_dir, context, run_manifest, outcome["eligibility"], outcome["cv_reports"],

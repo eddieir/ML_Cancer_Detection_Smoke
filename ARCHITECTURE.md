@@ -697,23 +697,73 @@ leakage class: the refit snapshot (`normalized_adata_for_refit`) used to be
 captured BEFORE `annotate_cell_types()` ran, so every fold/OOD
 reconstruction silently saw `cell_type_id=0` for every cell regardless of
 its real CellTypist annotation — fixed by moving that call to run exactly
-once, before the snapshot (`preprocess.py`), since CellTypist's
-majority-voting step is sensitive to which cells are present in a given call
-and must never run per-fold. This pass also added: real nested grouped-CV
-hyperparameter selection for the classical baselines
-(`benchmarks/hyperparameter_search.py`, computed strictly within the
-outer-train partition, wired into Task B's final frozen-test path — neural/
-MIL models are explicitly out of scope, see README); `cap_cells_per_subject`
-wired into the neural adapter's per-fold cell-level training, applied
-independently per split; leave-one-source-out now requires an explicit
-`reference_species` (never inferred from lexicographic source-name order)
-and rejects a subject assigned to more than one `dataset_source`;
-`ExperimentContext` now rejects a manifest subject missing from its cell
-dataset (previously checked only the reverse direction), rejects blank/
-placeholder bag subject IDs, and exposes fingerprinted `run_identity()` that
-a checkpoint/result reload can verify against; and a durable, restart/
-concurrency-safe one-time frozen-test guard (`benchmarks/test_guard.py`,
-atomic `O_CREAT|O_EXCL` file creation) is available and wired into Task B's
-final path as an opt-in (`benchmarks.frozen_test_guard_dir`) feature. Full
-list of what's fixed vs. still open: README's Benchmarking framework
+once, before the snapshot (`preprocess.py`). (The fourth pass below replaced
+the majority-voting mode this call used, which the rest of this sentence
+used to justify running only once, with an inductive per-cell mode — see
+below.) This pass also added: real nested grouped-CV hyperparameter
+selection for the classical baselines (`benchmarks/hyperparameter_search.py`,
+computed strictly within the outer-train partition, wired into Task B's
+final frozen-test path); `cap_cells_per_subject` wired into the neural
+adapter's per-fold cell-level training, applied independently per split;
+leave-one-source-out now requires an explicit `reference_species` (never
+inferred from lexicographic source-name order) and rejects a subject
+assigned to more than one `dataset_source`; `ExperimentContext` now rejects
+a manifest subject missing from its cell dataset (previously checked only
+the reverse direction), rejects blank/placeholder bag subject IDs, and
+exposes fingerprinted `run_identity()` that a checkpoint/result reload can
+verify against; and a durable, restart/concurrency-safe one-time frozen-test
+guard (`benchmarks/test_guard.py`, atomic `O_CREAT|O_EXCL` file creation)
+was added, wired into Task B's final path as an opt-in
+(`benchmarks.frozen_test_guard_dir`) feature — made mandatory in the fourth
+pass below.
+
+A fourth pass closed the five remaining blockers to treating this framework
+as scientifically load-bearing (see README's Benchmarking framework section
+for the full list, generated fresh per run in `report.md`'s limitations
+section):
+
+1. **Inductive cell-type annotation.** `annotate_cell_types()`
+   (`data/transforms.py`) now calls CellTypist with `majority_voting=False`
+   (CellTypist's own default) instead of `True` — a cell's predicted label
+   becomes a pure function of that cell's own expression, independent of
+   which other cells (in particular held-out validation/test cells) are
+   present in the same call. The previous `majority_voting=True` mode's
+   over-clustering pass, run across train+val+test together, let held-out
+   cells influence a training cell's own annotation — the actual bug the old
+   "must run once, before the snapshot" comment was unknowingly working
+   around rather than fixing. The fixed `CELL_TYPE_MAP` table is now
+   fingerprinted (`cell_type_map_fingerprint()`) and persisted on
+   `PreprocessingArtifact` for audit.
+2. **Neural/MIL candidates can win the final frozen-test evaluation.**
+   `benchmarks/final_evaluation.py::select_final_candidate` ranks every
+   requested model (baseline or MIL) by CV/development evidence alone; the
+   previous restriction to `CANCER_BASELINES` for the final path is gone.
+3. **The frozen-test guard is now mandatory for every non-synthetic run**
+   (`test_guard.py::default_guard_dir`, `ExperimentContext.
+   guard_identity_fingerprint()`, `runner.py`'s
+   `FrozenTestGuardDisabledInRealModeError`) — a safe default location is
+   derived from the run's own output root, keyed by scientific identity
+   (manifest + preprocessing + label-mapping + config + selected model), not
+   by `run_id`. Disabling it is possible only through an explicit,
+   synthetic-only config/CLI flag.
+4. **Hyperparameter selection is integrated into every outer CV fold.**
+   `hyperparameter_search.py::select_nested_hyperparameters_with_refit` runs
+   a real inner grouped-CV — refitting preprocessing from only each inner
+   fold's own training subjects — inside every outer fold of
+   `cross_validation.py::run_smoke_cv`/`run_cancer_cv`, for classical
+   baselines on both tasks and, via small bounded fixed candidate sets, for
+   the neural/MIL models too.
+5. **The final development/fit/calibration protocol now uses the whole
+   train+val pool correctly**, replacing the previous "final model fit on
+   train only, calibrated on val only" split:
+   `final_evaluation.generate_subject_oof_predictions` produces
+   subject-grouped out-of-fold predictions across the WHOLE development
+   pool (each OOF subject predicted by a fold-refit model that never saw
+   it); calibration/threshold are fit exclusively from those OOF
+   predictions; `final_evaluation.refit_final_candidate_on_dev_pool` then
+   fits ONE final preprocessing artifact and model on all development
+   subjects (using the already-selected configuration, never reselected)
+   before the single guarded test evaluation.
+
+Full list of what's fixed vs. still open: README's Benchmarking framework
 section.

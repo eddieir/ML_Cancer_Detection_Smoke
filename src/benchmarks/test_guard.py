@@ -31,6 +31,27 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 
+def default_guard_dir(output_root: Union[str, Path]) -> Path:
+    """
+    Safe default guard location derived purely from the immutable output
+    root every run already has to supply — used whenever a real (non-
+    synthetic) run does not explicitly configure
+    benchmarks.frozen_test_guard_dir. Guard files here are keyed by
+    ExperimentContext.guard_identity_fingerprint(), not by run_id, so this
+    directory can safely be shared by every run against the same output
+    root: two runs with different --run-id but identical scientific
+    identity (manifest/preprocessing/label-mapping/config/selected model)
+    still collide on the same guard file — see runner.py.
+    """
+    return Path(output_root) / ".frozen_test_guards"
+
+
+class FrozenTestGuardDisabledInRealModeError(RuntimeError):
+    """Raised when a real (non-synthetic) run's configuration attempts to
+    disable the durable frozen-test guard — never permitted, regardless of
+    how the request is phrased in config."""
+
+
 class FrozenTestAlreadyEvaluatedError(RuntimeError):
     """Raised when a guard file already records a completed frozen-test run."""
 

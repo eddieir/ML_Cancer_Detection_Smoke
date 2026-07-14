@@ -57,6 +57,20 @@ class PreprocessingArtifact:
     # inference can validate a caller's claimed input_stage against what
     # this artifact can actually consume.
     expected_input_stage:       str = EXPECTED_INPUT_STAGE
+    # SHA-256 of the fixed cell-type label-name -> ID table (constants.py's
+    # CELL_TYPE_MAP) in effect when obs["cell_type_id"] was assigned — see
+    # data/transforms.py::cell_type_map_fingerprint(). None for artifacts fit
+    # before this field existed, or when cell-type annotation never ran
+    # (e.g. pseudo-bulk-only sources). A mismatch on reload means the code's
+    # mapping table changed since this artifact was fit, not that different
+    # cells were annotated.
+    cell_type_map_fingerprint:  Optional[str] = None
+    # "inductive_per_cell" (CellTypist majority_voting=False — a pure
+    # function of each cell's own expression, independent of which other
+    # cells were annotated alongside it) or "majority_voting" (legacy,
+    # dataset-dependent) — see annotate_cell_types(). None if annotation
+    # never ran.
+    cell_type_annotation_mode:  Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -35,7 +35,7 @@ from train import (
     validate_experiment_partitions,
 )
 
-from .baselines import CANCER_BASELINES, SMOKE_BASELINES, positive_class_proba
+from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, SMOKE_SEARCH_SPACE, positive_class_proba
 from .features import build_cancer_subject_features, build_smoke_subject_summary_features, cap_cell_dataset
 from .fold_preprocessing import (
     artifact_fingerprint,
@@ -43,6 +43,7 @@ from .fold_preprocessing import (
     fold_train_val_datasets,
     require_normalized_adata,
 )
+from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
 from .metrics import (
     aggregate_metric,
     aggregate_metric_by_seed,
@@ -53,6 +54,17 @@ from .metrics import (
 from .neural import NeuralCancerAdapter, NeuralSmokeAdapter
 
 DEFAULT_SEEDS = [42, 43, 44]
+
+# Bounded, deterministic neural/MIL config search — deliberately NOT a large
+# hyperparameter grid (section 6: "do not perform a large search... use the
+# current configuration plus at most a small predefined comparison"). Each
+# candidate is compared via the SAME inner-grouped-CV/refit-per-fold
+# machinery as the classical baselines (select_nested_hyperparameters_with_refit).
+NEURAL_SEARCH_SPACE = {"phase1_epochs": [1, 2]}
+MIL_SEARCH_SPACE = {"pretrain_epochs": [1, 2]}
+# Inner CV cost multiplies across outer folds x seeds x candidates x inner
+# folds; kept small since inner folds retrain a real model per candidate.
+DEFAULT_INNER_FOLDS = 2
 
 
 def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelDataset:
@@ -83,6 +95,89 @@ def _majority_label_by_subject(normalized_adata, subjects: Sequence[str], num_cl
         vals = smoke_series[subj_series == str(s)].values
         out[s] = int(np.bincount(vals, minlength=num_classes).argmax())
     return out
+
+
+def _smoke_baseline_fit_score_fn(baseline_cls, num_cell_types: int, num_classes: int):
+    """fit_score_fn for select_nested_hyperparameters_with_refit: fits
+    baseline_cls(**params) on the inner-train fold's own subject-summary
+    features (built from an artifact refit on ONLY that inner fold's train
+    subjects) and scores subject-summary macro-F1 on the inner-val fold."""
+    def fn(params, artifact, inner_train_ds, inner_val_ds, seed):
+        Xtr, ytr, _, _ = build_smoke_subject_summary_features(inner_train_ds, num_cell_types, num_classes)
+        Xva, yva, _, _ = build_smoke_subject_summary_features(inner_val_ds, num_cell_types, num_classes)
+        model = baseline_cls(**params).fit(Xtr, ytr, seed=seed)
+        preds = model.predict(Xva)
+        return full_smoke_metrics_report(yva, preds, num_classes)["macro_f1"]
+    return fn
+
+
+def _neural_smoke_fit_score_fn(context, device: str, num_classes: int, max_cells_per_subject: int):
+    """fit_score_fn variant for the neural adapter: params carries a small
+    config override (e.g. {"phase1_epochs": N}), applied on top of
+    context.config for exactly this candidate's fit."""
+    def fn(params, artifact, inner_train_ds, inner_val_ds, seed):
+        train_capped = cap_cell_dataset(inner_train_ds, max_cells_per_subject, seed=seed)
+        val_capped = cap_cell_dataset(inner_val_ds, max_cells_per_subject, seed=seed)
+        fold_ctx = _fold_context(context, artifact, train_capped, val_capped)
+        # dataclasses.replace only shallow-copies the dataclass itself — the
+        # nested config dict is still the SAME object as context.config, so
+        # this candidate's override must go into a fresh dict, never mutate
+        # the shared one in place (which would leak into other candidates).
+        overridden_config = dict(fold_ctx.config)
+        overridden_config["train"] = dict(overridden_config.get("train", {}), **params)
+        fold_ctx.config = overridden_config
+        adapter = NeuralSmokeAdapter(fold_ctx.config, device=device)
+        adapter.fit(fold_ctx, train_capped, val_capped, seed=seed)
+        preds = adapter.predict(val_capped)
+        return full_smoke_metrics_report(val_capped.smoke.numpy(), preds, num_classes)["macro_f1"]
+    return fn
+
+
+def _auroc_or_none(y_val: np.ndarray, prob_val: np.ndarray) -> Optional[float]:
+    """AUROC, or None (never 0.5) when the validation rows carry only one
+    class — a real, expected outcome of small inner/outer CV folds."""
+    if len(set(np.asarray(y_val).tolist())) < 2:
+        return None
+    from sklearn.metrics import roc_auc_score
+    return roc_auc_score(y_val, prob_val)
+
+
+def _cancer_baseline_fit_score_fn(baseline_cls, num_cell_types: int, outcomes_by_subject: dict, min_cells: int):
+    def fn(params, artifact, inner_train_ds, inner_val_ds, seed):
+        train_bags = bags_from_fold_cell_dataset(inner_train_ds, outcomes_by_subject, min_cells)
+        val_bags = bags_from_fold_cell_dataset(inner_val_ds, outcomes_by_subject, min_cells)
+        if not train_bags or not val_bags:
+            return None
+        Xtr, ytr, _, _ = build_cancer_subject_features(train_bags, num_cell_types)
+        Xva, yva, _, _ = build_cancer_subject_features(val_bags, num_cell_types)
+        model = baseline_cls(**params).fit(Xtr, ytr, seed=seed)
+        return _auroc_or_none(yva, positive_class_proba(model, Xva))
+    return fn
+
+
+def _mil_fit_score_fn(context, pooling: str, device: str, outcomes_by_subject: dict, min_cells: int):
+    def fn(params, artifact, inner_train_ds, inner_val_ds, seed):
+        train_bags = bags_from_fold_cell_dataset(inner_train_ds, outcomes_by_subject, min_cells)
+        val_bags = bags_from_fold_cell_dataset(inner_val_ds, outcomes_by_subject, min_cells)
+        if not train_bags or not val_bags:
+            return None
+        train_sd = SubjectLevelDataset(train_bags)
+        val_sd = SubjectLevelDataset(val_bags)
+        try:
+            validate_experiment_partitions(
+                train_cell_dataset=inner_train_ds, val_cell_dataset=inner_val_ds,
+                train_subject_dataset=train_sd, val_subject_dataset=val_sd,
+            )
+            fold_ctx = _fold_context(context, artifact, inner_train_ds, inner_val_ds)
+            adapter = NeuralCancerAdapter(pooling=pooling, device=device)
+            adapter.fit(fold_ctx, inner_train_ds, inner_val_ds, train_sd, val_sd,
+                        seed=seed, pretrain_epochs=params.get("pretrain_epochs"))
+            proba = adapter.predict_proba(val_sd)
+            y_val_ordered = np.array([b["cancer_label"] for b in val_sd.bags])
+            return _auroc_or_none(y_val_ordered, proba)
+        except MILEligibilityError:
+            return None
+    return fn
 
 
 def _fold_context(context, artifact, train_cell_dataset, val_cell_dataset):
@@ -144,7 +239,22 @@ def run_smoke_cv(
                     # seed — same fold + same seed always keeps the same cells.
                     train_ds_capped = cap_cell_dataset(train_ds, max_cells_per_subject, seed=seed)
                     val_ds_capped = cap_cell_dataset(val_ds, max_cells_per_subject, seed=seed)
+
+                    # Bounded, deterministic config search (section 6) —
+                    # inner-CV selected ENTIRELY from this outer fold's own
+                    # training subjects (fold["train"]), each inner candidate
+                    # refitting its own preprocessing artifact from only its
+                    # inner-train subjects (select_nested_hyperparameters_with_refit).
+                    neural_hp = select_nested_hyperparameters_with_refit(
+                        context, fold["train"], label_by_subject,
+                        build_param_grid(NEURAL_SEARCH_SPACE),
+                        fit_score_fn=_neural_smoke_fit_score_fn(context, device, num_classes, max_cells_per_subject),
+                        seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                    )
                     fold_context = _fold_context(context, artifact, train_ds_capped, val_ds_capped)
+                    selected_config = dict(fold_context.config)
+                    selected_config["train"] = dict(selected_config.get("train", {}), **neural_hp["selected_params"])
+                    fold_context.config = selected_config
                     adapter = NeuralSmokeAdapter(fold_context.config, device=device)
                     adapter.fit(fold_context, train_ds_capped, val_ds_capped, seed=seed)
                     preds = adapter.predict(val_ds_capped)
@@ -153,12 +263,23 @@ def run_smoke_cv(
                         val_ds_capped.smoke.numpy(), preds, val_ds_capped.subject_ids, num_classes,
                     )
                     fold_record["hyperparameters"] = adapter.metadata()
+                    fold_record["hyperparameter_search"] = neural_hp
                     fold_record["feature_mode"] = "cell_capped"
                     fold_record["max_cells_per_subject"] = max_cells_per_subject
                     fold_record["n_cells_before_cap"] = {"train": len(train_ds), "val": len(val_ds)}
                     fold_record["n_cells_after_cap"] = {"train": len(train_ds_capped), "val": len(val_ds_capped)}
                 else:
-                    model = SMOKE_BASELINES[name]()
+                    # Nested, leakage-free hyperparameter selection ENTIRELY
+                    # from this outer fold's own training subjects — never
+                    # this fold's val subjects, never any other fold's or the
+                    # outer context's val/test subjects (blocker 4).
+                    hp_search = select_nested_hyperparameters_with_refit(
+                        context, fold["train"], label_by_subject,
+                        build_param_grid(SMOKE_SEARCH_SPACE.get(name, {})),
+                        fit_score_fn=_smoke_baseline_fit_score_fn(SMOKE_BASELINES[name], num_cell_types, num_classes),
+                        seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                    )
+                    model = SMOKE_BASELINES[name](**hp_search["selected_params"])
                     model.fit(Xtr, ytr, seed=seed)
                     preds = model.predict(Xva)
                     cell_report = full_smoke_metrics_report(yva, preds, num_classes)
@@ -167,6 +288,7 @@ def run_smoke_cv(
                     # prediction to weight), never claimed equal to subject-weighted.
                     subj_report = cell_report
                     fold_record["hyperparameters"] = model.metadata()
+                    fold_record["hyperparameter_search"] = hp_search
                     fold_record["evaluation_mode"] = "subject_summary"
                     fold_record["feature_mode"] = "subject_summary"
 
@@ -249,11 +371,22 @@ def run_cancer_cv(
             Xva, yva, _, _ = build_cancer_subject_features(val_bags_fold, num_cell_types)
 
             for name in baseline_names:
-                model = CANCER_BASELINES[name]()
+                # Nested selection ENTIRELY from this outer fold's own
+                # training subjects (fold["train"]) — never fold["val"],
+                # never any other fold's or the outer val/test subjects.
+                hp_search = select_nested_hyperparameters_with_refit(
+                    context, fold["train"], outcomes_by_subject,
+                    build_param_grid(CANCER_SEARCH_SPACE.get(name, {})),
+                    fit_score_fn=_cancer_baseline_fit_score_fn(CANCER_BASELINES[name], num_cell_types,
+                                                                outcomes_by_subject, min_cells),
+                    seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                )
+                model = CANCER_BASELINES[name](**hp_search["selected_params"])
                 model.fit(Xtr, ytr, seed=seed)
                 proba = positive_class_proba(model, Xva)
                 report = cancer_prediction_metrics(yva, proba)
                 report.update({"seed": seed, "fold": fold_idx, "hyperparameters": model.metadata(),
+                               "hyperparameter_search": hp_search,
                                "preprocessing_fingerprint": fp, "train_classes_present": sorted(set(ytr.tolist()))})
                 results[name]["folds"].append(report)
 
@@ -265,16 +398,24 @@ def run_cancer_cv(
                         train_cell_dataset=train_cell_ds, val_cell_dataset=val_cell_ds,
                         train_subject_dataset=train_sd, val_subject_dataset=val_sd,
                     )
+                    mil_hp = select_nested_hyperparameters_with_refit(
+                        context, fold["train"], outcomes_by_subject,
+                        build_param_grid(MIL_SEARCH_SPACE),
+                        fit_score_fn=_mil_fit_score_fn(context, pooling_for[name], device, outcomes_by_subject, min_cells),
+                        seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                    )
                     fold_context = _fold_context(context, artifact, train_cell_ds, val_cell_ds)
                     adapter = NeuralCancerAdapter(pooling=pooling_for[name], device=device)
                     adapter.fit(
                         fold_context, train_cell_ds, val_cell_ds,
-                        train_sd, val_sd, seed=seed, pretrain_epochs=2,
+                        train_sd, val_sd, seed=seed,
+                        pretrain_epochs=mil_hp["selected_params"].get("pretrain_epochs", 2),
                     )
                     proba = adapter.predict_proba(val_sd)
                     y_val_ordered = np.array([b["cancer_label"] for b in val_sd.bags])
                     report = cancer_prediction_metrics(y_val_ordered, proba)
                     report.update({"seed": seed, "fold": fold_idx, "hyperparameters": adapter.metadata(),
+                                   "hyperparameter_search": mil_hp,
                                    "preprocessing_fingerprint": fp})
                 except MILEligibilityError as e:
                     # A fold this small failing MIL eligibility (see

@@ -190,8 +190,50 @@ def batch_correct(adata: ad.AnnData, batch_key: str = "batch") -> ad.AnnData:
     return adata
 
 
-def annotate_cell_types(adata: ad.AnnData) -> ad.AnnData:
-    """CellTypist majority-vote → coarse 4-class cell_type_id."""
+def cell_type_map_fingerprint() -> str:
+    """
+    SHA-256 of the fixed CELL_TYPE_MAP label-name -> ID table (constants.py),
+    so a checkpoint/artifact can record and later verify exactly which
+    mapping produced its cell_type_id column. The map itself is a static
+    dict, never built from data (held-out frequency/order never enters it),
+    so this fingerprint is the same for any run of this codebase — a
+    mismatch on reload means the code's mapping table itself changed, not
+    that different cells were annotated.
+    """
+    import hashlib
+    import json
+    from constants import CELL_TYPE_MAP
+    blob = json.dumps(CELL_TYPE_MAP, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def annotate_cell_types(adata: ad.AnnData, majority_voting: bool = False) -> ad.AnnData:
+    """
+    CellTypist per-cell prediction -> coarse 4-class cell_type_id.
+
+    majority_voting defaults to False (INDUCTIVE): CellTypist's
+    majority_voting=True mode over-clusters the supplied cells and
+    replaces each cell's raw prediction with its cluster's majority label —
+    a step whose output for a given cell depends on which OTHER cells are
+    present in the same call. Running it once over train+val+test cells (as
+    this pipeline used to) therefore lets held-out validation/test cells
+    change a training cell's annotation, and reannotating a different
+    subject subset per CV fold would silently reassign cell_type_id for
+    cells that didn't change at all.
+
+    majority_voting=False instead returns CellTypist's raw per-cell
+    prediction from the fixed pretrained model: a pure function of that
+    cell's own expression vector, independent of any other cell supplied in
+    the same call. A cell's annotation is therefore identical whether it is
+    annotated alone, with its own split, or with the full merged dataset —
+    the property every fold/OOD reconstruction in benchmarks/ depends on.
+    This is CellTypist's own default (majority_voting=False); this pipeline
+    previously opted OUT of that default by passing majority_voting=True.
+
+    The label-name -> ID table (CELL_TYPE_MAP) is a fixed dict in
+    constants.py, never built from this dataset's label frequency/order —
+    see cell_type_map_fingerprint() for the persisted proof of that.
+    """
     from constants import CELL_TYPE_MAP
     if adata.obs["is_pseudo_bulk"].all():
         print("[transform] celltypist skipped for pseudo-bulk")
@@ -207,14 +249,22 @@ def annotate_cell_types(adata: ad.AnnData) -> ad.AnnData:
             ct_input.X = adata.layers["lognorm"]
 
         model = models.Model.load(model="Immune_All_Low.pkl")
-        pred  = celltypist.annotate(ct_input, model=model, majority_voting=True)
-        adata.obs["cell_type_name"] = pred.predicted_labels.majority_voting.values
+        pred  = celltypist.annotate(ct_input, model=model, majority_voting=majority_voting)
+        labels = (
+            pred.predicted_labels.majority_voting
+            if majority_voting else
+            pred.predicted_labels.predicted_labels
+        )
+        adata.obs["cell_type_name"] = labels.values
         adata.obs["cell_type_id"]   = (
             adata.obs["cell_type_name"]
             .map(lambda c: CELL_TYPE_MAP.get(c, 0))
             .astype(int)
         )
-        print(f"[transform] celltypist  {adata.n_obs:,} cells annotated")
+        adata.uns["cell_type_map_fingerprint"] = cell_type_map_fingerprint()
+        adata.uns["cell_type_annotation_mode"] = "majority_voting" if majority_voting else "inductive_per_cell"
+        print(f"[transform] celltypist  {adata.n_obs:,} cells annotated "
+              f"({'majority_voting' if majority_voting else 'inductive per-cell'})")
     except Exception as e:
         print(f"[transform] celltypist failed ({e}) — defaulting to epithelial")
     return adata

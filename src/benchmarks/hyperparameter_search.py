@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import numpy as np
 
 from data.splitting import grouped_kfold
+from .fold_preprocessing import fold_train_val_datasets
 
 
 def build_param_grid(search_space: Dict[str, Sequence]) -> List[Dict]:
@@ -110,4 +111,88 @@ def select_hyperparameters_nested(
     return {
         "no_search_space": False, "selected_params": best["params"], "candidates": results,
         "seed": seed, "n_inner_folds": n_inner_folds,
+    }
+
+
+def select_nested_hyperparameters_with_refit(
+    context, outer_train_subjects: Sequence[str], label_by_subject: Dict[str, int],
+    candidates: List[Dict], fit_score_fn: Callable[[Dict, object, "object", "object", int], Optional[float]],
+    seed: int = 42, n_inner_folds: int = 3, n_hvgs: Optional[int] = None,
+) -> Dict:
+    """
+    Context-aware nested hyperparameter/config selection: subdivides
+    outer_train_subjects into INNER grouped folds and, for every inner fold,
+    refits a fresh PreprocessingArtifact using ONLY that inner fold's own
+    training subjects (via fold_preprocessing.fold_train_val_datasets) before
+    scoring a candidate — so an inner-validation subject's expression never
+    influences the scaling/HVG selection its own held-out score is computed
+    from. This is stricter than select_hyperparameters_nested above (which
+    takes pre-built X/y and therefore inherits whatever artifact built them,
+    typically the OUTER fold's — a real, if one-level-deeper, leakage path).
+
+    candidates: an explicit list of hyperparameter/config dicts (build one
+    with build_param_grid() for a classical sklearn search space, or pass a
+    small fixed list directly for a neural/MIL config comparison — this
+    function has no opinion about what a "candidate" trains).
+
+    fit_score_fn(params, artifact, inner_train_cell_dataset,
+    inner_val_cell_dataset, seed) -> float | None. Owns fitting whatever
+    model `params` describes on the inner-train side and scoring it on the
+    inner-val side; returning None marks that inner fold undefined for this
+    candidate (excluded from its mean, never coerced to a filler value).
+
+    An empty `candidates` list means the model has no tunable configuration
+    — recorded as {"no_search_space": True}, never silently skipped.
+    """
+    if not candidates:
+        return {
+            "no_search_space": True, "selected_params": {}, "candidates": [],
+            "inner_folds": [], "seed": seed, "n_inner_folds": n_inner_folds,
+        }
+
+    subj = np.array(sorted({str(s) for s in outer_train_subjects}))
+    y = np.array([label_by_subject[s] for s in subj])
+    try:
+        inner_folds = grouped_kfold(subj, y, n_folds=n_inner_folds, seed=seed)
+    except ValueError as e:
+        return {
+            "no_search_space": False, "selected_params": candidates[0], "candidates": [],
+            "inner_folds": [], "seed": seed, "n_inner_folds": n_inner_folds,
+            "note": f"inner grouped_kfold unavailable ({e}) — defaulting to the first "
+                    "declared candidate, NOT selected by inner-CV evidence.",
+        }
+
+    inner_fold_meta = [
+        {"train": sorted(str(s) for s in f["train"]), "val": sorted(str(s) for s in f["val"])}
+        for f in inner_folds
+    ]
+
+    results = []
+    for params in candidates:
+        fold_scores = []
+        for f in inner_folds:
+            artifact, train_ds, val_ds = fold_train_val_datasets(context, f["train"], f["val"], n_hvgs=n_hvgs)
+            if len(train_ds) == 0 or len(val_ds) == 0:
+                continue
+            score = fit_score_fn(params, artifact, train_ds, val_ds, seed)
+            if score is not None:
+                fold_scores.append(float(score))
+        results.append({
+            "params": params, "inner_scores": fold_scores,
+            "inner_score_mean": float(np.mean(fold_scores)) if fold_scores else None,
+        })
+
+    scored = [r for r in results if r["inner_score_mean"] is not None]
+    if not scored:
+        return {
+            "no_search_space": False, "selected_params": candidates[0], "candidates": results,
+            "inner_folds": inner_fold_meta, "seed": seed, "n_inner_folds": n_inner_folds,
+            "note": "no candidate produced a defined inner score on any inner fold — "
+                    "defaulting to the first declared candidate, NOT selected by evidence.",
+        }
+
+    best = max(scored, key=lambda r: r["inner_score_mean"])
+    return {
+        "no_search_space": False, "selected_params": best["params"], "candidates": results,
+        "inner_folds": inner_fold_meta, "seed": seed, "n_inner_folds": n_inner_folds,
     }

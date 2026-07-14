@@ -229,6 +229,26 @@ class ExperimentContext:
             "config_fingerprint": self.config_fingerprint,
         }
 
+    def guard_identity_fingerprint(self, selected_model: str) -> str:
+        """
+        SHA-256 identity key for the durable frozen-test guard (see
+        test_guard.py): manifest + preprocessing + label-mapping +
+        configuration + the selected final model, combined. Deliberately
+        independent of any run_id/run_dir name — two runs given DIFFERENT
+        output directory names but the SAME underlying data/config/model
+        selection must resolve to the SAME guard identity, so a fresh
+        `--run-id` cannot be used to bypass the one-time test-evaluation
+        guard for scientifically identical conditions.
+        """
+        blob = json.dumps({
+            "split_manifest_fingerprint": self.split_manifest.fingerprint,
+            "preprocessing_artifact_fingerprint": self.preprocessing_artifact_fingerprint,
+            "label_mapping_fingerprint": self.label_mapping_fingerprint,
+            "config_fingerprint": self.config_fingerprint,
+            "selected_model": selected_model,
+        }, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
     def validate_run_identity(self, expected: Dict[str, Optional[str]]) -> None:
         """
         Recompute this context's own run_identity() and compare field-by-
