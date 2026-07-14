@@ -138,9 +138,80 @@ def new_run_dir(base_dir: str = "artifacts/benchmarks", run_id: Optional[str] = 
     path = Path(base_dir) / run_id
     if path.exists():
         raise FileExistsError(f"Run directory {path} already exists — run_ids must be immutable/unique.")
-    for sub in ("predictions", "metrics", "calibration"):
+    for sub in ("predictions", "metrics", "calibration", "preprocessing", "models"):
         (path / sub).mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _environment_snapshot(synthetic: bool) -> dict:
+    """Records the facts a reproducibility artifact needs to judge whether
+    a run can be repeated/compared: interpreter/platform identity, the
+    exact versions of every scientific dependency whose behavior could
+    affect results (never guessed — each is looked up via
+    importlib.metadata, and a package that isn't installed is recorded as
+    None rather than silently omitted), the git SHA this code ran at, and
+    whether the working tree was dirty at run time (best-effort — `git
+    status` may be unavailable outside a git checkout, e.g. an extracted
+    release tarball)."""
+    import importlib.metadata
+    import platform
+    import subprocess
+    import sys as _sys
+
+    def _version(pkg: str):
+        try:
+            return importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    git_sha = get_git_sha()
+    git_dirty = None
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=Path(__file__).parents[2],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        git_dirty = bool(status.strip())
+    except Exception:
+        pass
+
+    return {
+        "python_version": _sys.version,
+        "platform": platform.platform(),
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "synthetic": synthetic,
+        "package_versions": {
+            pkg: _version(pkg) for pkg in (
+                "numpy", "pandas", "scipy", "scikit-learn", "torch", "scanpy",
+                "anndata", "celltypist", "harmonypy", "pytest",
+            )
+        },
+    }
+
+
+def write_environment_artifact(run_dir: Path, synthetic: bool) -> dict:
+    """Writes environment.json (see _environment_snapshot) and returns the
+    same dict so a caller can cross-reference it (e.g. embed the git_sha in
+    run_manifest.json) without re-deriving it."""
+    snapshot = _environment_snapshot(synthetic)
+    write_json(run_dir / "environment.json", snapshot)
+    return snapshot
+
+
+def write_preprocessing_artifact_record(run_dir: Path, context) -> None:
+    """Writes preprocessing/final_artifact.json: the full, reloadable
+    PreprocessingArtifact this run's outer split used (gene list/scaling,
+    cell-type annotation provenance and CellTypist/scikit-learn
+    compatibility — see data/preprocessing.py::PreprocessingArtifact),
+    cross-referenced with its own fingerprint so a later reload can verify
+    it is looking at the artifact this run actually used, not a
+    similar-but-different one."""
+    record = {
+        "artifact": context.preprocessing_artifact.to_dict(),
+        "artifact_fingerprint": context.preprocessing_artifact_fingerprint,
+    }
+    write_json(run_dir / "preprocessing" / "final_artifact.json", record)
 
 
 def write_json(path: Path, obj) -> None:
@@ -262,6 +333,8 @@ def write_benchmark_report(
     comparisons: List[Dict], calibration_report: Optional[Dict] = None, synthetic: bool = False,
 ) -> None:
     write_json(run_dir / "run_manifest.json", run_manifest)
+    write_environment_artifact(run_dir, synthetic)
+    write_preprocessing_artifact_record(run_dir, context)
     write_json(run_dir / "eligibility.json", {k: v.to_dict() if hasattr(v, "to_dict") else v
                                                for k, v in eligibility.items()})
     write_json(run_dir / "comparisons.json", comparisons)

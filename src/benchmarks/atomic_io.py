@@ -91,6 +91,60 @@ def atomic_write_bytes(path: Union[str, Path], data: bytes) -> None:
         pass
 
 
+def exclusive_create_bytes(path: Union[str, Path], data: bytes, mode: int = 0o644) -> None:
+    """Atomically CREATE `path` (fails with FileExistsError if it already
+    exists — this is create-if-absent ownership acquisition, not a
+    replace-if-present write) and durably persist every byte of `data`
+    before it becomes visible under `path` at all.
+
+    Writing `data` directly into an `O_CREAT | O_EXCL`-opened `path` would
+    leave a window — between the open() succeeding and the write/fsync
+    completing — during which `path` exists but holds truncated content; a
+    concurrent reader checking "does this exist" in that window would see a
+    corrupt file, not a clean not-yet-created one. To avoid that window
+    entirely, the full payload is first written and fsynced to a uniquely
+    named temp file in the same directory, and only then linked into `path`
+    via `os.link()` — a hard link is a single atomic filesystem operation
+    that fails with `FileExistsError` if `path` already exists (giving the
+    same race-free create-if-absent guarantee as `O_CREAT | O_EXCL`), and
+    the instant it succeeds, `path` refers to content that was already
+    complete and durable. The temp file is always removed afterward — since
+    it is a second hard link to the same inode as `path` once linking
+    succeeds, deleting it never touches `path`'s content.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _temp_path(path)
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    try:
+        try:
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        os.link(str(tmp), str(path))
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, AttributeError):
+        pass
+
+
 def atomic_write_json(path: Union[str, Path], obj) -> None:
     atomic_write_bytes(path, json.dumps(obj, indent=2, default=str).encode("utf-8"))
 

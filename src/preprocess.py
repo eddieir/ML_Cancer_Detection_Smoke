@@ -370,12 +370,10 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT),
     )
     artifact.label_mapping = label_mapping.to_dict()
-    # Persist which fixed label-name -> ID table produced obs["cell_type_id"]
-    # (set by annotate_cell_types above), so a checkpoint/report can verify
-    # on reload that its cell-type IDs mean the same thing this run's did.
-    artifact.cell_type_map_fingerprint = merged.uns.get("cell_type_map_fingerprint")
-    artifact.cell_type_annotation_mode = merged.uns.get("cell_type_annotation_mode")
-    artifact.cell_type_annotation_degraded = merged.uns.get("cell_type_annotation_degraded")
+    # Cell-type annotation provenance (which fixed label-name -> ID table
+    # produced obs["cell_type_id"], set by annotate_cell_types above) is
+    # already copied onto `artifact` by fit_preprocessing() itself, straight
+    # from `merged.uns` — see data/preprocessing.py::fit_preprocessing.
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────

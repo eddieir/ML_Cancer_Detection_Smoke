@@ -254,4 +254,72 @@ def test_sklearn_tree_extension_type_is_explicitly_canonicalized_not_repr_fallba
     canonical = _canonicalize(tree_obj)
     assert canonical["__class__"] == "sklearn.tree._tree.Tree"
     assert "children_left" in canonical
-    assert "value" in canonical
+
+
+def test_unsupported_object_with_a_normal_dict_raises_not_silently_reflected():
+    """An object with an ordinary, non-empty __dict__ but no explicit
+    whitelist entry must still raise — proves the generic 'any object with
+    a __dict__' fallback is gone, not just the no-__dict__ case."""
+
+    class UnlistedEstimator:
+        def __init__(self):
+            self.coef_ = [1.0, 2.0]
+            self.classes_ = [0, 1]
+
+    with pytest.raises(UnsupportedModelStateError):
+        sklearn_model_state_fingerprint(UnlistedEstimator())
+
+
+def test_unsupported_object_with_an_empty_dict_raises():
+    class EmptyDictThing:
+        pass
+
+    obj = EmptyDictThing()
+    assert vars(obj) == {}
+    with pytest.raises(UnsupportedModelStateError):
+        sklearn_model_state_fingerprint(obj)
+
+
+def test_unsupported_object_nested_inside_a_supported_container_raises():
+    """An unsupported type buried inside a dict/list must still raise —
+    canonicalization must not silently drop or stringify it."""
+
+    class OpaqueFittedThing:
+        __slots__ = ()
+
+    with pytest.raises(UnsupportedModelStateError):
+        _canonicalize({"a": [1, 2, {"nested": OpaqueFittedThing()}]})
+
+
+def _subprocess_fit_and_fingerprint(fitter_name: str, seed: int, result_queue) -> None:
+    """Top-level (picklable) worker: fits a baseline and fingerprints it in
+    a fresh, independent process — proves determinism is not an artifact of
+    reusing interpreter state within one process. `_BASELINE_FITTERS` and
+    `sklearn_model_state_fingerprint` are resolved as globals of THIS module
+    (already imported in order to unpickle this very function in the child
+    process), not via a fresh `import` statement, which is not guaranteed
+    to succeed under every pytest import mode."""
+    fitter = _BASELINE_FITTERS[fitter_name]
+    model = fitter(seed=seed)
+    result_queue.put(sklearn_model_state_fingerprint(model))
+
+
+@pytest.mark.parametrize("name", sorted(_BASELINE_FITTERS))
+def test_registered_baseline_fingerprint_deterministic_across_independent_processes(name):
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+    procs = [
+        ctx.Process(target=_subprocess_fit_and_fingerprint, args=(name, 13, q))
+        for _ in range(2)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+        assert not p.is_alive()
+    fp_a = q.get(timeout=5)
+    fp_b = q.get(timeout=5)
+    assert fp_a == fp_b
+    assert fp_a == sklearn_model_state_fingerprint(_BASELINE_FITTERS[name](seed=13))

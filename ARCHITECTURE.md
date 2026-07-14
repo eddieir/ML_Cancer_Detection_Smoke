@@ -887,5 +887,55 @@ framework section for the full list):
    turns it into `CellTypistCompatibilityError` for callers who want to
    enforce matching versions. The warning itself is never suppressed.
 
+An eighth pass closed six further problems (see README's Benchmarking
+framework section for the full list):
+
+1. **`FrozenTestGuard.acquire()` no longer risks a truncated guard.** Writing
+   directly into an `O_CREAT | O_EXCL`-opened destination left a window where
+   a concurrent reader could see an existing-but-incomplete guard file. It
+   now writes the full payload to a temp file, fsyncs it, then atomically
+   `os.link()`s it into place — the destination only ever appears fully
+   formed. A real multiprocess race test (six `spawn`-context processes)
+   proves exactly one winner. Corrupted guard JSON now raises
+   `FrozenTestGuardCorruptedError` rather than being treated as absent.
+2. **`model_fingerprint.py`'s last generic `__dict__` fallback removed**,
+   replaced with an explicit whitelist (`LogisticRegression`,
+   `StandardScaler`, `RandomForestClassifier`, `MLPClassifier`,
+   `DecisionTreeClassifier`, plus the previously-added `Tree`/
+   `TreePredictor`/`HistGradientBoostingClassifier`/`DummyClassifier`
+   branches). Tightening it surfaced a second real bug:
+   `HistGradientBoostingClassifier._bin_mapper` was silently falling through
+   the old fallback. Anything else now raises `UnsupportedModelStateError`;
+   determinism is tested across independent OS processes, not just repeated
+   in-process calls.
+3. **Strict cell-type provenance validation.** The historical
+   `getattr(artifact, "cell_type_annotation_degraded", False)` check treated
+   a *missing* provenance field as safe. `data/preprocessing.py::
+   validate_cell_type_provenance` now requires `degraded is False` exactly,
+   `mode` in an explicit allow-list (`inductive_per_cell` or the new
+   `pseudo_bulk_no_cell_type_identity`), and — for `inductive_per_cell` — a
+   well-formed fingerprint matching the current `CELL_TYPE_MAP` exactly.
+   `fit_preprocessing()` now propagates these fields from `adata.uns` onto
+   every artifact it produces, closing a gap where per-fold/per-OOD refits
+   (`fold_preprocessing.py`) previously produced artifacts with unset
+   provenance regardless of the outer artifact's real state.
+4. **CellTypist/scikit-learn compatibility provenance persisted.**
+   `cell_type_annotation_compatibility` (celltypist version, model name,
+   runtime/serialized sklearn versions, a `compatible` boolean) is now
+   recorded on the AnnData and propagated onto every `PreprocessingArtifact`.
+   The default warn-vs-fail policy from the sixth pass is unchanged — making
+   a real run fail closed on this mismatch by default remains open (see
+   README's limitations).
+5. **CI dependency installation reproducibility.** `requirements.txt` was
+   documented as "exact versions" while its entries are lower bounds. A new
+   `constraints-ci.txt` pins the exact Linux/Python-3.11 combination CI is
+   validated against; the workflow installs via
+   `pip install -r requirements.txt -c constraints-ci.txt`, pins
+   Python 3.11.15, and records dependency versions in the CI log.
+6. **CI workflow triggers fixed** (was hardcoded to a since-abandoned
+   feature-branch name) and **new reproducibility artifacts**
+   (`environment.json`, `preprocessing/final_artifact.json`) added to every
+   run directory.
+
 Full list of what's fixed vs. still open: README's Benchmarking framework
 section.

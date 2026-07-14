@@ -31,7 +31,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from .atomic_io import atomic_write_json
+from .atomic_io import atomic_write_json, exclusive_create_bytes
 
 
 def default_guard_dir(output_root: Union[str, Path]) -> Path:
@@ -72,6 +72,16 @@ class FrozenTestGuardOwnershipError(RuntimeError):
     finalizing a guard it never legitimately owned."""
 
 
+class FrozenTestGuardCorruptedError(RuntimeError):
+    """Raised when a guard file exists but does not contain valid, complete
+    JSON. Corruption must never be silently treated as "no guard exists" —
+    that would let a truncated/damaged guard be bypassed, re-opening
+    supposedly one-time frozen-test access. Recovery requires a human to
+    inspect the file at `guard_path`, confirm no frozen-test evaluation is
+    genuinely in flight, and explicitly move or delete it before any new
+    attempt can proceed."""
+
+
 class FrozenTestGuard:
     def __init__(self, guard_path: Union[str, Path]):
         self.guard_path = Path(guard_path)
@@ -80,8 +90,18 @@ class FrozenTestGuard:
     def _read(self) -> Optional[Dict]:
         if not self.guard_path.exists():
             return None
-        with open(self.guard_path) as f:
-            return json.load(f)
+        try:
+            with open(self.guard_path) as f:
+                text = f.read()
+            return json.loads(text)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            raise FrozenTestGuardCorruptedError(
+                f"Frozen test guard at {self.guard_path} exists but could not be parsed "
+                f"as valid JSON ({exc!r}). This must not be treated as 'no guard' — doing "
+                "so could silently re-open one-time frozen-test access. Recovery: a human "
+                "must confirm no evaluation is genuinely in flight, then explicitly move "
+                "or delete this file before any new attempt is permitted."
+            ) from exc
 
     def acquire(self, run_identity: Dict, selected_model: Optional[str] = None) -> None:
         """
@@ -136,13 +156,37 @@ class FrozenTestGuard:
         # itself race-free; it is deliberately NOT replaced by the
         # temp-file+os.replace() pattern used for terminal-state updates
         # below, since that pattern is atomic for REPLACING a file, not for
-        # exclusively creating one.
-        fd = os.open(str(self.guard_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        # exclusively creating one. exclusive_create_bytes writes the full
+        # payload to a temp file first (retrying short writes / EINTR,
+        # rejecting zero-progress) and fsyncs it, THEN atomically links it
+        # into self.guard_path — so self.guard_path never exists in a
+        # partially-written state a concurrent reader could observe, and a
+        # crash mid-write only ever leaves behind an orphaned temp file
+        # (cleaned up), never a truncated guard reserving this identity. If
+        # the final link fails (FileExistsError — another process won the
+        # acquisition race), the guard path is untouched.
+        payload_bytes = json.dumps(payload, indent=2).encode("utf-8")
         try:
-            os.write(fd, json.dumps(payload, indent=2).encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            exclusive_create_bytes(self.guard_path, payload_bytes)
+        except FileExistsError:
+            # Another process won the acquisition race between our _read()
+            # check above and this write — re-read to report the real
+            # reason, exactly as if we had observed it in the initial check.
+            existing = self._read()
+            status = existing.get("status") if existing else None
+            if status == "completed":
+                raise FrozenTestAlreadyEvaluatedError(
+                    f"Frozen test guard at {self.guard_path} already records a COMPLETED "
+                    "evaluation (lost acquisition race to another process) — refusing to "
+                    "evaluate the frozen test split again."
+                ) from None
+            raise FrozenTestInProgressError(
+                f"Frozen test guard at {self.guard_path} was created by another process "
+                "during acquisition (lost the acquisition race) — refusing to proceed."
+            ) from None
+        # _owner_token is only set once the payload above is confirmed
+        # durably and completely written — never before, so a failed
+        # acquisition can never be mistaken for a legitimately owned guard.
         self._owner_token = token
 
     def _require_ownership(self, existing: Dict) -> None:

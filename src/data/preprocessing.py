@@ -79,6 +79,15 @@ class PreprocessingArtifact:
     # with this set to True (see benchmarks/context.py) — a real run must
     # never silently proceed on degraded cell-type labels.
     cell_type_annotation_degraded: Optional[bool] = None
+    # CellTypist/scikit-learn version-compatibility provenance for this
+    # artifact's cell-type annotation — see data/transforms.py::
+    # _load_celltypist_model_checking_sklearn_compatibility. Keys:
+    # celltypist_version, model_name, runtime_sklearn_version,
+    # serialized_sklearn_versions (list), compatible (bool). None when
+    # annotation never ran (pseudo-bulk) or failed to a diagnostic fallback
+    # before a model could be loaded, or for artifacts fit before this
+    # field existed.
+    cell_type_annotation_compatibility: Optional[Dict] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -166,6 +175,21 @@ def fit_preprocessing(
         smoke_marker_genes_forced=forced,
         fit_n_cells=int(train_mask.sum()),
         fit_n_subjects=len(set(train_adata.obs[subject_col].astype(str))),
+        # Cell-type annotation provenance is a property of `adata.obs`
+        # (annotate_cell_types() ran once, upstream, on the full merged
+        # dataset before any fold/OOD/outer-split refit ever calls this
+        # function) — never re-derived or defaulted here. Every caller of
+        # fit_preprocessing (the outer split in preprocess.py, and every
+        # per-fold/per-OOD-reconstruction refit in
+        # benchmarks/fold_preprocessing.py) passes the SAME `adata` these
+        # fields came from, so propagating them here means a fold-refit
+        # artifact carries the identical, correct provenance the outer
+        # artifact does — closing the gap where a fold refit silently
+        # produced an artifact with unset (None) provenance fields.
+        cell_type_map_fingerprint=adata.uns.get("cell_type_map_fingerprint"),
+        cell_type_annotation_mode=adata.uns.get("cell_type_annotation_mode"),
+        cell_type_annotation_degraded=adata.uns.get("cell_type_annotation_degraded"),
+        cell_type_annotation_compatibility=adata.uns.get("cell_type_annotation_compatibility"),
         notes=[
             "Batch correction (Harmony) is NOT part of this artifact: Harmony has "
             "no native train-only-fit / apply-to-new-data transform, so it cannot "
@@ -215,6 +239,89 @@ def verify_compatible(artifact: PreprocessingArtifact, gene_names) -> None:
             + (" ..." if len(missing) > 10 else "") +
             ". Re-run the same conversion/harmonization pipeline used to fit "
             "this artifact, or refit a new artifact for this gene panel."
+        )
+
+
+class CellTypeProvenanceError(ValueError):
+    """Raised when a PreprocessingArtifact's cell-type annotation provenance
+    is missing, malformed, or records a mode a real (non-synthetic)
+    ExperimentContext must not silently accept. Lives here rather than in
+    benchmarks/context.py to avoid a circular import (data/transforms.py,
+    which defines cell_type_map_fingerprint(), already sits below
+    benchmarks/ in the dependency graph, and this module already owns
+    PreprocessingArtifact itself)."""
+
+
+# The only cell-type annotation modes a real (non-synthetic) pipeline result
+# may carry. "inductive_per_cell" (data/transforms.py::annotate_cell_types,
+# majority_voting=False) requires a matching cell_type_map_fingerprint.
+# "pseudo_bulk_no_cell_type_identity" is the explicit, documented policy for
+# pseudo-bulk sources: CellTypist annotation never runs on pseudo-bulk data
+# (there is no per-cell expression to classify), so no per-cell mapping
+# fingerprint applies — this is a deliberate absence of cell-type identity,
+# not a degraded/failed annotation, and callers requiring real per-cell
+# identity (e.g. a cell-type-aware MIL pooling path) must reject this mode
+# themselves rather than have it silently pass as "the same as annotated".
+# "majority_voting" (dataset-dependent, non-inductive) and
+# "diagnostic_fallback" (every cell given the same placeholder label after
+# CellTypist itself failed) are both real annotation modes that exist in
+# this codebase but are NEVER accepted for a real ExperimentContext.
+_VALID_REAL_CELL_TYPE_ANNOTATION_MODES = frozenset({
+    "inductive_per_cell", "pseudo_bulk_no_cell_type_identity",
+})
+
+
+def validate_cell_type_provenance(artifact: "PreprocessingArtifact") -> None:
+    """
+    Strict, fail-closed validation of a PreprocessingArtifact's cell-type
+    annotation provenance for a REAL (non-synthetic) ExperimentContext.
+    Unlike the historical `getattr(artifact, "cell_type_annotation_degraded",
+    False)` check this replaces, a MISSING provenance field is never treated
+    as "not degraded" / safe — every field below must be explicitly present
+    and valid, or this raises CellTypeProvenanceError.
+    """
+    degraded = artifact.cell_type_annotation_degraded
+    mode = artifact.cell_type_annotation_mode
+    fp = artifact.cell_type_map_fingerprint
+
+    if degraded is not False:
+        raise CellTypeProvenanceError(
+            f"PreprocessingArtifact.cell_type_annotation_degraded must be exactly False "
+            f"for a real pipeline result, got {degraded!r} (missing/None/True are all "
+            "refused — a missing field is never treated as 'not degraded')."
+        )
+    if mode not in _VALID_REAL_CELL_TYPE_ANNOTATION_MODES:
+        raise CellTypeProvenanceError(
+            f"PreprocessingArtifact.cell_type_annotation_mode={mode!r} is not one of the "
+            f"accepted real-run modes {sorted(_VALID_REAL_CELL_TYPE_ANNOTATION_MODES)} — "
+            "missing/None/'majority_voting'/'diagnostic_fallback'/any other mode is refused."
+        )
+    if mode == "inductive_per_cell":
+        if not fp or not isinstance(fp, str) or len(fp) != 64 or any(
+            c not in "0123456789abcdef" for c in fp
+        ):
+            raise CellTypeProvenanceError(
+                f"PreprocessingArtifact.cell_type_map_fingerprint is missing or malformed "
+                f"({fp!r}) for cell_type_annotation_mode='inductive_per_cell' — a real "
+                "per-cell annotation must record a valid 64-character hex SHA-256 "
+                "fingerprint of the mapping table used."
+            )
+        from data.transforms import cell_type_map_fingerprint as _current_cell_type_map_fingerprint
+        expected = _current_cell_type_map_fingerprint()
+        if fp != expected:
+            raise CellTypeProvenanceError(
+                f"PreprocessingArtifact.cell_type_map_fingerprint {fp!r} does not match the "
+                f"current canonical CELL_TYPE_MAP fingerprint {expected!r} — this artifact's "
+                "cell-type annotation was produced under a different mapping table than is "
+                "currently in effect. Re-run preprocessing rather than silently trusting a "
+                "stale mapping; if this is expected (e.g. an intentional constants.py "
+                "change), reprocess and refit a new artifact rather than reusing the old one."
+            )
+    elif mode == "pseudo_bulk_no_cell_type_identity" and fp is not None:
+        raise CellTypeProvenanceError(
+            f"PreprocessingArtifact.cell_type_map_fingerprint must be None for "
+            f"cell_type_annotation_mode='pseudo_bulk_no_cell_type_identity' (no per-cell "
+            f"mapping was ever applied), got {fp!r}."
         )
 
 

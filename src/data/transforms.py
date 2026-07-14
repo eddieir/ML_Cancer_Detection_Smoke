@@ -230,10 +230,20 @@ def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, stric
     pickled and the scikit-learn version installed here. The
     InconsistentVersionWarning sklearn itself raises during unpickling is
     always re-emitted so it still reaches the caller/CI logs exactly as
-    before; strict=True additionally turns it into a hard failure."""
+    before; strict=True additionally turns it into a hard failure.
+
+    Returns (model, compatibility) where `compatibility` is a JSON-safe dict
+    recording every fact needed to judge whether this annotation's results
+    can be treated as scientifically valid on reload — never fabricated,
+    never silently dropped: celltypist_version, model_name,
+    runtime_sklearn_version, serialized_sklearn_versions (one per estimator
+    sklearn warned about, deduplicated), and compatible (False if any
+    InconsistentVersionWarning fired, True if none did)."""
     import os
     import warnings
 
+    import celltypist as _celltypist_pkg
+    import sklearn as _sklearn_pkg
     from celltypist import models
     from sklearn.exceptions import InconsistentVersionWarning
 
@@ -243,6 +253,19 @@ def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, stric
     version_mismatches = [w for w in caught if issubclass(w.category, InconsistentVersionWarning)]
     for w in caught:
         warnings.warn_explicit(w.message, w.category, w.filename or __file__, w.lineno or 0)
+
+    serialized_versions = sorted({
+        getattr(w.message, "original_sklearn_version", None) for w in version_mismatches
+        if getattr(w.message, "original_sklearn_version", None) is not None
+    })
+    compatibility = {
+        "celltypist_version": getattr(_celltypist_pkg, "__version__", None),
+        "model_name": model_name,
+        "runtime_sklearn_version": _sklearn_pkg.__version__,
+        "serialized_sklearn_versions": serialized_versions,
+        "compatible": not version_mismatches,
+    }
+
     if version_mismatches and (strict or os.environ.get("CELLTYPIST_STRICT_SKLEARN_COMPAT") == "1"):
         raise CellTypistCompatibilityError(
             f"CellTypist pretrained model {model_name!r} was unpickled under a "
@@ -252,7 +275,7 @@ def _load_celltypist_model_checking_sklearn_compatibility(model_name: str, stric
             "cannot fix the mismatch itself — it does not control CellTypist's "
             "published model artifact."
         )
-    return model
+    return model, compatibility
 
 
 class CellTypeAnnotationError(RuntimeError):
@@ -322,7 +345,25 @@ def annotate_cell_types(
     """
     from constants import CELL_TYPE_MAP
     if adata.obs["is_pseudo_bulk"].all():
-        print("[transform] celltypist skipped for pseudo-bulk")
+        # Explicit, documented pseudo-bulk policy (never an implicit
+        # "missing provenance defaults to safe"): pseudo-bulk sources have
+        # no per-cell expression for CellTypist to classify, so no
+        # per-cell cell-type mapping is ever applied. This is stamped as
+        # its own distinct, non-degraded mode — deliberately NOT
+        # "inductive_per_cell" (no annotation ran, so no
+        # cell_type_map_fingerprint applies) and NOT "degraded" (this is
+        # an intentional, expected skip, not a CellTypist failure). A
+        # consumer whose model path requires real per-cell cell-type
+        # identity (e.g. cell-type-aware MIL pooling) must reject this
+        # mode itself — data/preprocessing.py::validate_cell_type_provenance
+        # accepts it as valid PROVENANCE, which is a distinct question from
+        # whether a given downstream model can operate without cell-type
+        # identity at all.
+        adata.uns["cell_type_map_fingerprint"] = None
+        adata.uns["cell_type_annotation_mode"] = "pseudo_bulk_no_cell_type_identity"
+        adata.uns["cell_type_annotation_degraded"] = False
+        print("[transform] celltypist skipped for pseudo-bulk "
+              "(cell_type_annotation_mode=pseudo_bulk_no_cell_type_identity)")
         return adata
     try:
         import celltypist
@@ -333,7 +374,7 @@ def annotate_cell_types(
         if "lognorm" in adata.layers:
             ct_input.X = adata.layers["lognorm"]
 
-        model = _load_celltypist_model_checking_sklearn_compatibility(
+        model, compatibility = _load_celltypist_model_checking_sklearn_compatibility(
             "Immune_All_Low.pkl", strict=strict_sklearn_compatibility
         )
         pred  = celltypist.annotate(ct_input, model=model, majority_voting=majority_voting)
@@ -351,6 +392,11 @@ def annotate_cell_types(
         adata.uns["cell_type_map_fingerprint"] = cell_type_map_fingerprint()
         adata.uns["cell_type_annotation_mode"] = "majority_voting" if majority_voting else "inductive_per_cell"
         adata.uns["cell_type_annotation_degraded"] = False
+        # Persisted so a checkpoint/reproducibility artifact can record
+        # exactly which CellTypist/scikit-learn combination produced this
+        # annotation and whether sklearn itself considers it version-
+        # consistent — see _load_celltypist_model_checking_sklearn_compatibility.
+        adata.uns["cell_type_annotation_compatibility"] = compatibility
         print(f"[transform] celltypist  {adata.n_obs:,} cells annotated "
               f"({'majority_voting' if majority_voting else 'inductive per-cell'})")
     except Exception as e:

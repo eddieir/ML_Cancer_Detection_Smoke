@@ -371,3 +371,62 @@ def test_environment_override_enables_strict_compatibility(monkeypatch):
                         var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
     with pytest.raises(CellTypeAnnotationError):
         annotate_cell_types(adata)
+
+
+def test_compatibility_provenance_persisted_for_a_mismatched_model(monkeypatch):
+    """cell_type_annotation_compatibility must record the actual mismatch
+    facts (not a fabricated/omitted value) so a reproducibility artifact can
+    show exactly which CellTypist/scikit-learn combination produced this
+    run's cell-type labels."""
+    import sklearn as _sklearn_pkg
+    from data.transforms import annotate_cell_types
+
+    calls = []
+    _install_version_mismatched_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata)
+    compat = out.uns["cell_type_annotation_compatibility"]
+    assert compat["compatible"] is False
+    assert compat["serialized_sklearn_versions"] == ["0.24.1"]
+    assert compat["runtime_sklearn_version"] == _sklearn_pkg.__version__
+    assert compat["model_name"] == "Immune_All_Low.pkl"
+
+
+def test_compatibility_provenance_persisted_for_a_matching_model(monkeypatch):
+    from data.transforms import annotate_cell_types
+
+    calls = []
+    _install_fake_celltypist(monkeypatch, calls)  # no version-mismatch warning
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata)
+    compat = out.uns["cell_type_annotation_compatibility"]
+    assert compat["compatible"] is True
+    assert compat["serialized_sklearn_versions"] == []
+
+
+def test_compatibility_provenance_round_trips_through_preprocessing_artifact():
+    """fit_preprocessing must copy cell_type_annotation_compatibility from
+    adata.uns onto the PreprocessingArtifact, exactly like the other
+    cell-type provenance fields (see data/preprocessing.py::fit_preprocessing)."""
+    from data.preprocessing import fit_preprocessing
+
+    n, g = 6, 3
+    obs = _obs(n)
+    obs["subject_id"] = [f"s{i}" for i in range(n)]
+    adata = ad.AnnData(X=np.random.rand(n, g).astype("float32"), obs=obs,
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    fake_compat = {
+        "celltypist_version": "1.7.1", "model_name": "Immune_All_Low.pkl",
+        "runtime_sklearn_version": "1.9.0", "serialized_sklearn_versions": ["0.24.1"],
+        "compatible": False,
+    }
+    adata.uns["cell_type_annotation_compatibility"] = fake_compat
+    adata.uns["cell_type_map_fingerprint"] = "a" * 64
+    adata.uns["cell_type_annotation_mode"] = "inductive_per_cell"
+    adata.uns["cell_type_annotation_degraded"] = False
+    artifact = fit_preprocessing(adata, {f"s{i}" for i in range(n)}, n_hvgs=g)
+    assert artifact.cell_type_annotation_compatibility == fake_compat

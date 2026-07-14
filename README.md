@@ -768,6 +768,94 @@ inaccurate — see git history for the exact commits):
   hard `CellTypistCompatibilityError` for anyone who wants to enforce
   matching versions; the warning itself is never suppressed either way.
 
+**Fixed in the eighth pass** (see git history for the exact commits):
+
+- **`FrozenTestGuard.acquire()` no longer risks a truncated guard file.**
+  The previous implementation wrote directly into an `O_CREAT | O_EXCL`
+  destination fd, which left a window — between the exclusive create and the
+  write completing — during which a concurrent reader could observe a
+  guard file that exists but holds truncated/incomplete JSON. It now writes
+  the complete payload to a temp file, fsyncs it, and only then atomically
+  `os.link()`s it into the guard path (`atomic_io.py::exclusive_create_bytes`)
+  — a hard link is a single atomic operation that fails with
+  `FileExistsError` if the destination already exists (the same race-free
+  create-if-absent guarantee `O_CREAT | O_EXCL` gives), and the instant it
+  succeeds the guard path refers to content that was already complete and
+  durable. Malformed/truncated guard JSON now raises a dedicated
+  `FrozenTestGuardCorruptedError` from `_read()` instead of ever being
+  silently treated as "no guard" (which could have re-opened one-time
+  frozen-test access). A real multiprocess acquisition race test (six
+  separate OS processes, `spawn` context) proves exactly one process wins
+  and every loser gets `FrozenTestInProgressError`, never a corrupted-state
+  false negative.
+- **`model_fingerprint.py`'s remaining generic `hasattr(obj, "__dict__")`
+  fallback is gone.** It was still unrestricted — any fitted object with a
+  `__dict__` (even one holding no genuinely fitted state, or fitted state
+  under a non-trailing-underscore name) was silently accepted. Writing
+  tests against the now-explicit whitelist (`LogisticRegression`,
+  `StandardScaler`, `RandomForestClassifier`, `MLPClassifier`,
+  `DecisionTreeClassifier`) surfaced a second real, previously-undetected
+  bug: `HistGradientBoostingClassifier._bin_mapper` (a
+  `sklearn.ensemble._hist_gradient_boosting.binning._BinMapper` holding the
+  actual learned bin thresholds) was also falling through the old generic
+  fallback — now explicitly canonicalized. Any object with a `__dict__` but
+  no whitelist entry, or a `__slots__`-only/empty-`__dict__` object, now
+  raises `UnsupportedModelStateError`; determinism across independent OS
+  processes (not just repeated calls in one process) is tested for every
+  registered baseline.
+- **Real cell-type annotation provenance validation now fails closed.** The
+  previous check (`getattr(artifact, "cell_type_annotation_degraded",
+  False)`) treated a *missing* provenance field as "not degraded" — safe by
+  accident, not by design. `data/preprocessing.py::validate_cell_type_provenance`
+  now requires all three provenance fields to be explicitly present and
+  valid: `cell_type_annotation_degraded is False` exactly (missing/None/True
+  all refused), `cell_type_annotation_mode` in an explicit allow-list
+  (`inductive_per_cell` or the new `pseudo_bulk_no_cell_type_identity`;
+  `majority_voting`/`diagnostic_fallback`/anything else refused), and for
+  `inductive_per_cell`, a well-formed 64-hex-char `cell_type_map_fingerprint`
+  that matches the *current* `CELL_TYPE_MAP` fingerprint exactly. Pseudo-bulk
+  sources (no per-cell expression for CellTypist to classify) now get an
+  explicit, documented provenance mode instead of silently leaving every
+  field unset. `fit_preprocessing()` now propagates these fields from
+  `adata.uns` onto every artifact it produces — including per-fold/per-OOD
+  refits (`benchmarks/fold_preprocessing.py`), which previously produced
+  artifacts with unset (`None`) cell-type provenance regardless of the outer
+  artifact's real annotation state.
+- **CellTypist/scikit-learn compatibility provenance is now persisted, not
+  just warned about.** `annotate_cell_types` now records
+  `cell_type_annotation_compatibility` (CellTypist version, model name,
+  runtime scikit-learn version, the serialized scikit-learn version(s)
+  sklearn's own `InconsistentVersionWarning` reports, and a `compatible`
+  boolean) onto the AnnData and, via `fit_preprocessing`, onto every
+  `PreprocessingArtifact`. The warning itself is still never suppressed
+  (see the sixth pass's decision on why hard-failing by default would be a
+  functional regression, not a fix, given this exact warning has been
+  present in every prior passing CI run) — this pass adds the durable
+  record, not a behavior change to the default warn-vs-fail policy. Making
+  a real (non-synthetic) run fail closed on this mismatch **by default**
+  remains open — see limitations below.
+- **CI dependency installation is now reproducible.** `requirements.txt`'s
+  entries are lower-bound ranges (`scikit-learn>=1.4.0`, etc.) — installing
+  from it alone does not reproduce a specific environment. A new
+  `constraints-ci.txt` pins the exact Linux/Python-3.11 versions this
+  project's tests are validated against (captured from an environment whose
+  independent resolution of the same unconstrained `requirements.txt`
+  matched every version the last completed CI job reported); `.github/workflows/tests.yml`
+  now installs via `pip install -r requirements.txt -c constraints-ci.txt`,
+  pins Python to `3.11.15`, records core dependency versions in the CI log,
+  and busts its pip cache when either file changes.
+- **CI workflow triggers fixed.** The `push` trigger referenced a specific,
+  temporary feature branch name that had already gone stale (the repository
+  had since moved to a different branch) — it now triggers on push/PR
+  against `main` plus an on-demand `workflow_dispatch`, so it keeps working
+  regardless of which branch is checked out.
+- **New reproducibility artifacts**: every run now writes `environment.json`
+  (Python version, platform, git SHA, working-tree dirty flag, synthetic
+  flag, and the installed version of every scientific dependency that could
+  affect results) and `preprocessing/final_artifact.json` (the full outer
+  `PreprocessingArtifact` this run used, cross-referenced with its own
+  fingerprint).
+
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
 section for the same list, generated fresh per run): the neural/MIL bounded
 search spaces compared inside nested CV (both the outer-CV-fold and the
@@ -779,17 +867,29 @@ feature vector per subject) for their own training/prediction — the neural
 adapter is the only Task A model exercising true cell-level training, so
 "cell-weighted" metrics for baselines remain explicitly marked
 not-applicable rather than presented as real per-cell scores; the immutable
-artifact directory still does not contain every file the ideal schema calls
-for (a dedicated `preprocessing/` subdir with per-fold artifact files, an
-environment snapshot recording Python/dependency versions) — the OOF CSV
-and `hyperparameters.json`/`folds_partitions.json` now cover most of the
-gap, but per-fold `PreprocessingArtifact` objects themselves are still not
-written as separate files; attention weights remain an interpretability
-aid, not a causal explanation, in every pooling variant; this pass's new
-regression tests cover representative cases for each fix rather than
-literally every scenario a full audit could enumerate (e.g. concurrent-guard
-races beyond the existing single-process tests, or every possible
-CellTypist failure mode).
+artifact directory now has `environment.json` and
+`preprocessing/final_artifact.json` but still does not contain every file
+the ideal schema calls for — a sanitized `configuration.json` snapshot, a
+`models/final_model_manifest.json` recording the final candidate's
+architecture/hyperparameters/model-state fingerprint, and per-CV-fold
+`PreprocessingArtifact` files (as opposed to the fold-local fingerprints
+already recorded in `metrics/*_folds_partitions.json`) are not yet written;
+a real (non-synthetic) run does not yet fail closed by default on a
+CellTypist/scikit-learn pretrained-model version mismatch — the mismatch is
+now fully recorded in provenance (`cell_type_annotation_compatibility`) and
+never silently swallowed, but making strict compatibility the default for
+real runs would currently break the pipeline against CellTypist's own
+published `Immune_All_Low.pkl` model (serialized under scikit-learn 0.24.1,
+an upstream artifact this project does not control) and has not been forced
+through without further validation; the frozen-test guard's identity
+fingerprint (`ExperimentContext.guard_identity_fingerprint`) and
+`fold_preprocessing.py::artifact_fingerprint` do not yet incorporate
+cell-type annotation provenance, so a stale/mismatched cell-type mapping
+would not by itself invalidate a guard identity or be caught purely by
+fingerprint comparison on reload (the strict provenance *validation* at
+context-construction time, described above, is a separate and already-fixed
+mechanism from this fingerprint-scope gap); attention weights remain an
+interpretability aid, not a causal explanation, in every pooling variant.
 
 ## Pipeline
 
@@ -828,7 +928,7 @@ src/
     neural.py                  adapters wrapping Trainer/MultiSmokeCancerNet for CV comparison
     metrics.py                  subject/cell-weighted F1, AUROC/AUPRC/Brier/ECE, bootstrap CI
     cross_validation.py          grouped-CV runner around data/splitting.py::grouped_kfold
-    calibration.py                 validation-only calibration + frozen threshold
+    calibration.py                 OOF-based calibration + guarded one-time frozen-test evaluation
     ood.py                          leave-one-dataset-source-out validation
     reporting.py                    statistical comparison, immutable artifacts, Markdown/CSV report
     runner.py                        CLI entry point (`python -m benchmarks.runner`)
@@ -849,7 +949,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (442 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 22 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_nested_cv_selection.py`, and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (483 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 23 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_nested_cv_selection.py`, and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |

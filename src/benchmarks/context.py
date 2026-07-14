@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from data.label_mapping import EffectiveLabelMapping
-from data.preprocessing import PreprocessingArtifact
+from data.preprocessing import PreprocessingArtifact, validate_cell_type_provenance
 from data.splitting import SplitManifest
 from train import validate_experiment_partitions, SubjectLevelDataset
 
@@ -122,23 +122,17 @@ def _validate_context(
                     f"{b['gene_matrix'].shape[1]} genes, preprocessing_artifact has {n_genes}."
                 )
 
-    # 3b. reject a degraded (diagnostic-fallback) cell-type annotation for a
-    # real pipeline result — this check only runs here, inside
-    # from_pipeline_result, never for a hand-built synthetic context (see
-    # build_synthetic_context in runner.py, which constructs
-    # ExperimentContext directly and never calls this function) — so a real
-    # run can never silently proceed on every-cell-labeled-epithelial
-    # placeholder annotations produced by data/transforms.py::
-    # annotate_cell_types's allow_diagnostic_fallback path.
-    if getattr(preprocessing_artifact, "cell_type_annotation_degraded", False):
-        raise ValueError(
-            "ExperimentContext: preprocessing_artifact.cell_type_annotation_degraded=True — "
-            "this pipeline result's cell-type annotation came from CellTypist's diagnostic "
-            "fallback (every cell assigned the same placeholder label after CellTypist itself "
-            "failed), not a real per-cell prediction. Refusing to build a real ExperimentContext "
-            "from it. Re-run preprocessing with CellTypist available, or use this result only for "
-            "a deliberate, clearly-labelled diagnostic run."
-        )
+    # 3b. strict cell-type annotation provenance for a real pipeline result
+    # — this check only runs here, inside from_pipeline_result, never for a
+    # hand-built synthetic context (see build_synthetic_context in
+    # runner.py, which constructs ExperimentContext directly and never
+    # calls this function). Unlike the historical
+    # `getattr(..., "cell_type_annotation_degraded", False)` check this
+    # replaced, a MISSING provenance field is never treated as safe — see
+    # data.preprocessing.validate_cell_type_provenance for the full policy
+    # (accepted modes, fingerprint matching, the explicit pseudo-bulk
+    # exemption).
+    validate_cell_type_provenance(preprocessing_artifact)
 
     # 4. artifact's embedded label mapping matches the context's label_mapping
     if preprocessing_artifact.label_mapping is not None:

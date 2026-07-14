@@ -48,10 +48,32 @@ from typing import Any, Tuple
 
 import numpy as np
 from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble._hist_gradient_boosting.binning import _BinMapper
 from sklearn.ensemble._hist_gradient_boosting.predictor import TreePredictor
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.tree._tree import Tree as SklearnTree
+
+# Every fitted estimator/container type this framework's registered
+# baselines (SMOKE_BASELINES / CANCER_BASELINES in baselines.py) can
+# actually produce, including RandomForestClassifier's per-tree
+# DecisionTreeClassifier members. Deliberately NOT open-ended: an
+# estimator type added to a baseline in the future without a matching
+# entry here must fail loudly (UnsupportedModelStateError), not silently
+# canonicalize via generic reflection that could miss non-conventional
+# fitted state (as happened historically for TreePredictor and
+# DummyClassifier.constant — see module docstring).
+_EXPLICIT_DICT_REFLECTION_TYPES: Tuple[type, ...] = (
+    LogisticRegression,
+    StandardScaler,
+    RandomForestClassifier,
+    MLPClassifier,
+    DecisionTreeClassifier,
+)
 
 
 class UnsupportedModelStateError(TypeError):
@@ -119,6 +141,14 @@ def _canonicalize(obj: Any) -> Any:
             "raw_left_cat_bitsets": _canonicalize(obj.raw_left_cat_bitsets),
             "binned_left_cat_bitsets": _canonicalize(obj.binned_left_cat_bitsets),
         }
+    if isinstance(obj, _BinMapper):
+        # HistGradientBoostingClassifier._bin_mapper's actual learned bin
+        # thresholds (bin_thresholds_, is_categorical_,
+        # missing_values_bin_idx_, n_bins_non_missing_) DO follow the
+        # trailing-underscore convention, verified by direct inspection —
+        # still listed explicitly rather than left to the generic __dict__
+        # fallback, which no longer exists.
+        return _canonicalize_fitted_attrs(obj)
     if isinstance(obj, DummyClassifier):
         # strategy="constant"'s predicted value lives in the constructor
         # parameter `constant`, not in any trailing-underscore fitted
@@ -136,16 +166,31 @@ def _canonicalize(obj: Any) -> Any:
             obj,
             extra_private=("_predictors", "_baseline_prediction", "_bin_mapper", "_n_features"),
         )
-    if hasattr(obj, "__dict__"):
-        # Covers every other registered baseline's fitted estimator:
-        # DummyClassifier, LogisticRegression, RandomForestClassifier (whose
+    if isinstance(obj, _EXPLICIT_DICT_REFLECTION_TYPES):
+        # LogisticRegression, StandardScaler, RandomForestClassifier (whose
         # estimators_ are DecisionTreeClassifier instances, each recursing
         # into the explicit sklearn.tree._tree.Tree handling above via its
-        # tree_ attribute), MLPClassifier, StandardScaler, and the internal
-        # _BinMapper HistGradientBoostingClassifier stores per-feature bin
-        # thresholds in (all of which expose their learned state through
-        # ordinary trailing-underscore attributes).
+        # tree_ attribute), MLPClassifier, and DecisionTreeClassifier itself
+        # all expose their complete learned state through ordinary
+        # trailing-underscore attributes, verified by direct inspection
+        # under the pinned scikit-learn version — no non-conventional
+        # private state to enumerate, unlike TreePredictor/HGB/DummyClassifier
+        # above.
         return _canonicalize_fitted_attrs(obj)
+    if hasattr(obj, "__dict__"):
+        # Deliberately NOT a supported fallback: an object with a __dict__
+        # but no explicit whitelist entry above may hold fitted state under
+        # a non-trailing-underscore name (as DummyClassifier.constant and
+        # TreePredictor's fields did), or an empty/irrelevant __dict__ that
+        # would silently produce an incomplete fingerprint. Fail loudly
+        # instead of guessing.
+        raise UnsupportedModelStateError(
+            f"model_fingerprint: {type(obj).__module__}.{type(obj).__qualname__} has a "
+            f"__dict__ but is not in the explicit canonicalization whitelist — add explicit "
+            f"handling (verifying which attributes actually hold fitted state under the "
+            f"installed scikit-learn version) rather than relying on generic reflection, "
+            f"which can silently miss non-trailing-underscore fitted state."
+        )
     raise UnsupportedModelStateError(
         f"model_fingerprint: no deterministic canonicalization is defined for "
         f"{type(obj).__module__}.{type(obj).__qualname__}; refusing to fall back "
