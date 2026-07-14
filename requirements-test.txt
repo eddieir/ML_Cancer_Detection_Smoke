@@ -1,0 +1,4 @@
+# Test/development-only dependencies. Not required to run the package,
+# only to run its test suite. Installed alongside requirements.txt in CI:
+#   pip install -r requirements.txt -r requirements-test.txt -c constraints-ci.txt
+pytest>=7.0.0

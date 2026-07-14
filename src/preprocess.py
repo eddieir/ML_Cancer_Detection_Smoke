@@ -148,7 +148,15 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     merged = merge_sources(*adatas)
     merged = smoke_aware_hvg(merged, n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT))
     merged = batch_correct(merged)
-    merged = annotate_cell_types(merged)
+    # cell_type_allow_diagnostic_fallback defaults to False (fail-closed on
+    # any CellTypist failure or scikit-learn/CellTypist version mismatch —
+    # see data/transforms.py::annotate_cell_types). No real production
+    # config sets this key; it exists only for a deliberate, disclosed
+    # diagnostic run, and any output produced with it set is stamped
+    # degraded and rejected by real ExperimentContext construction.
+    merged = annotate_cell_types(
+        merged, allow_diagnostic_fallback=cfg.get("cell_type_allow_diagnostic_fallback", False)
+    )
 
     if cfg.get("nlst_csv"):
         merged = transfer_nlst_labels(merged, cfg["nlst_csv"])
@@ -327,12 +335,57 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
             **split_kwargs,
         )
 
+    # Cell-type annotation BEFORE the refit snapshot. CellTypist
+    # (annotate_cell_types) is pretrained-model inference, not data-fit: it
+    # loads a fixed pretrained classifier and only reads obs["is_pseudo_bulk"]
+    # and layers["lognorm"] (restored explicitly since merge_sources leaves
+    # .X as z-scores) — it never fits/trains on this dataset, so running it
+    # here adds no leakage risk. annotate_cell_types() defaults to
+    # majority_voting=False, CellTypist's own inductive mode: each cell's
+    # predicted label is a pure function of that cell's own expression
+    # vector, independent of which other cells are supplied in the same
+    # call. A held-out validation/test cell therefore cannot change a
+    # training cell's annotation, and annotating a different subject subset
+    # per CV fold reproduces the SAME per-cell labels rather than silently
+    # reassigning them — see data/transforms.py::annotate_cell_types for the
+    # full rationale. It is still run exactly once here (not once per fold)
+    # purely as a performance/consistency convenience — inductive per-cell
+    # prediction makes that a choice, not a leakage requirement. Previously
+    # this ran AFTER the refit-snapshot line below, which meant every
+    # fold-reconstructed cell got cell_type_id=0 (the placeholder) instead
+    # of its real annotation — silently destroying cell-type proportions and
+    # MIL cell-type-id inputs for every benchmark CV fold and OOD evaluation.
+    # See run_pipeline() above for cell_type_allow_diagnostic_fallback's
+    # fail-closed-by-default contract — identical here.
+    merged = annotate_cell_types(
+        merged, allow_diagnostic_fallback=cfg.get("cell_type_allow_diagnostic_fallback", False)
+    )
+
+    # Snapshot the full-gene, normalized-but-not-yet-HVG-selected-or-scaled
+    # AnnData BEFORE fit_preprocessing/apply_preprocessing run. Neither
+    # function mutates `merged` in place (both return new objects), so this
+    # is a cheap reference, not a copy — and it's exactly the "pre-feature-
+    # selection, normalized/log-transformed expression, WITH real cell-type
+    # annotations" a benchmark needs to refit its own PreprocessingArtifact
+    # per CV fold (see src/benchmarks/fold_preprocessing.py) instead of
+    # reusing this one artifact (fit on ALL original-train subjects) across
+    # every fold, which would leak an inner-CV-validation subject's
+    # influence on scaling/HVG selection into that same fold's "held-out"
+    # evaluation. fit_preprocessing/apply_preprocessing only ever touch .X
+    # (gene expression) and never obs["cell_type_id"], so cell-type labels
+    # here are exactly what every fold and the outer split will see.
+    normalized_adata_for_refit = merged
+
     # ── 5/6. Fit preprocessing on train only, apply to everyone ─────────────
     artifact = fit_preprocessing(
         merged, set(manifest.train_subjects),
         n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT),
     )
     artifact.label_mapping = label_mapping.to_dict()
+    # Cell-type annotation provenance (which fixed label-name -> ID table
+    # produced obs["cell_type_id"], set by annotate_cell_types above) is
+    # already copied onto `artifact` by fit_preprocessing() itself, straight
+    # from `merged.uns` — see data/preprocessing.py::fit_preprocessing.
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────
@@ -350,7 +403,8 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
               "transductive Harmony correction across the full dataset.")
         transductive_used = False
 
-    merged = annotate_cell_types(merged)
+    # cell-type annotation already ran once, above, before the refit
+    # snapshot — see the comment there for why it must not run twice.
 
     # ── 8. Export + assemble ─────────────────────────────────────────────────
     cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
@@ -417,6 +471,10 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
             "malignancy_unknown_cells": int((~cell_data["malignancy_known"]).sum()),
         },
         "transductive_batch_correction": transductive_used,
+        # pre-HVG, pre-scaling normalized AnnData — see the comment at its
+        # assignment above. Benchmarks-only; run_pipeline_split_aware's other
+        # callers/tests are unaffected by this additional key.
+        "normalized_adata_for_refit": normalized_adata_for_refit,
     }
 
 

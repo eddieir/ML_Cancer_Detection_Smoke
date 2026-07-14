@@ -1,27 +1,46 @@
 name: tests
 
+# Branch-independent triggers: this workflow must keep working regardless
+# of which feature branch is currently checked out, so it targets `main`
+# (not a hardcoded, temporary feature-branch name that goes stale the
+# moment that branch is renamed or merged) plus an on-demand dispatch for
+# manually re-running against any ref.
 on:
   push:
-    branches: [improve/valid-evaluation-and-training]
+    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
 jobs:
   pytest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.11.15"
           cache: "pip"
+          # Included in the cache key so a change to either file busts the
+          # cache instead of silently reusing a stale resolution.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+            constraints-ci.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
+          pip install -r requirements.txt -r requirements-test.txt -c constraints-ci.txt
+
+      - name: Verify test runner is installed
+        run: python -m pytest --version
+
+      - name: Record environment
+        run: python -m benchmarks.env_versions
+        env:
+          PYTHONPATH: src
 
       # Every test in tests/ builds its own synthetic fixtures in-process
       # (see tests/test_preprocess_split_aware.py, tests/test_pipeline.py) —

@@ -26,6 +26,9 @@ env/
 # demo run output (logs + generated report, created by scripts/run_demo.sh)
 demo_run_*/
 
+# benchmark run output (created by src/benchmarks/runner.py)
+artifacts/benchmarks/
+
 # OS
 .DS_Store
 

@@ -42,6 +42,14 @@ def test_run_pipeline_produces_cell_data():
             "n_hvgs": 50,
             "min_cells_per_subject": 5,
             "out_dir": out,
+            # This environment's installed CellTypist model was serialized
+            # under scikit-learn 0.24.1, incompatible with the installed
+            # 1.9.0 (see data/transforms.py::CellTypistCompatibilityError) —
+            # a real run must fail closed on that by default. This test only
+            # exercises pipeline shape/mechanics on synthetic random data, so
+            # it explicitly opts into the disclosed, always-degraded
+            # diagnostic override rather than testing CellTypist compatibility.
+            "cell_type_allow_diagnostic_fallback": True,
         })
         assert "gene_matrix"  in cell_data
         assert "smoke_labels" in cell_data
@@ -57,6 +65,9 @@ def test_run_pipeline_produces_bags():
             "n_hvgs": 50,
             "min_cells_per_subject": 5,
             "out_dir": str(Path(tmp) / "p"),
+            # See test_run_pipeline_produces_cell_data for why this
+            # disclosed diagnostic override is used here.
+            "cell_type_allow_diagnostic_fallback": True,
         })
         assert len(bags) > 0
         assert "gene_matrix" in bags[0]
@@ -74,6 +85,9 @@ def test_model_forward_after_pipeline():
             "n_hvgs": 50,
             "min_cells_per_subject": 5,
             "out_dir": str(Path(tmp) / "p"),
+            # See test_run_pipeline_produces_cell_data for why this
+            # disclosed diagnostic override is used here.
+            "cell_type_allow_diagnostic_fallback": True,
         })
         model = MultiSmokeCancerNet(input_dim=50, embedding_dim=32, attention_dim=16)
         b = bags[0]

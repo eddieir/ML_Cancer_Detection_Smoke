@@ -512,6 +512,49 @@ class Trainer:
                 config = yaml.safe_load(f)
         return cls(model, config, device, seed=seed)
 
+    @classmethod
+    def from_experiment_context(
+        cls,
+        context: "benchmarks.context.ExperimentContext",
+        device:  str = "cpu",
+        seed:    Optional[int] = None,
+        pooling: Optional[str] = None,
+    ) -> "Trainer":
+        """
+        Build a Trainer whose model, label mapping, and provenance are all
+        derived from one ExperimentContext (src/benchmarks/context.py) — so a
+        benchmark comparing baselines against MultiSmokeCancerNet can never
+        accidentally construct the model with the wrong input_dim or the
+        fixed 6-class head when the rare-class policy already shrank K.
+
+        Rejects (raises ValueError) rather than silently truncating/padding
+        when the context's preprocessing artifact's gene count doesn't match
+        model_config['input_dim'] (if input_dim is explicitly set in config —
+        otherwise it's derived from the context) — a mismatch there means the
+        config was written for a different HVG count than this context
+        actually produced.
+        """
+        model_cfg = dict(context.config.get("model", {}))
+        configured_input_dim = model_cfg.get("input_dim")
+        if configured_input_dim is not None and configured_input_dim != context.input_dim:
+            raise ValueError(
+                f"Trainer.from_experiment_context: config model.input_dim="
+                f"{configured_input_dim} does not match context.input_dim="
+                f"{context.input_dim} (len(preprocessing_artifact.gene_list)). "
+                "Remove the explicit input_dim from config to derive it from "
+                "the context, or fix the mismatch."
+            )
+        model_cfg["input_dim"] = context.input_dim
+
+        model = MultiSmokeCancerNet.from_config(
+            {"model": model_cfg}, num_smoke_types=context.num_smoke_classes, pooling=pooling,
+        )
+        trainer = cls(model, context.config, device=device, seed=seed if seed is not None else context.seed)
+        trainer.set_label_mapping(context.label_mapping)
+        trainer.transductive_batch_correction = context.transductive_batch_correction
+        trainer.rare_class_policy = context.label_mapping.policy
+        return trainer
+
     def set_label_mapping(self, mapping: "EffectiveLabelMapping") -> None:
         """
         The sanctioned way to wire an EffectiveLabelMapping (data/label_mapping.py)
@@ -853,6 +896,119 @@ class Trainer:
         self._save_history({"phase2": history}, "phase2")
         self._log(f"Phase 2 done.  best_AUC={best_auc:.3f}")
         return {"history": history, "best_auc": best_auc}
+
+    # ── Final-fit variants (no internal validation split) ─────────────────────
+    #
+    # phase1/phase2 above always require a subject-disjoint validation split
+    # to select the best-on-val checkpoint. That is the right behaviour for
+    # every normal training run, but it is architecturally incompatible with
+    # "fit the ONE final frozen-test candidate on every eligible development
+    # subject" (see benchmarks/final_evaluation.py): a normal phase1/phase2
+    # call would always hold some development subjects out of gradient
+    # updates for its own bookkeeping. These two methods exist only for that
+    # final refit: they train for a FIXED, already-decided epoch count (from
+    # development-only nested-CV/OOF evidence, selected before this ever
+    # runs), take every subject supplied as a gradient-update subject, and
+    # never consult a validation split for checkpoint selection or early
+    # stopping. They must never be used for CV/model-selection training.
+
+    def phase1_final_fit(
+        self,
+        train_cell_dataset: CellLevelDataset,
+        epochs: Optional[int] = None,
+        smoke_class_weights: Optional[torch.Tensor] = None,
+    ) -> Dict:
+        self._log("\n=== Phase 1 (final fit, no validation split) ===")
+        if len(train_cell_dataset) == 0:
+            raise ValueError("Trainer: train dataset is empty — nothing to train on.")
+        if not getattr(train_cell_dataset, "diagnostic_mode", False):
+            self._train_subjects_seen |= _dataset_subject_ids(train_cell_dataset)
+
+        epochs = epochs if epochs is not None else self.cfg.get("phase1_epochs", 15)
+        lr = self.cfg.get("phase1_lr", 1e-3)
+        batch_size = self.cfg.get("phase1_batch_size", 512)
+
+        if smoke_class_weights is None:
+            smoke_class_weights = train_cell_dataset.smoke_class_weights(num_classes=self.model.num_smoke)
+
+        train_dl = DataLoader(train_cell_dataset, batch_size=batch_size, shuffle=True,
+                               drop_last=len(train_cell_dataset) >= batch_size,
+                               generator=self._generator())
+        loss_fn = MultiTaskLoss(
+            lambda_smoke=0.50, lambda_malignancy=0.50,
+            smoke_class_weights=smoke_class_weights.to(self.device),
+        )
+        params = [
+            *self.model.encoder.parameters(),
+            *self.model.smoke_head.parameters(),
+            *self.model.malignancy_head.parameters(),
+            *self.model.dose_head.parameters(),
+        ]
+        opt = self._make_optimizer(params, lr)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
+        lambda_dose = self.cfg.get("lambda_dose", 0.10)
+
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            for batch in train_dl:
+                x = batch["x"].to(self.device)
+                smoke_t = batch["smoke_label"].to(self.device)
+                malig_t = batch["malignancy_label"].to(self.device)
+                malig_k = batch["malignancy_known"].to(self.device)
+                dose_t = batch["exposure_dose"].to(self.device)
+                z, logits, malig = self.model.forward_cell(x)
+                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k)
+                dose_loss, _ = loss_fn.dose_response_loss(self.model.dose_head(z), dose_t, malig)
+                self._grad_step(loss + lambda_dose * dose_loss, opt, params)
+            sched.step()
+            self._log(f"  epoch {epoch:02d}/{epochs}  (final fit — every subject trained, no checkpoint selection)")
+
+        self._log(f"Phase 1 (final fit) done — trained {epochs} epoch(s) on all "
+                   f"{len(train_cell_dataset)} cells, no held-out checkpoint selection.")
+        return {"epochs": epochs, "n_cells": len(train_cell_dataset)}
+
+    def phase2_final_fit(
+        self,
+        train_subject_dataset: SubjectLevelDataset,
+        epochs: Optional[int] = None,
+    ) -> Dict:
+        self._log("\n=== Phase 2 (final fit, no validation split) ===")
+        if len(train_subject_dataset) == 0:
+            raise ValueError("Trainer: train dataset is empty — nothing to train on.")
+        if not getattr(train_subject_dataset, "diagnostic_mode", False):
+            self._train_subjects_seen |= _dataset_subject_ids(train_subject_dataset)
+
+        epochs = epochs if epochs is not None else self.cfg.get("phase2_epochs", 12)
+        lr = self.cfg.get("phase2_lr", 5e-4)
+
+        for p in [*self.model.encoder.parameters(),
+                  *self.model.smoke_head.parameters(),
+                  *self.model.malignancy_head.parameters()]:
+            p.requires_grad = False
+
+        train_dl = DataLoader(train_subject_dataset, batch_size=1, shuffle=True,
+                               collate_fn=subject_collate_fn, generator=self._generator())
+        loss_fn = MultiTaskLoss()
+        params = list(self.model.aggregator.parameters())
+        opt = self._make_optimizer(params, lr)
+
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            for [item] in train_dl:
+                x_bag = item["gene_matrix"].to(self.device)
+                ct_ids = item["cell_type_ids"].to(self.device)
+                cancer = item["cancer_label"].to(self.device)
+                out = self.model.forward_subject(x_bag, ct_ids)
+                loss, _ = loss_fn.subject_level_loss(out["cancer_probability"], cancer)
+                self._grad_step(loss, opt, params)
+            self._log(f"  epoch {epoch:02d}/{epochs}  (final fit — every subject trained, no checkpoint selection)")
+
+        for p in self.model.parameters():
+            p.requires_grad = True
+
+        self._log(f"Phase 2 (final fit) done — trained {epochs} epoch(s) on all "
+                   f"{len(train_subject_dataset)} subjects, no held-out checkpoint selection.")
+        return {"epochs": epochs, "n_subjects": len(train_subject_dataset)}
 
     # ── Phase 3: End-to-end fine-tuning ───────────────────────────────────────
 

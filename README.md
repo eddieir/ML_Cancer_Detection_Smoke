@@ -400,6 +400,545 @@ Full table with citations: [ARCHITECTURE.md §9](ARCHITECTURE.md#9-novel-contrib
 This table is also reproduced automatically in the generated demo report — see
 [Running the full demo](#running-the-full-demo).
 
+## Benchmarking framework (Phase 1: does the neural model beat simple baselines?)
+
+`src/benchmarks/` answers one narrow, honest question: under the exact same
+subject-level splits, does `MultiSmokeCancerNet` actually beat simple
+baselines? It does **not** do causal modelling, counterfactual generation,
+pathway-constrained learning, or foundation-model integration — those are
+explicitly out of scope for this phase.
+
+**Two tasks, defined once and never mixed:**
+
+| | Task A — smoke-type classification | Task B — subject-level cancer prediction |
+|---|---|---|
+| Unit of independence | subject | subject bag |
+| Labels | effective smoke classes 0..K-1 | known cancer outcome only (never fabricated) |
+| Primary metric | **subject-weighted** macro-F1 (one vote per subject — a subject with 10,000 cells cannot outvote one with 100) | AUROC (undefined, not 0.5, if a split has one class) |
+| Secondary metrics | cell-weighted macro-F1, balanced accuracy, weighted F1, per-class P/R/F1, confusion matrix | AUPRC, balanced accuracy, sensitivity, specificity, F1, Brier score, ECE |
+| Eligibility check | [eligibility.py](src/benchmarks/eligibility.py)`::check_task_a_eligibility` | `check_task_b_eligibility` — subjects without a real NLST/TCGA-linked outcome are excluded, never scored as a fabricated negative |
+
+**Baselines** ([baselines.py](src/benchmarks/baselines.py)): majority/prevalence
+predictor, logistic regression, random forest, HistGradientBoosting, and a
+small MLP (a few thousand parameters vs. MultiSmokeCancerNet's ~2.9M) — all
+fit only on the data they're given, with deterministic seeds and recorded
+hyperparameters/library versions. Task A also runs the real neural model
+(`neural`); Task B runs three MIL pooling variants sharing one encoder
+(`mean_mil` / `max_mil` / `attention_mil` — [model.py](src/model.py)'s
+`MIL_POOLINGS`) so gated attention has to earn its extra parameters over
+plain mean/max pooling, not just be assumed better.
+
+**Grouped CV** ([cross_validation.py](src/benchmarks/cross_validation.py)):
+wraps `data/splitting.py::grouped_kfold` over the **train+val subject pool
+only** — test is never touched during CV or hyperparameter search. Folds
+are subject-disjoint; a fold too small for `MILEligibilityError`
+(train.py's `check_mil_eligibility`) is recorded as an undefined result with
+its reason, not silently dropped or coerced to AUROC=0.5. Results are
+aggregated (mean/std/median/95% bootstrap CI, n valid vs. n undefined) across
+folds and seeds `[42, 43, 44]` by default.
+
+**Calibration and frozen threshold** ([calibration.py](src/benchmarks/calibration.py),
+Task B only): Platt/isotonic calibration and threshold selection (fixed 0.5,
+Youden's J, balanced-accuracy, sensitivity-constrained) are fit on
+validation predictions only, then frozen into one `FrozenThresholdPolicy`
+applied to test **exactly once** (`apply_to_test` raises on a second call) —
+replacing the previous non-clinical, unvalidated fixed 0.70 cutoff.
+
+**Statistical comparison** ([reporting.py](src/benchmarks/reporting.py)):
+paired fold-level differences, bootstrap CI, Cohen's d, win/tie/loss count.
+A model is only reported as "meaningfully better" if it wins >=70% of paired
+folds AND the CI on the paired difference excludes zero — a numerically
+higher mean alone is never sufficient (`summarize_comparison`).
+
+**Leave-one-source-out** ([ood.py](src/benchmarks/ood.py)): trains on every
+GEO source except one, evaluates only on the held-out source's subjects.
+Species/label-semantics compatibility across sources is config-driven
+(`incompatible_sources`, `species_by_source`), not auto-inferred — a source
+without that information declared explicitly compatible is marked
+`NOT_COMPARABLE`, not silently included.
+
+```bash
+python -m benchmarks.runner --synthetic --fast     # CI: software-only check, no real data
+PYTHONPATH=src python3 -m benchmarks.runner --synthetic --fast --task smoke
+
+PYTHONPATH=src python3 -m benchmarks.runner --config configs/default.yaml --task smoke \
+    --models majority logistic random_forest gradient_boosting small_mlp neural \
+    --cv-folds 5 --seeds 42 43 44 --output artifacts/benchmarks
+
+PYTHONPATH=src python3 -m benchmarks.runner --config configs/default.yaml --task cancer \
+    --models prevalence logistic random_forest gradient_boosting small_mlp \
+    mean_mil max_mil attention_mil --calibration auto --output artifacts/benchmarks
+```
+
+Each run writes an **immutable** `artifacts/benchmarks/<run_id>/` (a
+colliding `--run-id` raises rather than overwriting) containing
+`run_manifest.json` (git SHA, seeds, split fingerprint, label mapping),
+`eligibility.json`, `metrics/*_folds.{json,csv}`, `calibration/frozen_policy.json`,
+`comparisons.json`, `summary.json`, and a human-readable `report.md` — every
+synthetic run is stamped `synthetic: true` and the report opens with a
+"validates software only" warning so it can never be mistaken for a
+real-data result.
+
+**Fixed since the first Phase 1 pass** (a real, previously-undiscovered
+leakage bug, not a style change): grouped CV used to reuse the
+`ExperimentContext`'s outer `PreprocessingArtifact` — fit once on ALL
+original-train subjects — across every fold. Any original-train subject that
+became an *inner* CV validation subject had therefore already influenced the
+gene-scaling means/stds and HVG selection it was then "held out" against.
+CV now refits a fresh `PreprocessingArtifact` per fold, per seed, from
+`context.normalized_adata_for_refit` (the pre-HVG, pre-scaling normalized
+expression `run_pipeline_split_aware()` now captures), using only that
+fold's own training subjects — see
+[fold_preprocessing.py](src/benchmarks/fold_preprocessing.py). The same
+per-fold cell/bag datasets fixed a second leak: cancer-task MIL encoder
+pretraining used to always use the OUTER train/val cell split regardless of
+which subjects were in a given cancer-CV fold, so a fold's own validation
+subjects could appear in Phase 1 encoder training. Leave-one-source-out
+similarly now refits preprocessing using only the remaining-source training
+subjects, and defaults an unlabeled source's species/semantics compatibility
+to `NOT_COMPARABLE` rather than assuming it's fine. Ground-truth malignancy
+labels are no longer a Task B feature (they can proxy the cancer outcome
+directly for outcome-linked sources) — the only sanctioned path back in is a
+validated out-of-fold prediction (`features.py::validate_oof_predictions`).
+Logistic regression and the small MLP now fit a `StandardScaler` inside a
+`Pipeline`, scoped to whatever data each fold passes in. A single-class
+training fold (an expected outcome of small grouped-CV folds, not a bug) no
+longer crashes baselines outright or silently mis-indexes `predict_proba`'s
+positive-class column. Statistical comparison now reports two confidence
+intervals: a fold-level one (folds from repeated seeds over the same subject
+pool overlap and aren't independent — descriptive only) and a seed-level one
+(bootstraps independent per-seed means — the one `summarize_comparison`
+actually requires to call a model "meaningfully better").
+
+**Fixed in the second pass** (see git history for the exact commits): the
+snapshot CV/OOD refit from (`normalized_adata_for_refit`) is now captured
+AFTER cell-type annotation runs, not before — every fold and OOD evaluation
+used to silently see `cell_type_id=0` for every cell regardless of its real
+CellTypist annotation (see [preprocess.py](src/preprocess.py) and
+[fold_preprocessing.py](src/benchmarks/fold_preprocessing.py)). The declared
+`SMOKE_SEARCH_SPACE`/`CANCER_SEARCH_SPACE` are now consulted by real,
+leakage-free nested grouped-CV selection
+(`hyperparameter_search.py::select_hyperparameters_nested`) — wired into Task
+B's final frozen-test path, computed strictly within the outer-train
+partition; a model with no declared search space is recorded as such
+explicitly, never silently skipped. `features.py::cap_cells_per_subject` is
+now wired into the neural adapter's per-fold cell-level training
+(deterministic, computed independently per split — see
+`cross_validation.py::run_smoke_cv`'s `feature_mode`/`max_cells_per_subject`
+fold fields). Leave-one-source-out no longer infers its reference
+species/cohort from whichever source sorts first lexicographically — an
+explicit `reference_species` is now required whenever `species_by_source` is
+declared — and a subject assigned to more than one `dataset_source` is
+rejected outright rather than silently resolved. `ExperimentContext` now
+rejects a manifest subject *missing* from its cell dataset (previously only
+the reverse direction — an unexpected subject — was checked), rejects
+blank/placeholder bag subject IDs, and exposes fingerprinted `run_identity()`
+(manifest + preprocessing-artifact + label-mapping + config fingerprints)
+that a checkpoint/result reload can verify against
+(`validate_run_identity()`). A durable, restart-and-concurrency-safe one-time
+frozen-test guard (`test_guard.py::FrozenTestGuard`, atomic
+`O_CREAT|O_EXCL` file creation) is wired into Task B's final path.
+
+**Fixed in the third pass** (see git history for the exact commits — this
+supersedes the "opt-in guard" / "baseline-only final evaluation" / "search
+space declared but not consulted for neural/MIL" limitations listed above):
+
+- **Cell-type annotation is now inductive.** `annotate_cell_types()`
+  defaults to CellTypist's `majority_voting=False` mode: a cell's predicted
+  label is a pure function of that cell's own expression, independent of
+  which other cells (in particular, held-out validation/test cells) are
+  present in the same call — previously `majority_voting=True` let an
+  over-clustering pass computed across train+val+test cells influence a
+  training cell's own label. The fixed `CELL_TYPE_MAP` label-to-ID table is
+  unchanged (a static dict, never data-derived) but is now fingerprinted and
+  persisted on `PreprocessingArtifact` (`cell_type_map_fingerprint`,
+  `cell_type_annotation_mode`) for audit — see
+  [data/transforms.py](src/data/transforms.py).
+- **Neural/MIL candidates can win the final frozen-test evaluation.**
+  `final_evaluation.py::select_final_candidate` ranks every requested
+  model — classical baseline or MIL (`mean_mil`/`max_mil`/`attention_mil`/
+  `neural`) — by CV/development evidence alone; the winner is never silently
+  swapped for a baseline. A model with an undefined CV metric across every
+  fold is recorded ineligible with a reason, not dropped without a trace.
+- **The frozen-test guard is now mandatory for every non-synthetic run.** A
+  safe default location (`<output>/.frozen_test_guards/`) is derived from
+  the run's own output root when `benchmarks.frozen_test_guard_dir` isn't
+  configured, and the guard is keyed by
+  `ExperimentContext.guard_identity_fingerprint()` (manifest + preprocessing
+  + label-mapping + config + selected-model fingerprints combined) rather
+  than by `run_id`, so a fresh `--run-id` cannot bypass it. Disabling the
+  guard is possible only via the explicit, synthetic-only
+  `benchmarks.disable_frozen_test_guard` config flag (or CLI
+  `--disable-frozen-test-guard`, which `main()` rejects outside
+  `--synthetic`); attempting to disable it for a real run raises
+  `FrozenTestGuardDisabledInRealModeError`.
+- **Hyperparameter selection is integrated into every outer CV fold, for
+  both tasks.** `hyperparameter_search.py::select_nested_hyperparameters_with_refit`
+  runs a real inner grouped-CV — refitting its own `PreprocessingArtifact`
+  from only each inner fold's own training subjects — inside every outer CV
+  fold, for classical baselines (Task A and Task B) and, via a small bounded
+  fixed candidate set (`NEURAL_SEARCH_SPACE`/`MIL_SEARCH_SPACE` in
+  [cross_validation.py](src/benchmarks/cross_validation.py)), for the
+  neural/MIL models too. Every outer-fold record now carries its
+  `hyperparameter_search` result (candidates tried, inner scores, selected
+  params, inner fold partitions); a model with no tunable parameters records
+  `no_search_space: true` explicitly.
+- **The final development/fit/calibration protocol now uses the whole
+  train+val pool, correctly.** `final_evaluation.py` selects one final
+  configuration via nested CV over the entire development pool, generates
+  subject-grouped out-of-fold (OOF) predictions across that same pool (each
+  OOF subject predicted by a fold-refit model/artifact that never saw that
+  subject), fits calibration and selects the threshold from those OOF
+  predictions exclusively (never a plain validation split, never test), then
+  refits ONE final preprocessing artifact and model on all (and only)
+  development subjects before the single, guarded test evaluation. MIL
+  candidates' final refit carves a small internal validation slice out of
+  the development pool for Trainer's own checkpoint-selection bookkeeping
+  (see limitations below) — classical baselines have no such requirement and
+  use every development subject directly.
+
+**Fixed in the fourth pass** (this supersedes several "third pass" claims
+above and in `ARCHITECTURE.md` that were, on closer review, still
+inaccurate — see git history for the exact commits):
+
+- **The frozen-test guard is now acquired strictly before ANY test access.**
+  `run_cancer_task` (`src/benchmarks/runner.py`) is split into a
+  development-only stage and a guarded stage. The development-only stage —
+  candidate selection, OOF generation, calibration/threshold fitting, and
+  the final dev-pool fit (`final_evaluation.py::fit_final_candidate_on_dev_pool`)
+  — has function signatures that structurally cannot accept test subject
+  IDs, test bags, or test labels; `evaluate_frozen_test` is the only
+  function that reads `context.test_bags`/`context.subjects_for("test")`,
+  and it is called for the first time only inside the `try` block that
+  follows `FrozenTestGuard.acquire()`. Previously the guard was acquired
+  only immediately before computing the final metric, after test labels had
+  already been read and test predictions already generated.
+- **OOF predictions are now selection-clean.** Previously
+  `generate_subject_oof_predictions` accepted ONE hyperparameter
+  configuration selected once from the whole development pool and reused it
+  for every OOF subject — meaning a held-out subject's own label had
+  already influenced the configuration used to predict it, even though the
+  fold's model weights excluded that subject. Each OOF fold now runs its
+  OWN inner grouped-CV hyperparameter/config selection
+  (`final_evaluation.py::_oof_fold_hyperparameters`) using only that fold's
+  OOF-training subjects, then fits on the full OOF-training set with the
+  fold-selected configuration before predicting the OOF-held-out subjects —
+  the same nested-CV pattern already used by the outer CV loop, applied one
+  level deeper. The dev-pool-wide selection is still computed once, but is
+  now used only for the final refit's configuration, never reused as every
+  OOF fold's configuration.
+- **The final MIL fit now trains on every eligible development subject.**
+  `train.py::Trainer.phase1_final_fit`/`phase2_final_fit` are new,
+  fixed-epoch training methods with no internal validation split and no
+  validation-based checkpoint selection — unlike the normal `phase1`/`phase2`
+  (still used for CV/OOF fold fits, which correctly hold out a real
+  validation split). `NeuralCancerAdapter.fit_final` uses these for the
+  final dev-pool refit, so every development subject now contributes to
+  gradient updates; the "MIL final refit carves out an internal validation
+  slice" limitation from the previous pass is resolved, not merely
+  documented.
+- **CellTypist annotation failure now fails loudly by default.**
+  `annotate_cell_types()` previously printed a warning and returned `adata`
+  unchanged on any CellTypist failure — leaving `obs["cell_type_id"]`
+  either absent or stale, not actually defaulted to anything. It now raises
+  `CellTypeAnnotationError` by default; an explicit
+  `allow_diagnostic_fallback=True` (never passed by the real pipeline
+  entry points in `src/preprocess.py`) is required to fall back to a fixed
+  placeholder label for every cell, which stamps
+  `cell_type_annotation_degraded=True` on the resulting `PreprocessingArtifact`.
+  `ExperimentContext.from_pipeline_result` rejects a degraded artifact
+  outright — a real run can never silently proceed on fabricated cell types.
+- **Real OOF predictions are now persisted, not just fold-membership
+  counts.** `predictions/cancer_<candidate>_oof.csv` — one row per
+  development subject with its actual OOF probability, fold, and
+  fold-local selected-hyperparameters/fingerprint columns — is now written
+  alongside `calibration/frozen_policy.json`'s `oof_summary` (which still
+  carries fold membership only, for the markdown report).
+
+**Fixed in the fifth pass** (see git history for the exact commits):
+
+- **Task B eligibility no longer reads test labels or test class counts.**
+  `check_task_b_eligibility` previously computed known-outcome/class counts
+  from `context.test_bags` and rejected the whole run if the test split had
+  only one class — test composition could change whether an experiment
+  proceeded at all. It is now split into
+  `eligibility.py::check_task_b_development_eligibility(train_bags, val_bags)`
+  (the only gate run before the guard; its signature structurally cannot
+  accept `test_bags`) and `check_test_evaluability(test_bags)` (run only
+  inside the guarded stage, after `FrozenTestGuard.acquire()`): a one-class
+  test split now produces `auroc_auprc_defined=False` with a recorded
+  reason, and the run continues rather than being rejected pre-guard.
+- **The frozen-test guard identity is now deterministic across runs of the
+  same scientific configuration.** It previously included
+  `fitted.model_metadata`, which for neural/MIL candidates carries
+  `fit_seconds` — real wall-clock timing that differs on every run, making
+  the guard identity itself non-reproducible. The identity now uses
+  `context.guard_identity_fingerprint`'s `extra` payload with
+  `final_model_state_fingerprint` — a SHA-256 of the ACTUAL fitted model
+  weights (`benchmarks/model_fingerprint.py`: canonicalized `state_dict`
+  bytes for neural/MIL models via `torch_state_dict_fingerprint`, canonicalized
+  fitted sklearn attributes via `sklearn_model_state_fingerprint` for
+  baselines) — plus a deterministic `calibration_fingerprint` and a new
+  `test_membership_fingerprint` (`ExperimentContext.test_membership_fingerprint`,
+  derived only from `split_manifest.test_subjects`, never from `test_bags`).
+  No timestamp, run ID, or output directory name enters the identity.
+- **The guarded frozen-test transaction is now complete, not just guarded
+  metric computation.** `run_cancer_task` now builds an immutable
+  `calibration/frozen_test_result.json` (identity/model-state/preprocessing/
+  calibration fingerprints, the frozen threshold, aggregate metrics, test
+  membership fingerprint, evaluated-subject count, synthetic flag, and its
+  own `artifact_fingerprint` — no raw test labels or probabilities),
+  persists it atomically, reloads and verifies it, and only then calls
+  `guard.mark_completed(...)`, which now references that exact artifact
+  fingerprint. Any failure in this sequence (evaluation, calibration,
+  serialization, or verification) marks the guard failed instead — `mark_completed`
+  is structurally unreachable unless persistence and reload verification
+  both succeeded.
+- **Every JSON/CSV artifact this framework writes is now genuinely atomic.**
+  `benchmarks/atomic_io.py` writes a uniquely named temp file in the
+  destination directory, fsyncs it, and calls `os.replace()` onto the final
+  path — `reporting.py::write_json`/`write_csv_table` and
+  `test_guard.py::FrozenTestGuard.mark_completed`/`mark_failed` all use it
+  now, replacing the previous direct `open(path, "w")` writes that offered
+  no atomicity guarantee. `FrozenTestGuard.acquire()` still uses
+  `O_CREAT | O_EXCL` (a different, exclusive-creation primitive, not
+  replace-based) since that is what makes first-acquisition itself race-free.
+  The guard also now records a per-acquisition `owner_token`; a
+  `FrozenTestGuard` instance that never itself called `acquire()` (or whose
+  token doesn't match what's on disk) raises `FrozenTestGuardOwnershipError`
+  from `mark_completed`/`mark_failed` rather than being able to finalize a
+  guard file it does not own.
+- **The OOF CSV now carries real fingerprints instead of raw JSON under a
+  "fingerprint" column name.** `training_subjects_fingerprint` and
+  `validation_subjects_fingerprint` are now SHA-256 hashes of the canonical
+  sorted subject list (previously `training_subjects_fingerprint` was a raw
+  JSON-serialized list). Every successfully predicted row now also carries
+  `selected_params_fingerprint`, `inner_selection_fingerprint` (already
+  present), and `model_state_fingerprint` for the exact fold model that
+  produced that subject's OOF probability — writing refuses to proceed if a
+  "predicted" row is missing its model-state fingerprint. The CSV is
+  written atomically, reloaded, and its row count verified; the file's own
+  SHA-256 is recorded as `oof_summary.oof_artifact_fingerprint` in
+  `calibration/frozen_policy.json`, so calibration output references the
+  exact OOF artifact it was fit from.
+
+**Fixed in the sixth pass** (see git history for the exact commits):
+
+- **`atomic_write_bytes` now guarantees complete writes.** `os.write()` is
+  only guaranteed to write *up to* the requested number of bytes — a short
+  write is normal OS behavior, not an error. `benchmarks/atomic_io.py` now
+  loops (`_write_all`) until every byte is written, retries
+  `InterruptedError` explicitly, and treats zero-byte progress as a hard
+  error rather than looping forever. A failure anywhere before the
+  temp-to-destination `os.replace()` (write, fsync, or close) now always
+  removes the temp file and leaves the previous destination content
+  untouched.
+- **`model_fingerprint.py` no longer falls back to `repr()` for unsupported
+  fitted state.** The fallback was unsafe for a scientific identity: fitted
+  `sklearn.tree._tree.Tree` objects (used by every random forest, including
+  `random_forest` in both `SMOKE_BASELINES`/`CANCER_BASELINES`) are a Cython
+  extension type with no `__dict__`, so they previously fell all the way
+  through to `repr(obj)`, which embeds the object's memory address —
+  different every process, meaning two identically fitted forests could
+  fingerprint differently. Canonicalization now explicitly handles
+  `sklearn.tree._tree.Tree` (node/threshold/feature/value arrays),
+  `sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor` (whose
+  fitted fields don't follow sklearn's trailing-underscore convention, so a
+  generic reflection walk silently collected nothing for it),
+  `HistGradientBoostingClassifier` itself (whose actual learned trees live
+  in the private `_predictors`/`_baseline_prediction`/`_bin_mapper`
+  attributes, not any public trailing-underscore attribute), and
+  `DummyClassifier` (whose `strategy="constant"` predicted value lives in
+  the constructor parameter `constant`, not a fitted attribute — the model
+  used for this framework's single-training-class fallback path). Any
+  fitted value with no defined canonicalization now raises
+  `UnsupportedModelStateError` instead of silently using `repr()`.
+- **CellTypist/scikit-learn pretrained-model version compatibility is now
+  detected and surfaced explicitly, not silently absorbed.** CellTypist's
+  published `Immune_All_Low.pkl` model was serialized with scikit-learn
+  0.24.1; loading it under this project's scikit-learn (>=1.4, 1.9.0 in CI)
+  always emits scikit-learn's own `InconsistentVersionWarning` — a known,
+  disclosed, *upstream* compatibility gap this project cannot fix directly
+  (it does not control CellTypist's published model artifact, and no
+  scikit-learn-1.x-compatible replacement has been identified). As of the
+  ninth pass below, real (non-diagnostic) preprocessing fails closed on
+  this mismatch by default — this bullet is retained only as the
+  historical record of when the mismatch was first detected and persisted
+  as provenance; see the ninth pass for the current, fail-closed behavior.
+
+**Fixed in the eighth pass** (see git history for the exact commits):
+
+- **`FrozenTestGuard.acquire()` no longer risks a truncated guard file.**
+  The previous implementation wrote directly into an `O_CREAT | O_EXCL`
+  destination fd, which left a window — between the exclusive create and the
+  write completing — during which a concurrent reader could observe a
+  guard file that exists but holds truncated/incomplete JSON. It now writes
+  the complete payload to a temp file, fsyncs it, and only then atomically
+  `os.link()`s it into the guard path (`atomic_io.py::exclusive_create_bytes`)
+  — a hard link is a single atomic operation that fails with
+  `FileExistsError` if the destination already exists (the same race-free
+  create-if-absent guarantee `O_CREAT | O_EXCL` gives), and the instant it
+  succeeds the guard path refers to content that was already complete and
+  durable. Malformed/truncated guard JSON now raises a dedicated
+  `FrozenTestGuardCorruptedError` from `_read()` instead of ever being
+  silently treated as "no guard" (which could have re-opened one-time
+  frozen-test access). A real multiprocess acquisition race test (six
+  separate OS processes, `spawn` context) proves exactly one process wins
+  and every loser gets `FrozenTestInProgressError`, never a corrupted-state
+  false negative.
+- **`model_fingerprint.py`'s remaining generic `hasattr(obj, "__dict__")`
+  fallback is gone.** It was still unrestricted — any fitted object with a
+  `__dict__` (even one holding no genuinely fitted state, or fitted state
+  under a non-trailing-underscore name) was silently accepted. Writing
+  tests against the now-explicit whitelist (`LogisticRegression`,
+  `StandardScaler`, `RandomForestClassifier`, `MLPClassifier`,
+  `DecisionTreeClassifier`) surfaced a second real, previously-undetected
+  bug: `HistGradientBoostingClassifier._bin_mapper` (a
+  `sklearn.ensemble._hist_gradient_boosting.binning._BinMapper` holding the
+  actual learned bin thresholds) was also falling through the old generic
+  fallback — now explicitly canonicalized. Any object with a `__dict__` but
+  no whitelist entry, or a `__slots__`-only/empty-`__dict__` object, now
+  raises `UnsupportedModelStateError`; determinism across independent OS
+  processes (not just repeated calls in one process) is tested for every
+  registered baseline.
+- **Real cell-type annotation provenance validation now fails closed.** The
+  previous check (`getattr(artifact, "cell_type_annotation_degraded",
+  False)`) treated a *missing* provenance field as "not degraded" — safe by
+  accident, not by design. `data/preprocessing.py::validate_cell_type_provenance`
+  now requires all three provenance fields to be explicitly present and
+  valid: `cell_type_annotation_degraded is False` exactly (missing/None/True
+  all refused), `cell_type_annotation_mode` in an explicit allow-list
+  (`inductive_per_cell` or the new `pseudo_bulk_no_cell_type_identity`;
+  `majority_voting`/`diagnostic_fallback`/anything else refused), and for
+  `inductive_per_cell`, a well-formed 64-hex-char `cell_type_map_fingerprint`
+  that matches the *current* `CELL_TYPE_MAP` fingerprint exactly. Pseudo-bulk
+  sources (no per-cell expression for CellTypist to classify) now get an
+  explicit, documented provenance mode instead of silently leaving every
+  field unset. `fit_preprocessing()` now propagates these fields from
+  `adata.uns` onto every artifact it produces — including per-fold/per-OOD
+  refits (`benchmarks/fold_preprocessing.py`), which previously produced
+  artifacts with unset (`None`) cell-type provenance regardless of the outer
+  artifact's real annotation state.
+- **CellTypist/scikit-learn compatibility provenance is now persisted, not
+  just warned about.** `annotate_cell_types` now records
+  `cell_type_annotation_compatibility` (CellTypist version, model name,
+  runtime scikit-learn version, the serialized scikit-learn version(s)
+  sklearn's own `InconsistentVersionWarning` reports, and a `compatible`
+  boolean) onto the AnnData and, via `fit_preprocessing`, onto every
+  `PreprocessingArtifact`. The warning itself is still never suppressed
+  (see the sixth pass's decision on why hard-failing by default would be a
+  functional regression, not a fix, given this exact warning has been
+  present in every prior passing CI run) — this pass adds the durable
+  record, not a behavior change to the default warn-vs-fail policy. Making
+  a real (non-synthetic) run fail closed on this mismatch **by default**
+  remains open — see limitations below.
+- **CI dependency installation is now reproducible.** `requirements.txt`'s
+  entries are lower-bound ranges (`scikit-learn>=1.4.0`, etc.) — installing
+  from it alone does not reproduce a specific environment. A new
+  `constraints-ci.txt` pins the exact Linux/Python-3.11 versions this
+  project's tests are validated against (captured from an environment whose
+  independent resolution of the same unconstrained `requirements.txt`
+  matched every version the last completed CI job reported); `.github/workflows/tests.yml`
+  now installs via `pip install -r requirements.txt -c constraints-ci.txt`,
+  pins Python to `3.11.15`, records core dependency versions in the CI log,
+  and busts its pip cache when either file changes.
+- **CI workflow triggers fixed.** The `push` trigger referenced a specific,
+  temporary feature branch name that had already gone stale (the repository
+  had since moved to a different branch) — it now triggers on push/PR
+  against `main` plus an on-demand `workflow_dispatch`, so it keeps working
+  regardless of which branch is checked out.
+- **New reproducibility artifacts**: every run now writes `environment.json`
+  (Python version, platform, git SHA, working-tree dirty flag, synthetic
+  flag, and the installed version of every scientific dependency that could
+  affect results) and `preprocessing/final_artifact.json` (the full outer
+  `PreprocessingArtifact` this run used, cross-referenced with its own
+  fingerprint).
+
+**Fixed in the ninth pass** (see git history for the exact commits):
+
+- **CI's dependency installation was actually broken, not just imprecise.**
+  `constraints-ci.txt` only narrows a version pip is already trying to
+  install — it does not add `pytest` as a dependency, and `requirements.txt`
+  never listed it, so the CI job's test step failed with `No module named
+  pytest`. Fixed with a new `requirements-test.txt` (pytest only) installed
+  alongside `requirements.txt` via `pip install -r requirements.txt -r
+  requirements-test.txt -c constraints-ci.txt`, plus a `python -m pytest
+  --version` verification step so a future break in this chain fails at the
+  install step, not silently inside the test step.
+- **CI's "Record environment" step was silently producing fake output.**
+  It called `importlib.metadata.version(...)` without importing
+  `importlib.metadata` (only the parent `importlib` package), so every
+  lookup raised `AttributeError`, caught by a bare `except Exception` that
+  printed `UNAVAILABLE` for every package — and the whole step was wrapped
+  in `|| true`, so this never failed the build. It also looked up the
+  import name `sklearn` instead of the installable distribution name
+  `scikit-learn`, which would have returned `None`/not-found even with the
+  import fixed. Replaced with `src/benchmarks/env_versions.py`
+  (`collect_core_package_versions`), a small tested utility shared by CI
+  (`python -m benchmarks.env_versions`, which now exits non-zero if any
+  required package is missing — no `|| true`) and by
+  `reporting.py::_environment_snapshot`'s reproducibility artifact, so both
+  callers use the same correct distribution-name mapping.
+- **Real (non-diagnostic) preprocessing now fails closed on a
+  CellTypist/scikit-learn version mismatch by default.** The previous
+  passes recorded the mismatch as provenance but left the default
+  behavior permissive (`strict_sklearn_compatibility=False`, an opt-in
+  flag real pipeline entry points never set). `annotate_cell_types` no
+  longer has a `strict_sklearn_compatibility` parameter or a
+  `CELLTYPIST_STRICT_SKLEARN_COMPAT` environment-variable escape hatch —
+  strictness is now tied unconditionally to `allow_diagnostic_fallback`
+  (the same flag that already gated CellTypist *failure* fallback): a real
+  call (the default) raises `CellTypistCompatibilityError` — propagated
+  undisturbed, never wrapped in the generic `CellTypeAnnotationError` —
+  and `allow_diagnostic_fallback=True` is the only way to tolerate the
+  mismatch, which now always stamps `cell_type_annotation_degraded=True`
+  (previously it stayed `False`), so real `ExperimentContext` construction
+  automatically rejects a diagnostic-tolerated mismatch through the
+  existing degraded-provenance guard. `run_pipeline`/`run_pipeline_split_aware`
+  expose this only via an explicit `cell_type_allow_diagnostic_fallback`
+  config key that no real production config sets (absent = fail-closed by
+  default, not dependent on a caller remembering to pass anything).
+- **`fold_preprocessing.py::artifact_fingerprint` now incorporates
+  cell-type/compatibility provenance.** Previously scoped to gene
+  scaling/HVG selection only, so two artifacts with identical gene
+  statistics but different (or stale) cell-type annotation/compatibility
+  status collided on identity. Now includes
+  `cell_type_map_fingerprint`/`cell_type_annotation_mode`/
+  `cell_type_annotation_degraded`/`cell_type_annotation_compatibility` —
+  closing the gap disclosed in the eighth pass's limitations.
+- **CI action versions upgraded.** `actions/checkout@v4` and
+  `actions/setup-python@v5` both still ran on the Node 20 runtime GitHub
+  was warning about; upgraded to `actions/checkout@v7` and
+  `actions/setup-python@v6` (verified via each action's own `action.yml`
+  on its GitHub release tag: both declare `runs.using: node24`).
+
+**Known Phase 1 limitations remaining** (see `report.md`'s own limitations
+section for the same list, generated fresh per run): the neural/MIL bounded
+search spaces compared inside nested CV (both the outer-CV-fold and the
+OOF-fold-local selections) are deliberately small (one or two fixed
+candidates, e.g. `phase1_epochs`/`pretrain_epochs`), not a real
+hyperparameter grid — a full grid would mean many more full training runs
+per fold; Task A baselines still run in subject-summary mode only (one
+feature vector per subject) for their own training/prediction — the neural
+adapter is the only Task A model exercising true cell-level training, so
+"cell-weighted" metrics for baselines remain explicitly marked
+not-applicable rather than presented as real per-cell scores; the immutable
+artifact directory now has `environment.json` and
+`preprocessing/final_artifact.json` but still does not contain every file
+the ideal schema calls for — a sanitized `configuration.json` snapshot and a
+`models/final_model_manifest.json` recording the final candidate's
+architecture/hyperparameters/model-state fingerprint are not yet written
+(per-fold identity is already covered by the fold-local fingerprints in
+`metrics/*_folds_partitions.json`, now provenance-complete per the ninth
+pass above); this project has never had access to a CellTypist model
+reserialized against a matching scikit-learn version, so real (non-
+synthetic) preprocessing genuinely cannot complete in this environment
+without the disclosed `cell_type_allow_diagnostic_fallback` diagnostic
+override — this is the intended, honest fail-closed behavior, not a bug,
+and is not something a future pass can silently "fix" without an actually
+compatible upstream model; attention weights remain an interpretability
+aid, not a causal explanation, in every pooling variant.
+
 ## Pipeline
 
 ```
@@ -429,6 +968,18 @@ src/
   train.py                three-phase Trainer (cell-level, aggregator, end-to-end)
   evaluate.py             cell-level + subject-level metrics, interpretability report
   inference.py            Predictor — predict_subject / predict_batch / predict_h5ad, plus CLI
+  benchmarks/            Phase 1 leakage-free benchmarking (see "Benchmarking framework" above)
+    context.py             ExperimentContext — the one object every benchmark is built from
+    eligibility.py          Task A/B eligibility reports, computed before any training starts
+    features.py              subject-summary feature construction, out-of-fold helper
+    baselines.py              majority/prevalence, logistic, random forest, gradient boosting, small MLP
+    neural.py                  adapters wrapping Trainer/MultiSmokeCancerNet for CV comparison
+    metrics.py                  subject/cell-weighted F1, AUROC/AUPRC/Brier/ECE, bootstrap CI
+    cross_validation.py          grouped-CV runner around data/splitting.py::grouped_kfold
+    calibration.py                 OOF-based calibration + guarded one-time frozen-test evaluation
+    ood.py                          leave-one-dataset-source-out validation
+    reporting.py                    statistical comparison, immutable artifacts, Markdown/CSV report
+    runner.py                        CLI entry point (`python -m benchmarks.runner`)
 configs/
   default.yaml           data / model / train config used by model.py and train.py
 tests/                  one file per src/data module + model/pipeline integration tests
@@ -446,7 +997,8 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (222 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py` |
+| `tests/*` | All modules covered (495 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 24 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, and `test_benchmarks_final_evaluation.py`) |
+| `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
 | Real data — GSE994, GSE307690 | Downloaded, converted, harmonized, and actually trained on — see [Current results](#current-results-real-data) |
@@ -569,29 +1121,33 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
 ## Next steps
 
-- Run `preprocess.py::run_pipeline_split_aware()` on the real merged data
-  (GSE994 + GSE307690 + GSE123352 + GSE136831 once re-converted), then
-  actually train against the resulting split and report real held-out
-  macro-F1/balanced-accuracy/per-class-F1 — the tooling exists and is
-  tested; this experiment has not been run yet, so no held-out number can
-  be reported honestly today
-- Re-run Phase 1 training with the inverse-frequency class weighting
-  (`CellLevelDataset.smoke_class_weights`, `train.py`) against a real
-  held-out split, not the training-set numbers in the table above
-- Build the baseline-model runner from the improvement plan (majority-class,
-  logistic regression, random forest, small MLP) on the same subject-level
-  splits, so the neural model's real held-out macro-F1 can be judged against
-  something simpler rather than assumed better
-- Wire `grouped_kfold()` into an actual training loop for a real
-  cross-validation experiment (aggregate mean/std/median across folds)
-- Add validation-selected threshold + calibration reporting for the cancer
-  head instead of the current fixed, non-clinical 0.70 cutoff
+- Run `python -m benchmarks.runner` against the real merged data (GSE994 +
+  GSE307690 + GSE123352 + GSE136831 once re-converted) for both tasks — the
+  framework exists and is tested against synthetic data, but has not been
+  run against real data yet, so no real baseline-vs-neural comparison number
+  can be reported honestly today
+- Wire the neural/MIL adapter into the same one-shot frozen-threshold final
+  test evaluation path baselines already use (`benchmarks/runner.py::run_cancer_task`
+  currently only does this for baseline models — a documented, not silent, gap)
+- Wire the declared hyperparameter search spaces (`baselines.py`'s
+  `SMOKE_SEARCH_SPACE`/`CANCER_SEARCH_SPACE`) into an actual nested-grouped-CV
+  selection loop — every baseline currently trains with defaults only, the
+  search spaces are unused constants today
+- Implement true cell-mode Task A evaluation (fit baselines directly on
+  capped per-subject cells, not just subject-summary features) so
+  cell-weighted metrics stop being marked not-applicable for baselines
 - Get a GDC token and NLST DUA to unlock TCGA-LUAD/LUSC (real malignancy
-  labels) and NLST (real cancer outcomes + cigar/dual-use history)
+  labels) and NLST (real cancer outcomes + cigar/dual-use history) — this
+  also unblocks Task B eligibility on real data, not just the current
+  synthetic CI check
 - Add a subject-aware/subject-capped sampler (bound max cells sampled per
   subject per epoch) so a handful of subjects with very large cell counts
   can't dominate a training epoch — class weights are now train-split-only,
-  but no per-epoch subject-balancing sampler exists yet
+  but no per-epoch subject-balancing sampler exists yet (`benchmarks/features.py::cap_cells_per_subject`
+  exists for benchmark baselines but is not yet wired into `train.py`'s own curriculum)
+- Phase 2+ of the wider improvement plan (causal modelling, counterfactual
+  generation, pathway-constrained learning, foundation-model integration) is
+  explicitly out of scope for this benchmarking framework and not started
 - Add explicit bulk-vs-single-cell-vs-MIL experiment-mode separation and
   species-provenance tracking (GSE288003's mouse→human ortholog mapping
   still runs unconditionally with no recorded mapped/unmapped gene counts)
