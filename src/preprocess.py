@@ -375,6 +375,7 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     # on reload that its cell-type IDs mean the same thing this run's did.
     artifact.cell_type_map_fingerprint = merged.uns.get("cell_type_map_fingerprint")
     artifact.cell_type_annotation_mode = merged.uns.get("cell_type_annotation_mode")
+    artifact.cell_type_annotation_degraded = merged.uns.get("cell_type_annotation_degraded")
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────

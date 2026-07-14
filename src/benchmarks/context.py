@@ -122,6 +122,24 @@ def _validate_context(
                     f"{b['gene_matrix'].shape[1]} genes, preprocessing_artifact has {n_genes}."
                 )
 
+    # 3b. reject a degraded (diagnostic-fallback) cell-type annotation for a
+    # real pipeline result — this check only runs here, inside
+    # from_pipeline_result, never for a hand-built synthetic context (see
+    # build_synthetic_context in runner.py, which constructs
+    # ExperimentContext directly and never calls this function) — so a real
+    # run can never silently proceed on every-cell-labeled-epithelial
+    # placeholder annotations produced by data/transforms.py::
+    # annotate_cell_types's allow_diagnostic_fallback path.
+    if getattr(preprocessing_artifact, "cell_type_annotation_degraded", False):
+        raise ValueError(
+            "ExperimentContext: preprocessing_artifact.cell_type_annotation_degraded=True — "
+            "this pipeline result's cell-type annotation came from CellTypist's diagnostic "
+            "fallback (every cell assigned the same placeholder label after CellTypist itself "
+            "failed), not a real per-cell prediction. Refusing to build a real ExperimentContext "
+            "from it. Re-run preprocessing with CellTypist available, or use this result only for "
+            "a deliberate, clearly-labelled diagnostic run."
+        )
+
     # 4. artifact's embedded label mapping matches the context's label_mapping
     if preprocessing_artifact.label_mapping is not None:
         artifact_mapping = EffectiveLabelMapping.from_dict(preprocessing_artifact.label_mapping)
@@ -229,24 +247,34 @@ class ExperimentContext:
             "config_fingerprint": self.config_fingerprint,
         }
 
-    def guard_identity_fingerprint(self, selected_model: str) -> str:
+    def guard_identity_fingerprint(self, selected_model: str, extra: Optional[Dict] = None) -> str:
         """
         SHA-256 identity key for the durable frozen-test guard (see
         test_guard.py): manifest + preprocessing + label-mapping +
-        configuration + the selected final model, combined. Deliberately
+        configuration + the selected final model, combined with whatever
+        additional dev-only-derived fingerprints/parameters the caller
+        passes via `extra` (e.g. selected hyperparameters, the FINAL
+        development-refit preprocessing/model fingerprints, calibration
+        parameters, the frozen threshold — see runner.py). Deliberately
         independent of any run_id/run_dir name — two runs given DIFFERENT
-        output directory names but the SAME underlying data/config/model
-        selection must resolve to the SAME guard identity, so a fresh
-        `--run-id` cannot be used to bypass the one-time test-evaluation
-        guard for scientifically identical conditions.
+        output directory names but the SAME underlying data/config/model/
+        hyperparameter selection must resolve to the SAME guard identity,
+        so a fresh `--run-id` cannot be used to bypass the one-time
+        test-evaluation guard for scientifically identical conditions.
+        Changing any selected hyperparameter or the final model fingerprint
+        changes this identity, so a genuinely different final candidate is
+        never blocked by a guard file recorded for a different one.
         """
-        blob = json.dumps({
+        payload = {
             "split_manifest_fingerprint": self.split_manifest.fingerprint,
             "preprocessing_artifact_fingerprint": self.preprocessing_artifact_fingerprint,
             "label_mapping_fingerprint": self.label_mapping_fingerprint,
             "config_fingerprint": self.config_fingerprint,
             "selected_model": selected_model,
-        }, sort_keys=True, default=str).encode("utf-8")
+        }
+        if extra:
+            payload["extra"] = extra
+        blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()
 
     def validate_run_identity(self, expected: Dict[str, Optional[str]]) -> None:

@@ -157,6 +157,97 @@ def test_annotate_cell_types_persists_fingerprint_and_mode(monkeypatch):
     assert out.uns["cell_type_annotation_mode"] == "inductive_per_cell"
 
 
+def _install_broken_celltypist(monkeypatch):
+    def fake_annotate(adata, model, majority_voting):
+        raise RuntimeError("simulated CellTypist model download failure")
+    fake_models = types.SimpleNamespace(Model=types.SimpleNamespace(load=lambda model: object()))
+    fake_celltypist = types.SimpleNamespace(annotate=fake_annotate, models=fake_models)
+    monkeypatch.setitem(sys.modules, "celltypist", fake_celltypist)
+    monkeypatch.setitem(sys.modules, "celltypist.models", fake_models)
+
+
+def test_celltypist_failure_raises_by_default(monkeypatch):
+    from data.transforms import CellTypeAnnotationError, annotate_cell_types
+
+    _install_broken_celltypist(monkeypatch)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    with pytest.raises(CellTypeAnnotationError, match="simulated CellTypist model download failure"):
+        annotate_cell_types(adata)
+
+
+def test_celltypist_failure_with_explicit_fallback_stamps_degraded(monkeypatch):
+    from data.transforms import annotate_cell_types
+
+    _install_broken_celltypist(monkeypatch)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata, allow_diagnostic_fallback=True)
+
+    assert out.uns["cell_type_annotation_degraded"] is True
+    assert out.uns["cell_type_annotation_mode"] == "diagnostic_fallback"
+    assert "cell_type_fallback_reason" in out.uns
+    assert set(out.obs["cell_type_name"].unique()) == {"epithelial"}
+    assert (out.obs["cell_type_id"] == out.obs["cell_type_id"].iloc[0]).all()
+
+
+def test_successful_annotation_is_not_marked_degraded(monkeypatch):
+    from data.transforms import annotate_cell_types
+
+    calls = []
+    _install_fake_celltypist(monkeypatch, calls)
+    n, g = 4, 3
+    adata = ad.AnnData(X=np.ones((n, g), dtype="float32"), obs=_obs(n),
+                        var=pd.DataFrame(index=[f"G{i}" for i in range(g)]))
+    out = annotate_cell_types(adata)
+    assert out.uns["cell_type_annotation_degraded"] is False
+
+
+def test_context_validation_rejects_degraded_annotation_in_real_mode():
+    from benchmarks.context import ExperimentContext
+    from data.label_mapping import identity_label_mapping
+    from data.preprocessing import PreprocessingArtifact
+    from data.splitting import SplitManifest
+    from train import CellLevelDataset
+
+    n_genes = 3
+    train_subj = ["s0", "s1"]
+    val_subj = ["s2"]
+    test_subj = ["s3"]
+    ds = CellLevelDataset(
+        gene_matrix=np.zeros((2, n_genes), dtype="float32"), smoke_labels=np.array([0, 1]),
+        malignancy_labels=np.zeros(2, dtype="float32"), cell_type_ids=np.zeros(2, dtype=np.int64),
+        subject_ids=np.array(train_subj, dtype=object), dataset_source=np.array(["a", "a"], dtype=object),
+    )
+    val_ds = CellLevelDataset(
+        gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([0]),
+        malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
+        subject_ids=np.array(val_subj, dtype=object), dataset_source=np.array(["a"], dtype=object),
+    )
+    test_ds = CellLevelDataset(
+        gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([1]),
+        malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
+        subject_ids=np.array(test_subj, dtype=object), dataset_source=np.array(["a"], dtype=object),
+    )
+    artifact = PreprocessingArtifact(
+        version="1", gene_list=[f"g{i}" for i in range(n_genes)], gene_means=[0.0] * n_genes,
+        gene_stds=[1.0] * n_genes, n_hvgs=n_genes, smoke_marker_genes_forced=[],
+        fit_n_cells=2, fit_n_subjects=2, cell_type_annotation_degraded=True,
+    )
+    manifest = SplitManifest(seed=1, train_subjects=train_subj, val_subjects=val_subj, test_subjects=test_subj)
+    mapping = identity_label_mapping({0: "cigarette", 1: "vape"})
+    result = {
+        "train_cell_dataset": ds, "val_cell_dataset": val_ds, "test_cell_dataset": test_ds,
+        "train_bags": [], "val_bags": [], "test_bags": [], "split_manifest": manifest,
+        "preprocessing_artifact": artifact, "label_mapping": mapping, "rare_class_report": {},
+        "label_provenance_report": {}, "transductive_batch_correction": False,
+    }
+    with pytest.raises(ValueError, match="cell_type_annotation_degraded"):
+        ExperimentContext.from_pipeline_result(result, config={})
+
+
 def test_preprocessing_artifact_persists_cell_type_map_fingerprint():
     from data.preprocessing import PreprocessingArtifact
     from data.transforms import cell_type_map_fingerprint

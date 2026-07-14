@@ -100,6 +100,29 @@ class NeuralCancerAdapter:
         self.fit_seconds = time.time() - t0
         return self
 
+    def fit_final(
+        self, context,
+        dev_cell_dataset: CellLevelDataset, dev_subject_dataset: SubjectLevelDataset,
+        seed: int = 42, pretrain_epochs: Optional[int] = None, phase2_epochs: Optional[int] = None,
+    ) -> "NeuralCancerAdapter":
+        """
+        The ONE final MIL fit for the frozen-test protocol (blocker 3): every
+        subject in dev_cell_dataset/dev_subject_dataset contributes to
+        gradient updates — unlike fit() above, there is no internal
+        validation split held out for checkpoint selection. pretrain_epochs/
+        phase2_epochs must already be decided from development-only nested-
+        CV/OOF evidence before this runs (never selected here); None falls
+        back to this context's configured defaults.
+        """
+        t0 = time.time()
+        self.trainer = Trainer.from_experiment_context(
+            context, device=self.device, seed=seed, pooling=self.pooling,
+        )
+        self.trainer.phase1_final_fit(dev_cell_dataset, epochs=pretrain_epochs)
+        self.trainer.phase2_final_fit(dev_subject_dataset, epochs=phase2_epochs)
+        self.fit_seconds = time.time() - t0
+        return self
+
     def predict_proba(self, subject_dataset: SubjectLevelDataset) -> np.ndarray:
         self.trainer.model.eval()
         probs = []

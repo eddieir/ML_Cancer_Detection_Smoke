@@ -1,10 +1,12 @@
 """
-Regression tests for PR7 blockers 2 and 5: neural/MIL candidates must be
+Regression tests for the frozen-test protocol: neural/MIL candidates must be
 able to win the final frozen-test evaluation on the same footing as
-classical baselines, and the final development/fit/calibration protocol
-must generate subject-grouped OOF predictions across the whole train+val
-pool, calibrate/select the threshold from those OOF predictions only, and
-refit once on the whole development pool before the single test evaluation.
+classical baselines; each OOF fold must select its OWN hyperparameters from
+only its own OOF-training subjects (never leaking a held-out subject's
+influence into the configuration used to predict it); and the development-
+only final fit (fit_final_candidate_on_dev_pool) must be structurally
+incapable of reading test data — evaluate_frozen_test is the only function
+that touches it, and only after runner.py acquires the durable guard.
 """
 import shutil
 import sys
@@ -16,10 +18,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from benchmarks.final_evaluation import (
+    FittedFinalCandidate,
     NoEligibleFinalCandidateError,
+    evaluate_frozen_test,
+    fit_final_candidate_on_dev_pool,
     generate_subject_oof_predictions,
     is_mil_candidate,
-    refit_final_candidate_on_dev_pool,
     select_final_candidate,
 )
 from benchmarks.runner import build_synthetic_context
@@ -64,39 +68,38 @@ def test_no_eligible_candidate_raises_instead_of_silently_falling_back():
         select_final_candidate(cv_report, ["prevalence"])
 
 
-# ─── generate_subject_oof_predictions ──────────────────────────────────────
+# ─── generate_subject_oof_predictions: selection-clean OOF ─────────────────
 
-def test_oof_predictions_cover_every_dev_subject_exactly_once():
-    ctx = build_synthetic_context(seed=3, fast=True)
+def _dev_pool(ctx):
     all_bags = list(ctx.train_bags) + list(ctx.val_bags)
     outcomes = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
     dev_subjects = sorted(outcomes.keys())
     num_cell_types = ctx.config["model"]["num_cell_types"]
     min_cells = ctx.config["data"]["min_cells_per_subject"]
     n_hvgs = ctx.preprocessing_artifact.n_hvgs
+    return outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs
+
+
+def test_oof_predictions_cover_every_dev_subject_exactly_once():
+    ctx = build_synthetic_context(seed=3, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
 
     oof = generate_subject_oof_predictions(
-        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs,
-        device="cpu", seed=42, n_folds=3,
+        ctx, "logistic", dev_subjects, outcomes, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42, n_folds=3, n_inner_folds=2,
     )
     assert set(oof["oof_by_subject"].keys()) == set(oof["dev_subjects"])
-    # no duplicate coverage: every fold's val subjects partition dev_subjects
     all_val = [s for f in oof["fold_membership"] for s in f.get("val_subject_ids", [])]
     assert len(all_val) == len(set(all_val))
 
 
 def test_oof_prediction_never_from_a_model_trained_on_that_subject():
     ctx = build_synthetic_context(seed=3, fast=True)
-    all_bags = list(ctx.train_bags) + list(ctx.val_bags)
-    outcomes = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
-    dev_subjects = sorted(outcomes.keys())
-    num_cell_types = ctx.config["model"]["num_cell_types"]
-    min_cells = ctx.config["data"]["min_cells_per_subject"]
-    n_hvgs = ctx.preprocessing_artifact.n_hvgs
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
 
     oof = generate_subject_oof_predictions(
-        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs,
-        device="cpu", seed=42, n_folds=3,
+        ctx, "logistic", dev_subjects, outcomes, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42, n_folds=3, n_inner_folds=2,
     )
     for fold in oof["fold_membership"]:
         train_set = set(fold.get("train_subject_ids", []))
@@ -106,75 +109,126 @@ def test_oof_prediction_never_from_a_model_trained_on_that_subject():
 
 def test_oof_generation_deterministic_given_seed():
     ctx = build_synthetic_context(seed=3, fast=True)
-    all_bags = list(ctx.train_bags) + list(ctx.val_bags)
-    outcomes = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
-    dev_subjects = sorted(outcomes.keys())
-    num_cell_types = ctx.config["model"]["num_cell_types"]
-    min_cells = ctx.config["data"]["min_cells_per_subject"]
-    n_hvgs = ctx.preprocessing_artifact.n_hvgs
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
 
     oof1 = generate_subject_oof_predictions(
-        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs,
-        device="cpu", seed=42, n_folds=3,
+        ctx, "logistic", dev_subjects, outcomes, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42, n_folds=3, n_inner_folds=2,
     )
     oof2 = generate_subject_oof_predictions(
-        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs,
-        device="cpu", seed=42, n_folds=3,
+        ctx, "logistic", dev_subjects, outcomes, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42, n_folds=3, n_inner_folds=2,
     )
     assert oof1["oof_by_subject"] == oof2["oof_by_subject"]
 
 
-# ─── refit_final_candidate_on_dev_pool ─────────────────────────────────────
+def test_each_oof_fold_has_its_own_fold_local_hyperparameter_search():
+    """The old (leaky) contract accepted ONE globally-selected params dict
+    and reused it for every OOF subject. The corrected contract has each
+    fold run its own inner-CV selection recorded on the fold's own record —
+    two folds with different OOF-training subjects are free to select
+    different candidates."""
+    ctx = build_synthetic_context(seed=3, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
 
-def test_final_refit_artifact_fit_only_on_dev_subjects():
-    ctx = build_synthetic_context(seed=4, fast=True)
-    all_bags = list(ctx.train_bags) + list(ctx.val_bags)
-    outcomes = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
-    test_outcomes = {str(b["subject_id"]): b["cancer_label"] for b in ctx.test_bags if b.get("cancer_label_known")}
-    dev_subjects = sorted(outcomes.keys())
-    test_subjects = ctx.subjects_for("test")
-    num_cell_types = ctx.config["model"]["num_cell_types"]
-    min_cells = ctx.config["data"]["min_cells_per_subject"]
-    n_hvgs = ctx.preprocessing_artifact.n_hvgs
-
-    result = refit_final_candidate_on_dev_pool(
-        ctx, "logistic", dev_subjects, test_subjects, {**outcomes, **test_outcomes},
-        {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    oof = generate_subject_oof_predictions(
+        ctx, "logistic", dev_subjects, outcomes, num_cell_types, min_cells, n_hvgs,
+        device="cpu", seed=42, n_folds=3, n_inner_folds=2,
     )
-    assert result["preprocessing_artifact"].fit_n_subjects == len(dev_subjects)
-    assert set(result["test_subject_ids"]) <= set(test_subjects)
-    assert len(result["test_proba"]) == len(result["test_subject_ids"])
+    for fold in oof["fold_membership"]:
+        assert "hyperparameter_search" in fold
+        hp = fold["hyperparameter_search"]
+        assert "selected_params" in hp
+        # every inner fold's train/val subjects must be subsets of THIS
+        # OOF fold's own OOF-training subjects, never its OOF-held-out side
+        oof_train = set(fold["train_subject_ids"])
+        for inner in hp.get("inner_folds", []):
+            assert set(inner["train"]) <= oof_train
+            assert set(inner["val"]) <= oof_train
 
 
-def test_final_refit_test_predictions_change_with_test_expression_but_not_dev_fit():
+def test_corrupting_a_subject_outside_the_oof_training_set_does_not_change_fold_selection():
+    """An OOF-held-out (or otherwise excluded) subject's outcome must not
+    influence the hyperparameters selected for a fold whose OOF-training set
+    does not contain it — _oof_fold_hyperparameters only ever reads
+    outcomes_by_subject for subjects inside outer_train_subjects (via
+    select_nested_hyperparameters_with_refit's own outer_train_subjects
+    argument), so corrupting an excluded subject's label must not change
+    what that fold selects. (A full generate_subject_oof_predictions
+    end-to-end comparison is not used here because corrupting a subject's
+    label also changes grouped_kfold's stratified OUTER fold assignment —
+    this isolates the fold-local selection step itself.)"""
+    from benchmarks.final_evaluation import _oof_fold_hyperparameters
+
+    ctx = build_synthetic_context(seed=3, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    oof_train_subjects = dev_subjects[:-1]
+    excluded_subject = dev_subjects[-1]
+
+    hp1 = _oof_fold_hyperparameters(
+        ctx, "logistic", oof_train_subjects, outcomes,
+        num_cell_types, min_cells, n_hvgs, "attention", "cpu", 42, 2,
+    )
+    corrupted = dict(outcomes)
+    corrupted[excluded_subject] = 1 - corrupted[excluded_subject]
+    hp2 = _oof_fold_hyperparameters(
+        ctx, "logistic", oof_train_subjects, corrupted,
+        num_cell_types, min_cells, n_hvgs, "attention", "cpu", 42, 2,
+    )
+    assert hp1["selected_params"] == hp2["selected_params"]
+
+
+# ─── fit_final_candidate_on_dev_pool / evaluate_frozen_test ───────────────
+
+def test_final_dev_fit_signature_accepts_no_test_data():
+    """fit_final_candidate_on_dev_pool structurally cannot be handed test
+    subject IDs/labels — it has no such parameter, unlike the old
+    (blocker-1-violating) refit_final_candidate_on_dev_pool."""
+    import inspect
+    sig = inspect.signature(fit_final_candidate_on_dev_pool)
+    names = set(sig.parameters.keys())
+    assert "test_subjects" not in names
+    assert "test_outcomes_by_subject" not in names
+
+
+def test_final_dev_fit_artifact_fit_only_on_dev_subjects():
+    ctx = build_synthetic_context(seed=4, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    fitted = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    )
+    assert isinstance(fitted, FittedFinalCandidate)
+    assert fitted.preprocessing_artifact.fit_n_subjects == len(dev_subjects)
+    assert set(fitted.dev_subject_ids) <= set(dev_subjects)
+
+
+def test_evaluate_frozen_test_transforms_but_never_refits_the_dev_artifact():
     """The final artifact's scaling statistics must be identical whether or
     not test expression is corrupted — test rows are only ever TRANSFORMED
-    through it, never used to FIT it."""
+    through it in evaluate_frozen_test, never used to FIT it."""
     ctx = build_synthetic_context(seed=4, fast=True)
-    all_bags = list(ctx.train_bags) + list(ctx.val_bags)
-    outcomes = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
     test_outcomes = {str(b["subject_id"]): b["cancer_label"] for b in ctx.test_bags if b.get("cancer_label_known")}
-    dev_subjects = sorted(outcomes.keys())
     test_subjects = ctx.subjects_for("test")
-    num_cell_types = ctx.config["model"]["num_cell_types"]
-    min_cells = ctx.config["data"]["min_cells_per_subject"]
-    n_hvgs = ctx.preprocessing_artifact.n_hvgs
 
-    r1 = refit_final_candidate_on_dev_pool(
-        ctx, "logistic", dev_subjects, test_subjects, {**outcomes, **test_outcomes},
-        {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    fitted1 = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
     )
-
     ctx2 = build_synthetic_context(seed=4, fast=True)
     na = ctx2.normalized_adata_for_refit
     mask = na.obs["subject_id"].astype(str).isin(set(test_subjects)).values
     na.X[mask] = na.X[mask] + 0.0  # no-op corruption placeholder kept deterministic
-    r2 = refit_final_candidate_on_dev_pool(
-        ctx2, "logistic", dev_subjects, test_subjects, {**outcomes, **test_outcomes},
-        {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    fitted2 = fit_final_candidate_on_dev_pool(
+        ctx2, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
     )
-    assert r1["preprocessing_artifact"].gene_means == r2["preprocessing_artifact"].gene_means
-    assert r1["preprocessing_artifact"].gene_stds == r2["preprocessing_artifact"].gene_stds
+    assert fitted1.preprocessing_artifact.gene_means == fitted2.preprocessing_artifact.gene_means
+    assert fitted1.preprocessing_artifact.gene_stds == fitted2.preprocessing_artifact.gene_stds
+
+    raw = evaluate_frozen_test(fitted1, ctx, test_subjects, test_outcomes, num_cell_types, min_cells)
+    assert len(raw["test_proba"]) == len(raw["test_subject_ids"])
+    assert set(raw["test_subject_ids"]) <= set(test_subjects)
 
 
 # ─── end-to-end: MIL winning the CV feeds through the same frozen path ─────
@@ -197,8 +251,6 @@ def test_mil_candidate_flows_through_full_run_cancer_task(monkeypatch):
     # synthetic CV score, so this test exercises the MIL path through
     # selection -> OOF -> calibration -> guard -> test evaluation without
     # depending on synthetic data producing a specific ranking.
-    real_select = runner_mod.select_final_candidate
-
     def _force_mil(cv_report, model_names, primary_metric="auroc"):
         return "attention_mil", {"ranked": [{"name": "attention_mil", "score": 1.0, "kind": "mil"}],
                                   "ineligible": [], "primary_metric": primary_metric}
@@ -215,3 +267,39 @@ def test_mil_candidate_flows_through_full_run_cancer_task(monkeypatch):
     assert report["selected_model"] == "attention_mil"
     assert "test_result" in report
     assert report["final_model_metadata"]["pooling"] == "attention"
+
+
+def test_mil_final_fit_trains_on_every_eligible_development_subject(monkeypatch):
+    """Blocker 3: unlike the CV/OOF fold fits (which still hold out a real
+    validation split for Trainer's checkpoint selection), the FINAL MIL
+    refit must place every eligible development subject's cells into
+    Trainer.phase1_final_fit/phase2_final_fit's gradient-update datasets —
+    none held out for an internal validation carve-out."""
+    from train import Trainer
+
+    ctx = build_synthetic_context(seed=6, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    seen = {}
+    orig_p1 = Trainer.phase1_final_fit
+    orig_p2 = Trainer.phase2_final_fit
+
+    def spy_p1(self, train_cell_dataset, **kw):
+        seen["phase1_subjects"] = set(str(s) for s in train_cell_dataset.subject_ids.tolist())
+        return orig_p1(self, train_cell_dataset, **kw)
+
+    def spy_p2(self, train_subject_dataset, **kw):
+        seen["phase2_subjects"] = {str(b["subject_id"]) for b in train_subject_dataset.bags}
+        return orig_p2(self, train_subject_dataset, **kw)
+
+    monkeypatch.setattr(Trainer, "phase1_final_fit", spy_p1)
+    monkeypatch.setattr(Trainer, "phase2_final_fit", spy_p2)
+
+    fitted = fit_final_candidate_on_dev_pool(
+        ctx, "attention_mil", dev_subjects, outcomes, {"pretrain_epochs": 1},
+        num_cell_types, min_cells, n_hvgs, pooling="attention", device="cpu", seed=42,
+    )
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+    assert seen["phase2_subjects"] == set(fitted.dev_subject_ids)
+    assert seen["phase1_subjects"] >= seen["phase2_subjects"]

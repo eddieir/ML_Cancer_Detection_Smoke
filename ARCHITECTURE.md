@@ -765,5 +765,51 @@ section):
    subjects (using the already-selected configuration, never reselected)
    before the single guarded test evaluation.
 
+A fifth pass closed five further problems the fourth pass's own claims did
+not actually hold up to (see README's Benchmarking framework section for
+the full list):
+
+1. **The frozen-test guard is now acquired before ANY test access**, not
+   just before the final metric computation. `run_cancer_task`
+   (`benchmarks/runner.py`) is split into a development-only stage —
+   `select_final_candidate`, `generate_subject_oof_predictions`,
+   `fit_final_candidate_on_dev_pool` (`final_evaluation.py`), none of which
+   accept test subject IDs/bags/labels as arguments — and a guarded stage
+   whose only test-touching call, `evaluate_frozen_test`, runs strictly
+   inside the `try` block that follows `FrozenTestGuard.acquire()`.
+   Previously test labels/predictions were already computed by
+   `refit_final_candidate_on_dev_pool` before the guard was acquired.
+2. **OOF predictions are now selection-clean.** The old
+   `generate_subject_oof_predictions` accepted one globally-selected
+   hyperparameter dict and reused it for every OOF fold — an OOF-held-out
+   subject's own label had already influenced the configuration used to
+   predict it. `final_evaluation._oof_fold_hyperparameters` now runs a
+   fresh inner grouped-CV selection per OOF fold, using only that fold's
+   OOF-training subjects, mirroring the same nested pattern the outer CV
+   loop already used.
+3. **The final MIL fit trains on every eligible development subject.**
+   `Trainer.phase1_final_fit`/`phase2_final_fit` (`train.py`) are new
+   fixed-epoch training methods with no internal validation carve-out or
+   validation-based checkpoint selection; `NeuralCancerAdapter.fit_final`
+   (`benchmarks/neural.py`) uses them for the final dev-pool refit. The
+   fourth pass's claim that only classical baselines used every development
+   subject (with MIL "documented" as carving out a validation slice) is
+   resolved, not merely disclosed.
+4. **CellTypist failure fails loudly by default.** `annotate_cell_types()`
+   (`data/transforms.py`) previously printed a warning on any CellTypist
+   exception and returned `adata` unchanged — `obs["cell_type_id"]` ended
+   up missing or stale, not actually defaulted to anything despite the
+   printed message claiming "defaulting to epithelial". It now raises
+   `CellTypeAnnotationError` unless `allow_diagnostic_fallback=True` is
+   explicitly passed (never by `preprocess.py`'s real pipeline entry
+   points); the fallback path stamps
+   `PreprocessingArtifact.cell_type_annotation_degraded=True`, which
+   `ExperimentContext.from_pipeline_result` rejects outright.
+5. **Real OOF predictions are persisted.** `predictions/cancer_<candidate>_oof.csv`
+   now carries one row per development subject with its actual OOF
+   probability and fold-local selected-hyperparameters/fingerprint columns
+   (`runner.py::_write_oof_predictions_csv`) — previously only fold
+   membership counts were written under `calibration_report["oof_summary"]`.
+
 Full list of what's fixed vs. still open: README's Benchmarking framework
 section.

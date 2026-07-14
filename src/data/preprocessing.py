@@ -71,6 +71,14 @@ class PreprocessingArtifact:
     # dataset-dependent) — see annotate_cell_types(). None if annotation
     # never ran.
     cell_type_annotation_mode:  Optional[str] = None
+    # True only when annotate_cell_types() fell back to a fixed placeholder
+    # label for every cell after CellTypist itself failed (see
+    # allow_diagnostic_fallback in data/transforms.py) — never a real,
+    # scientifically meaningful per-cell annotation. None/False for a normal
+    # artifact. ExperimentContext.from_pipeline_result rejects an artifact
+    # with this set to True (see benchmarks/context.py) — a real run must
+    # never silently proceed on degraded cell-type labels.
+    cell_type_annotation_degraded: Optional[bool] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

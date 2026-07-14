@@ -39,13 +39,14 @@ from .cross_validation import (
 from .eligibility import check_task_a_eligibility, check_task_b_eligibility
 from .final_evaluation import (
     NoEligibleFinalCandidateError,
+    evaluate_frozen_test,
+    fit_final_candidate_on_dev_pool,
     generate_subject_oof_predictions,
     is_mil_candidate,
-    refit_final_candidate_on_dev_pool,
     select_final_candidate,
 )
 from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
-from .reporting import compare_models, new_run_dir, write_benchmark_report
+from .reporting import compare_models, new_run_dir, write_benchmark_report, write_csv_table, write_json
 from .ood import run_leave_one_source_out
 from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError, default_guard_dir
 
@@ -215,9 +216,11 @@ def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outco
     """
     ONE hyperparameter/config selection for the chosen final candidate,
     computed by nested nested-CV over the WHOLE development pool (train+val
-    subjects — never test). This selection happens exactly once; both
-    generate_subject_oof_predictions and refit_final_candidate_on_dev_pool
-    reuse its result rather than re-searching.
+    subjects — never test). This selection is used only for the final
+    dev-pool fit (fit_final_candidate_on_dev_pool) — generate_subject_oof_
+    predictions performs its OWN fold-local selection per OOF fold instead
+    of reusing this one, so an OOF-held-out subject's label never
+    influences the configuration used to predict it.
     """
     if is_mil_candidate(best_name):
         candidates = build_param_grid(MIL_SEARCH_SPACE)
@@ -230,6 +233,55 @@ def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outco
         context, dev_subjects, outcomes_by_subject, candidates, fit_score_fn=fit_score_fn,
         seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
     )
+
+
+def _write_oof_predictions_csv(run_dir, oof: dict, outcomes_by_subject: dict, candidate_name: str, pooling: str) -> None:
+    """
+    Persist ONE row per development subject with a validated OOF prediction
+    (generate_subject_oof_predictions already rejected missing/duplicate/
+    in-fold-leaked coverage before returning `oof`) to
+    predictions/cancer_<candidate>_oof.csv — the actual subject-level
+    probabilities, not just the fold-membership counts calibration_report's
+    "oof_summary" carries. write_json/write_csv_table (reporting.py) write
+    complete files in one shot (json.dump / csv.DictWriter.writerows over
+    an already-fully-built object), never a partially-written file that
+    could be mistaken for a complete one.
+    """
+    import json as _json
+
+    fold_by_subject = {}
+    for fold in oof["fold_membership"]:
+        fp = fold.get("preprocessing_fingerprint")
+        hp = fold.get("hyperparameter_search", {})
+        selected_params_json = _json.dumps(hp.get("selected_params", {}), sort_keys=True)
+        inner_selection_fp = hashlib.sha256(_json.dumps(hp, sort_keys=True, default=str).encode()).hexdigest()
+        training_fp = _json.dumps(fold.get("train_subject_ids", []), sort_keys=True)
+        for sid in fold.get("val_subject_ids", []):
+            fold_by_subject[sid] = {
+                "outer_oof_fold": fold["fold"], "preprocessing_fingerprint": fp,
+                "selected_params_json": selected_params_json,
+                "inner_selection_fingerprint": inner_selection_fp,
+                "training_subjects_fingerprint": training_fp,
+            }
+
+    rows = []
+    for sid in oof["dev_subjects"]:
+        meta = fold_by_subject.get(sid, {})
+        proba = oof["oof_by_subject"].get(sid)
+        rows.append({
+            "subject_id": sid, "target": outcomes_by_subject.get(sid),
+            "probability": proba, "seed": oof.get("seed"),
+            "outer_oof_fold": meta.get("outer_oof_fold"), "candidate_name": candidate_name,
+            "candidate_type": "mil" if is_mil_candidate(candidate_name) else "baseline",
+            "pooling": pooling if is_mil_candidate(candidate_name) else "",
+            "selected_params_json": meta.get("selected_params_json", ""),
+            "training_subjects_fingerprint": meta.get("training_subjects_fingerprint", ""),
+            "preprocessing_fingerprint": meta.get("preprocessing_fingerprint", ""),
+            "prediction_status": "predicted" if proba is not None else "undefined",
+            "undefined_reason": "" if proba is not None else "subject never received an OOF prediction",
+        })
+    write_csv_table(run_dir / "predictions" / f"cancer_{candidate_name}_oof.csv", rows)
+    write_json(run_dir / "metrics" / "cancer_oof_folds.json", oof["fold_membership"])
 
 
 def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
@@ -247,23 +299,20 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             continue
         comparisons.append(compare_models(cv_report["results"], "auroc", name, baseline_ref))
 
-    # ── Final one-shot frozen-test evaluation ────────────────────────────
-    # Candidates are ranked using CV/development evidence ONLY (blocker 2):
-    # a classical baseline and a neural/MIL model compete on exactly the
-    # same footing, and the winner is never silently swapped for a baseline.
+    # ══════════════════════════════════════════════════════════════════════
+    # STAGE A — development-only. Every call below may read train_bags/
+    # val_bags and CV-report evidence, but NEVER context.test_bags, NEVER
+    # context.subjects_for("test"), NEVER a test label/probability. This is
+    # enforced structurally: select_final_candidate/generate_subject_oof_
+    # predictions/fit_final_candidate_on_dev_pool (final_evaluation.py) do
+    # not accept test data as an argument at all.
+    # ══════════════════════════════════════════════════════════════════════
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
     n_hvgs = context.preprocessing_artifact.n_hvgs
     min_cells = context.config.get("data", context.config).get("min_cells_per_subject", 50)
     all_dev_bags = list(context.train_bags) + list(context.val_bags)
     outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"] for b in all_dev_bags if b.get("cancer_label_known")}
     dev_subjects = sorted(outcomes_by_subject.keys())
-    # Test outcomes are needed ONLY by the single sanctioned final test
-    # evaluation below (refit_final_candidate_on_dev_pool's test-side
-    # lookup) — never merged into outcomes_by_subject/dev_subjects, so no
-    # selection, search, or OOF-generation code above can see them.
-    test_outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"]
-                                 for b in context.test_bags if b.get("cancer_label_known")}
-    all_known_outcomes = {**outcomes_by_subject, **test_outcomes_by_subject}
     pooling_for = {"mean_mil": "mean", "max_mil": "max", "attention_mil": "attention",
                    "neural": args.pooling or "attention"}
 
@@ -283,12 +332,14 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     )
     selected_params = hp_search["selected_params"]
 
-    # Subject-grouped OOF predictions across the WHOLE development pool,
-    # using the ALREADY-selected configuration — calibration/threshold below
-    # are fit exclusively from these, never from a plain validation split
-    # and never from test (blocker 5).
+    # Subject-grouped, SELECTION-CLEAN OOF predictions across the WHOLE
+    # development pool: each OOF fold selects its OWN hyperparameters from
+    # only its OOF-training subjects (blocker: no global-selection leakage
+    # into the configuration used to predict a held-out subject). Calibration
+    # /threshold below are fit exclusively from these, never from a plain
+    # validation split and never from test.
     oof = generate_subject_oof_predictions(
-        context, best_name, dev_subjects, outcomes_by_subject, selected_params,
+        context, best_name, dev_subjects, outcomes_by_subject,
         num_cell_types, min_cells, n_hvgs, pooling=pooling, device=args.device,
         seed=seed, n_folds=args.cv_folds,
     )
@@ -297,21 +348,34 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     policy = build_frozen_policy(y_oof, prob_oof, calibration_method=args.calibration,
                                   threshold_strategy=args.threshold_strategy)
 
+    # Persist the ACTUAL subject-level OOF predictions (not just fold
+    # membership counts) — one row per development subject, atomically
+    # written once fold_membership/oof_by_subject have both already passed
+    # generate_subject_oof_predictions's own coverage/leakage validation.
+    _write_oof_predictions_csv(run_dir, oof, outcomes_by_subject, best_name, pooling)
+
     # ONE final preprocessing + model fit on ALL development subjects, using
-    # the same already-selected configuration — never reselected here.
-    final = refit_final_candidate_on_dev_pool(
-        context, best_name, dev_subjects, context.subjects_for("test"), all_known_outcomes,
-        selected_params, num_cell_types, min_cells, n_hvgs, pooling=pooling, device=args.device, seed=seed,
+    # the dev-pool-selected configuration (never reselected here). This is
+    # the last development-only step — nothing past this point in Stage A
+    # reads test data, and `fitted` carries no test-derived information.
+    fitted = fit_final_candidate_on_dev_pool(
+        context, best_name, dev_subjects, outcomes_by_subject, selected_params,
+        num_cell_types, min_cells, n_hvgs, pooling=pooling, device=args.device, seed=seed,
     )
 
-    # Durable one-time test guard — MANDATORY for every non-synthetic run
-    # (blocker 3). A safe default location is derived from this run's own
-    # output root when benchmarks.frozen_test_guard_dir isn't configured, so
-    # a real run can never accidentally proceed without one. Disabling it is
-    # permitted ONLY through the explicit synthetic-only path (repeated
-    # CI/test invocations against the same synthetic context are an
-    # intentional, expected pattern); requesting that disable in a
-    # non-synthetic run is refused outright, not silently honored.
+    # ══════════════════════════════════════════════════════════════════════
+    # STAGE B — guarded frozen-test execution. The durable test guard is
+    # MANDATORY for every non-synthetic run: a safe default location is
+    # derived from this run's own output root when
+    # benchmarks.frozen_test_guard_dir isn't configured, so a real run can
+    # never accidentally proceed without one. Disabling it is permitted ONLY
+    # through the explicit synthetic-only path (repeated CI/test invocations
+    # against the same synthetic context are an intentional, expected
+    # pattern); requesting that disable in a non-synthetic run is refused
+    # outright, not silently honored. Test subject IDs, test bags, test
+    # labels, and test predictions are resolved for the FIRST time only
+    # inside the try block below, strictly after guard.acquire() succeeds.
+    # ══════════════════════════════════════════════════════════════════════
     bench_cfg = context.config.get("benchmarks", {})
     disable_guard = bool(bench_cfg.get("disable_frozen_test_guard", False))
     if disable_guard and not synthetic:
@@ -322,12 +386,25 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     guard = None
     if not (synthetic and disable_guard):
         guard_dir = bench_cfg.get("frozen_test_guard_dir") or default_guard_dir(run_dir.parent)
-        identity_fp = context.guard_identity_fingerprint(best_name)
+        identity_fp = context.guard_identity_fingerprint(best_name, extra={
+            "selected_hyperparameters": selected_params,
+            "final_preprocessing_artifact_fingerprint": fitted.preprocessing_artifact_fingerprint,
+            "final_model_metadata": fitted.model_metadata,
+            "calibration": policy.calibrator.to_dict(),
+            "threshold": policy.threshold,
+        })
         guard = FrozenTestGuard(Path(guard_dir) / f"{identity_fp}.json")
         guard.acquire(context.run_identity(run_dir.name), selected_model=best_name)
 
     try:
-        test_result = policy.apply_to_test(final["test_labels"], final["test_proba"])
+        # Test subject IDs and test labels are resolved here — the first
+        # point in this function's entire execution where either is touched.
+        test_subjects = context.subjects_for("test")
+        test_outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"]
+                                     for b in context.test_bags if b.get("cancer_label_known")}
+        raw = evaluate_frozen_test(fitted, context, test_subjects, test_outcomes_by_subject,
+                                    num_cell_types, min_cells)
+        test_result = policy.apply_to_test(raw["test_labels"], raw["test_proba"])
     except Exception as e:
         if guard is not None:
             guard.mark_failed(str(e))
@@ -343,9 +420,9 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             "candidate": oof["candidate"], "n_dev_subjects": len(oof["dev_subjects"]),
             "fold_membership": oof["fold_membership"],
         },
-        "final_model_metadata": final["model_metadata"],
-        "final_preprocessing_artifact_fingerprint": final["preprocessing_artifact_fingerprint"],
-        "test_subject_ids": final["test_subject_ids"],
+        "final_model_metadata": fitted.model_metadata,
+        "final_preprocessing_artifact_fingerprint": fitted.preprocessing_artifact_fingerprint,
+        "test_subject_ids": raw["test_subject_ids"],
         "guard": {"enabled": guard is not None,
                    "path": str(guard.guard_path) if guard is not None else None,
                    "synthetic_disabled": bool(synthetic and disable_guard)},

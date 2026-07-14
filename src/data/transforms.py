@@ -207,7 +207,22 @@ def cell_type_map_fingerprint() -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def annotate_cell_types(adata: ad.AnnData, majority_voting: bool = False) -> ad.AnnData:
+class CellTypeAnnotationError(RuntimeError):
+    """Raised when CellTypist annotation fails and no diagnostic fallback
+    was explicitly requested. Real benchmark runs must never silently
+    continue with missing, stale, or fabricated cell-type labels — a prior
+    version of this function printed a warning and returned `adata`
+    unchanged on failure, leaving obs["cell_type_id"] either absent or
+    stale from a previous call, which then surfaced only much later as a
+    confusing downstream KeyError or a silently wrong MIL cell-type input."""
+
+
+_DIAGNOSTIC_FALLBACK_LABEL = "epithelial"
+
+
+def annotate_cell_types(
+    adata: ad.AnnData, majority_voting: bool = False, allow_diagnostic_fallback: bool = False,
+) -> ad.AnnData:
     """
     CellTypist per-cell prediction -> coarse 4-class cell_type_id.
 
@@ -233,6 +248,19 @@ def annotate_cell_types(adata: ad.AnnData, majority_voting: bool = False) -> ad.
     The label-name -> ID table (CELL_TYPE_MAP) is a fixed dict in
     constants.py, never built from this dataset's label frequency/order —
     see cell_type_map_fingerprint() for the persisted proof of that.
+
+    Failure behavior: if CellTypist itself fails (missing dependency,
+    unreachable model download, malformed input, ...), this function raises
+    CellTypeAnnotationError by default — a real scientific run must never
+    silently proceed with no/fabricated cell types. allow_diagnostic_fallback
+    =True is the ONLY way to continue past that failure; it is meant for a
+    deliberate small-scale diagnostic run only (never for a real benchmark:
+    src/preprocess.py's real pipeline entry points never pass it). The
+    fallback assigns EVERY cell the same fixed placeholder label/ID and
+    stamps adata.uns["cell_type_annotation_degraded"] = True plus the
+    failure reason, so any downstream consumer (ExperimentContext
+    validation in particular — see benchmarks/context.py) can detect and
+    reject a degraded annotation rather than silently treating it as real.
     """
     from constants import CELL_TYPE_MAP
     if adata.obs["is_pseudo_bulk"].all():
@@ -263,8 +291,24 @@ def annotate_cell_types(adata: ad.AnnData, majority_voting: bool = False) -> ad.
         )
         adata.uns["cell_type_map_fingerprint"] = cell_type_map_fingerprint()
         adata.uns["cell_type_annotation_mode"] = "majority_voting" if majority_voting else "inductive_per_cell"
+        adata.uns["cell_type_annotation_degraded"] = False
         print(f"[transform] celltypist  {adata.n_obs:,} cells annotated "
               f"({'majority_voting' if majority_voting else 'inductive per-cell'})")
     except Exception as e:
-        print(f"[transform] celltypist failed ({e}) — defaulting to epithelial")
+        if not allow_diagnostic_fallback:
+            raise CellTypeAnnotationError(
+                f"CellTypist cell-type annotation failed: {e!r}. Refusing to continue with "
+                "missing or fabricated cell-type labels for a real run. Pass "
+                "allow_diagnostic_fallback=True only for a deliberate small-scale diagnostic "
+                "run — never for a real scientific benchmark."
+            ) from e
+        adata.obs["cell_type_name"] = _DIAGNOSTIC_FALLBACK_LABEL
+        adata.obs["cell_type_id"] = int(CELL_TYPE_MAP.get(_DIAGNOSTIC_FALLBACK_LABEL, 0))
+        adata.uns["cell_type_map_fingerprint"] = cell_type_map_fingerprint()
+        adata.uns["cell_type_annotation_mode"] = "diagnostic_fallback"
+        adata.uns["cell_type_annotation_degraded"] = True
+        adata.uns["cell_type_fallback_reason"] = repr(e)
+        print(f"[transform] celltypist FAILED ({e!r}) — DIAGNOSTIC FALLBACK: every cell labeled "
+              f"{_DIAGNOSTIC_FALLBACK_LABEL!r} (degraded, non-scientific annotation; "
+              "allow_diagnostic_fallback=True was explicitly set)")
     return adata

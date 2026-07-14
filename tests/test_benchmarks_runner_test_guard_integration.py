@@ -98,3 +98,114 @@ def test_synthetic_mode_remains_repeatable_when_explicitly_disabled():
         outcome2 = run_cancer_task(ctx, _Args(), run_dir2, synthetic=True)  # must not raise
         assert outcome2["calibration_report"]["guard"]["enabled"] is False
     shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+# ─── Guard-before-test-access ordering (blocker 1) ─────────────────────────
+#
+# run_cancer_task is split into a development-only stage (candidate
+# selection, hyperparameter search, OOF generation, calibration fitting, the
+# final dev-pool fit) and a guarded stage that resolves test subjects/labels
+# and evaluates the frozen test split. These tests assert that ordering
+# directly against the real run_cancer_task call, not against a hand-built
+# stand-in.
+
+def test_test_subject_resolution_never_happens_before_guard_acquired():
+    from benchmarks.context import ExperimentContext
+    from benchmarks.test_guard import FrozenTestGuard
+
+    ctx = build_synthetic_context(seed=7, fast=True)
+    guard_acquired = {"v": False}
+
+    orig_acquire = FrozenTestGuard.acquire
+    def spy_acquire(self, *a, **kw):
+        orig_acquire(self, *a, **kw)
+        guard_acquired["v"] = True
+    FrozenTestGuard.acquire = spy_acquire
+
+    orig_subjects_for = ExperimentContext.subjects_for
+    def spy_subjects_for(self, split):
+        if split == "test" and not guard_acquired["v"]:
+            raise AssertionError("context.subjects_for('test') was called before the frozen-test guard was acquired")
+        return orig_subjects_for(self, split)
+    ExperimentContext.subjects_for = spy_subjects_for
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+            outcome = run_cancer_task(ctx, _Args(), run_dir, synthetic=True)
+        assert outcome["calibration_report"]["test_result"] is not None
+        assert guard_acquired["v"] is True
+    finally:
+        FrozenTestGuard.acquire = orig_acquire
+        ExperimentContext.subjects_for = orig_subjects_for
+        shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_development_fit_result_carries_no_test_subject_ids():
+    """fit_final_candidate_on_dev_pool's return value (FittedFinalCandidate)
+    has no field that could hold test-derived data — dev_subject_ids must be
+    a subset of the development pool only."""
+    from benchmarks.final_evaluation import fit_final_candidate_on_dev_pool
+
+    ctx = build_synthetic_context(seed=7, fast=True)
+    all_bags = list(ctx.train_bags) + list(ctx.val_bags)
+    outcomes = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
+    dev_subjects = sorted(outcomes.keys())
+    test_subjects = set(ctx.subjects_for("test"))
+
+    fitted = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {},
+        ctx.config["model"]["num_cell_types"], ctx.config["data"]["min_cells_per_subject"],
+        ctx.preprocessing_artifact.n_hvgs, device="cpu", seed=42,
+    )
+    assert set(fitted.dev_subject_ids).isdisjoint(test_subjects)
+
+
+def test_exception_during_test_evaluation_marks_guard_failed_not_completed():
+    import benchmarks.runner as runner_mod
+
+    ctx = build_synthetic_context(seed=8, fast=True)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated failure during frozen-test evaluation")
+    orig = runner_mod.evaluate_frozen_test
+    runner_mod.evaluate_frozen_test = _boom
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+            with pytest.raises(RuntimeError, match="simulated failure"):
+                run_cancer_task(ctx, _Args(), run_dir, synthetic=False)
+            # default_guard_dir is derived from run_dir.parent
+            guard_dir = run_dir.parent / ".frozen_test_guards"
+            guard_files = list(guard_dir.glob("*.json"))
+            assert len(guard_files) == 1
+            import json
+            payload = json.loads(guard_files[0].read_text())
+            assert payload["status"] == "failed"
+            assert "test_result" not in payload
+    finally:
+        runner_mod.evaluate_frozen_test = orig
+        shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_guard_identity_changes_when_selected_hyperparameters_differ():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    fp_a = ctx.guard_identity_fingerprint("logistic", extra={"selected_hyperparameters": {"C": 1.0}})
+    fp_b = ctx.guard_identity_fingerprint("logistic", extra={"selected_hyperparameters": {"C": 10.0}})
+    assert fp_a != fp_b
+
+
+def test_guard_file_never_contains_raw_test_labels_or_probabilities():
+    ctx = build_synthetic_context(seed=1, fast=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = new_run_dir(str(Path(tmp) / "runs"), run_id="run1")
+        run_cancer_task(ctx, _Args(), run_dir)
+        guard_dir = run_dir.parent / ".frozen_test_guards"
+        guard_files = list(guard_dir.glob("*.json"))
+        assert len(guard_files) == 1
+        import json
+        payload = json.loads(guard_files[0].read_text())
+        assert "test_labels" not in payload
+        assert "test_proba" not in payload
+        assert "test_result" not in payload
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)

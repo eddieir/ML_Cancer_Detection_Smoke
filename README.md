@@ -597,29 +597,86 @@ space declared but not consulted for neural/MIL" limitations listed above):
   (see limitations below) — classical baselines have no such requirement and
   use every development subject directly.
 
+**Fixed in the fourth pass** (this supersedes several "third pass" claims
+above and in `ARCHITECTURE.md` that were, on closer review, still
+inaccurate — see git history for the exact commits):
+
+- **The frozen-test guard is now acquired strictly before ANY test access.**
+  `run_cancer_task` (`src/benchmarks/runner.py`) is split into a
+  development-only stage and a guarded stage. The development-only stage —
+  candidate selection, OOF generation, calibration/threshold fitting, and
+  the final dev-pool fit (`final_evaluation.py::fit_final_candidate_on_dev_pool`)
+  — has function signatures that structurally cannot accept test subject
+  IDs, test bags, or test labels; `evaluate_frozen_test` is the only
+  function that reads `context.test_bags`/`context.subjects_for("test")`,
+  and it is called for the first time only inside the `try` block that
+  follows `FrozenTestGuard.acquire()`. Previously the guard was acquired
+  only immediately before computing the final metric, after test labels had
+  already been read and test predictions already generated.
+- **OOF predictions are now selection-clean.** Previously
+  `generate_subject_oof_predictions` accepted ONE hyperparameter
+  configuration selected once from the whole development pool and reused it
+  for every OOF subject — meaning a held-out subject's own label had
+  already influenced the configuration used to predict it, even though the
+  fold's model weights excluded that subject. Each OOF fold now runs its
+  OWN inner grouped-CV hyperparameter/config selection
+  (`final_evaluation.py::_oof_fold_hyperparameters`) using only that fold's
+  OOF-training subjects, then fits on the full OOF-training set with the
+  fold-selected configuration before predicting the OOF-held-out subjects —
+  the same nested-CV pattern already used by the outer CV loop, applied one
+  level deeper. The dev-pool-wide selection is still computed once, but is
+  now used only for the final refit's configuration, never reused as every
+  OOF fold's configuration.
+- **The final MIL fit now trains on every eligible development subject.**
+  `train.py::Trainer.phase1_final_fit`/`phase2_final_fit` are new,
+  fixed-epoch training methods with no internal validation split and no
+  validation-based checkpoint selection — unlike the normal `phase1`/`phase2`
+  (still used for CV/OOF fold fits, which correctly hold out a real
+  validation split). `NeuralCancerAdapter.fit_final` uses these for the
+  final dev-pool refit, so every development subject now contributes to
+  gradient updates; the "MIL final refit carves out an internal validation
+  slice" limitation from the previous pass is resolved, not merely
+  documented.
+- **CellTypist annotation failure now fails loudly by default.**
+  `annotate_cell_types()` previously printed a warning and returned `adata`
+  unchanged on any CellTypist failure — leaving `obs["cell_type_id"]`
+  either absent or stale, not actually defaulted to anything. It now raises
+  `CellTypeAnnotationError` by default; an explicit
+  `allow_diagnostic_fallback=True` (never passed by the real pipeline
+  entry points in `src/preprocess.py`) is required to fall back to a fixed
+  placeholder label for every cell, which stamps
+  `cell_type_annotation_degraded=True` on the resulting `PreprocessingArtifact`.
+  `ExperimentContext.from_pipeline_result` rejects a degraded artifact
+  outright — a real run can never silently proceed on fabricated cell types.
+- **Real OOF predictions are now persisted, not just fold-membership
+  counts.** `predictions/cancer_<candidate>_oof.csv` — one row per
+  development subject with its actual OOF probability, fold, and
+  fold-local selected-hyperparameters/fingerprint columns — is now written
+  alongside `calibration/frozen_policy.json`'s `oof_summary` (which still
+  carries fold membership only, for the markdown report).
+
 **Known Phase 1 limitations remaining** (see `report.md`'s own limitations
 section for the same list, generated fresh per run): the neural/MIL bounded
-search spaces compared inside nested CV are deliberately small (one or two
-fixed candidates, e.g. `phase1_epochs`/`pretrain_epochs`), not a real
+search spaces compared inside nested CV (both the outer-CV-fold and the
+OOF-fold-local selections) are deliberately small (one or two fixed
+candidates, e.g. `phase1_epochs`/`pretrain_epochs`), not a real
 hyperparameter grid — a full grid would mean many more full training runs
 per fold; Task A baselines still run in subject-summary mode only (one
 feature vector per subject) for their own training/prediction — the neural
 adapter is the only Task A model exercising true cell-level training, so
 "cell-weighted" metrics for baselines remain explicitly marked
-not-applicable rather than presented as real per-cell scores; the MIL final
-refit (unlike the classical baselines) does not fit its weights on literally
-every development subject — Trainer's phase1/phase2 curriculum requires its
-own subject-disjoint validation split for checkpoint selection, so a small,
-seed-deterministic internal slice of the development pool (never test) is
-held out from gradient updates for that purpose only, a limitation of reusing
-the existing Trainer architecture rather than a leakage issue; the immutable
+not-applicable rather than presented as real per-cell scores; the immutable
 artifact directory still does not contain every file the ideal schema calls
-for (per-model OOF prediction CSVs as a separate file, a dedicated
-`preprocessing/` subdir, an environment snapshot) — OOF predictions and fold
-membership are recorded in `calibration/frozen_policy.json`'s
-`oof_summary`/`hyperparameters.json`, just not yet as standalone files;
-attention weights remain an interpretability aid, not a causal explanation,
-in every pooling variant.
+for (a dedicated `preprocessing/` subdir with per-fold artifact files, an
+environment snapshot recording Python/dependency versions) — the OOF CSV
+and `hyperparameters.json`/`folds_partitions.json` now cover most of the
+gap, but per-fold `PreprocessingArtifact` objects themselves are still not
+written as separate files; attention weights remain an interpretability
+aid, not a causal explanation, in every pooling variant; this pass's new
+regression tests cover representative cases for each fix rather than
+literally every scenario a full audit could enumerate (e.g. concurrent-guard
+races beyond the existing single-process tests, or every possible
+CellTypist failure mode).
 
 ## Pipeline
 
@@ -679,7 +736,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (351 tests): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 20 `test_benchmarks_*.py` files (including `test_benchmarks_nested_cv_selection.py` and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (364 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 20 `test_benchmarks_*.py` files (including `test_benchmarks_nested_cv_selection.py` and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
