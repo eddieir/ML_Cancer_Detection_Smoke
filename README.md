@@ -360,10 +360,11 @@ vs. the neural model); a grouped-cross-validation experiment *runner* (the
 primitive `splitting.py::grouped_kfold` is leakage-tested, including the
 small-class-count fix above, but no training loop consumes it yet); a
 hyperparameter-search runner; MIL pooling-baseline comparisons (mean/max
-pooling vs. gated attention) or attention-stability analysis;
-subject-aware/subject-capped sampling (class weights are now correctly
-computed from the train split only, but there is no per-epoch
-max-cells-per-subject sampler yet); explicit bulk-vs-single-cell-vs-MIL
+pooling vs. gated attention) or attention-stability analysis (subject-aware
+class -> subject -> cell sampling, with a per-batch max-cells-per-subject
+cap, is now implemented — see "Phase 2 — subject-aware class-imbalance
+correction" above; this list predates that work and is retained for
+historical context on the other still-open items); explicit bulk-vs-single-cell-vs-MIL
 experiment-mode separation; species-provenance / cross-species-merge guards
 (GSE288003's mouse→human ortholog mapping still runs unconditionally, with
 no recorded mapped/unmapped gene counts); probability calibration /
@@ -939,6 +940,114 @@ and is not something a future pass can silently "fix" without an actually
 compatible upstream model; attention weights remain an interpretability
 aid, not a causal explanation, in every pooling variant.
 
+## Phase 2 — subject-aware class-imbalance correction
+
+**Why cell-level weighted sampling is insufficient.** The "Current results"
+table above shows the collapse a class-imbalanced smoke-type head produces:
+77% accuracy but 0.27 macro-F1, with zero F1 on the smallest classes. The
+obvious fix — a per-cell `WeightedRandomSampler` giving every cell an
+inverse-frequency weight — does not actually solve the underlying problem:
+a subject with 50,000 cells and a subject with 500 cells in the *same*
+class still receive wildly different total sampling probability under that
+scheme, even though they are the same number of independent observations
+(one subject each). A cell-heavy subject can still dominate optimization
+purely by cell count, regardless of any inverse-frequency correction
+applied at the cell level.
+
+**Class → subject → cell sampling.** `src/data/sampling.py` implements a
+`SubjectBalancedBatchSampler` that draws every training index in three
+explicit stages: (1) pick an effective smoke class, (2) pick a unique
+subject belonging to that class (uniformly, by default — independent of
+that subject's cell count), (3) pick a cell belonging to that subject. A
+subject's cell count therefore only controls the diversity of cells *drawn
+from it*, never its own selection probability — verified directly by
+`tests/test_subject_balanced_sampling.py`, which constructs a class with a
+5,000-cell subject and a 50-cell subject and confirms both receive
+approximately equal draws. `class_selection` supports `uniform` (default —
+equal probability per observed effective class), `natural` (proportional to
+unique-subject count), and `inverse_subject_frequency`; `subject_selection`
+currently supports `uniform`. Only the training split may use this sampler
+— it is wired into `Trainer.phase1`/`phase1_final_fit`/`phase3`'s cell-level
+component and the corresponding `NeuralSmokeAdapter`/`NeuralCancerAdapter`
+benchmark entry points; validation and test `DataLoader`s remain
+`shuffle=False` with no sampler attached, unchanged from Phase 1, and are
+never oversampled, duplicated, or reweighted — see
+`tests/test_phase2_imbalance_integration.py`'s validation-loader tests.
+
+**Class weighting vs. sampling — two different corrections.** Inverse-
+frequency `CrossEntropyLoss` class weights (`CellLevelDataset.
+smoke_class_weights`, computed from the training partition only — never
+validation/test, never a fold's held-out subjects) already existed in
+Phase 1 and are unchanged in what they compute; Phase 2 makes *when* they
+apply configurable via `training.smoke_imbalance.class_weighting`
+(`none` | `inverse_frequency`, default `inverse_frequency` — preserves
+pre-Phase-2 behavior when the whole `smoke_imbalance` config section is
+absent). Sampling and loss weighting correct the same imbalance through
+different mechanisms (which subjects/cells appear in a batch, vs. how much
+each class's error counts), and combining both is a real double-correction
+risk: `focal_alpha_mode: none` (only meaningful when
+`loss: focal`) is the explicit way to run subject-balanced sampling without
+also reweighting the loss. `training.smoke_imbalance.seed_offset` keeps a
+multi-seed benchmark loop's sampling sequences independent of each other
+while remaining reproducible from the base seed.
+
+**Focal loss (`model.py`'s `FocalLoss`) is a configurable ablation, not a
+replacement.** `training.smoke_imbalance.loss` is `cross_entropy` (default)
+or `focal`; `focal_gamma=0` is mathematically identical to (optionally
+class-weighted) cross-entropy — verified directly in
+`tests/test_smoke_imbalance_loss.py`. The malignancy, cancer, and
+dose-response loss terms are unaffected by this setting.
+
+**Rare-class handling is unchanged and still honest.** Phase 2 does not
+touch `data/rare_class.py` or `data/label_mapping.py`: the sampler and
+class-weighting machinery both operate on the *effective* (post-merge,
+contiguous 0..K-1) smoke label, read from whatever `EffectiveLabelMapping`
+the run already has wired in, and reject (fail loudly, not silently) any
+subject whose per-cell effective labels disagree or fall outside `[0, K)`.
+A merged-away or excluded raw class (e.g. `cigar`, ~1 subject in the real
+data — see the rare-class discussion above) can never be resurrected by the
+sampler, since it never appears in the effective label space the sampler is
+built from. This project still does not claim six-class classification
+success — the effective, reported class count is whatever
+`EffectiveLabelMapping.k` resolves to for the configured rare-class policy.
+
+**Development-only ablation protocol.**
+`src/benchmarks/imbalance_ablation.py::run_smoke_imbalance_ablation` compares
+five named strategies (`natural_no_weight`, `natural_inverse_frequency`,
+`subject_balanced_no_weight`, `subject_balanced_inverse_frequency`,
+`subject_balanced_focal`) using the exact same grouped-subject-CV machinery
+`cross_validation.py::run_smoke_cv` already uses — identical outer folds,
+identical per-fold preprocessing refit, identical candidate architecture,
+only `train.smoke_imbalance` differs between strategies. It runs entirely
+over the experiment context's train+val subject pool; the frozen test split
+is never accessed and this comparison never invokes the frozen-test guard.
+The returned report includes `paired_fold_differences` (per seed/fold, not
+just a pooled mean) specifically so a strategy is not called "better" merely
+because its mean macro-F1 is nominally higher — see
+`tests/test_benchmarks_imbalance_ablation.py`.
+
+**Reproducibility and identity.** `training.smoke_imbalance` lives inside
+`ExperimentContext.config`, so it is already covered by
+`config_fingerprint`/`guard_identity_fingerprint` (see `benchmarks/
+context.py`) with no additional plumbing — two runs with different
+imbalance strategies never share scientific or frozen-test-guard identity.
+Every checkpoint (`Trainer._save`) persists the resolved
+`smoke_imbalance_config` and, when the subject-balanced sampler was used,
+its realized per-epoch sampling diagnostics (observed/absent effective
+classes, unique subjects per class, realized cells/subjects per class);
+`NeuralSmokeAdapter.metadata()`/`NeuralCancerAdapter.metadata()` expose the
+same fields for benchmark reports.
+
+**No real held-out imbalance-strategy comparison has been run.** Everything
+above has been exercised on synthetic data (`tests/`, and the CLI's
+`--synthetic --fast` workflows) and is unit/integration tested, but no real
+frozen-test evaluation of any imbalance strategy has occurred — running the
+frozen-test guard is a deliberate, one-time, separately-authorized action
+(see the guard discussion above), not something this pass performs. Any
+future macro-F1/accuracy numbers for a specific strategy must come from an
+actual run of `run_smoke_imbalance_ablation` (development-only) or the
+frozen-test protocol (at most once), never from this description.
+
 ## Pipeline
 
 ```
@@ -963,6 +1072,7 @@ src/
     splitting.py          subject-level train/val/test split + grouped K-fold CV
     preprocessing.py       leakage-free fit/transform preprocessing artifact
     rare_class.py           configurable policy for statistically-too-small classes
+    sampling.py               subject-aware class -> subject -> cell balanced batch sampler (Phase 2)
   preprocess.py        orchestrates data/ into run_pipeline(config) / run_pipeline_split_aware(config)
   model.py              MultiSmokeCancerNet (encoder, both heads, gated attention MIL)
   train.py                three-phase Trainer (cell-level, aggregator, end-to-end)
@@ -979,6 +1089,7 @@ src/
     calibration.py                 OOF-based calibration + guarded one-time frozen-test evaluation
     ood.py                          leave-one-dataset-source-out validation
     reporting.py                    statistical comparison, immutable artifacts, Markdown/CSV report
+    imbalance_ablation.py             development-only smoke-imbalance-strategy comparison (Phase 2)
     runner.py                        CLI entry point (`python -m benchmarks.runner`)
 configs/
   default.yaml           data / model / train config used by model.py and train.py
@@ -997,7 +1108,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (495 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, plus 24 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (574 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`) |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -1140,12 +1251,14 @@ consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
   labels) and NLST (real cancer outcomes + cigar/dual-use history) — this
   also unblocks Task B eligibility on real data, not just the current
   synthetic CI check
-- Add a subject-aware/subject-capped sampler (bound max cells sampled per
-  subject per epoch) so a handful of subjects with very large cell counts
-  can't dominate a training epoch — class weights are now train-split-only,
-  but no per-epoch subject-balancing sampler exists yet (`benchmarks/features.py::cap_cells_per_subject`
-  exists for benchmark baselines but is not yet wired into `train.py`'s own curriculum)
-- Phase 2+ of the wider improvement plan (causal modelling, counterfactual
+- Run the Phase 2 development-only imbalance-strategy ablation
+  (`benchmarks/imbalance_ablation.py::run_smoke_imbalance_ablation`) against
+  real data once it's available, and — separately, at most once — the
+  frozen-test protocol for whichever strategy that ablation selects; no real
+  imbalance-strategy comparison number exists yet, only the synthetic/
+  unit-tested implementation (see "Phase 2 — subject-aware class-imbalance
+  correction" above)
+- Phase 3+ of the wider improvement plan (causal modelling, counterfactual
   generation, pathway-constrained learning, foundation-model integration) is
   explicitly out of scope for this benchmarking framework and not started
 - Add explicit bulk-vs-single-cell-vs-MIL experiment-mode separation and

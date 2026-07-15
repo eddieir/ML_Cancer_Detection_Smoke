@@ -17,6 +17,11 @@ import yaml
 
 from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
 from data.label_mapping import EffectiveLabelMapping
+from data.sampling import (
+    SubjectBalancedBatchSampler,
+    build_subject_balanced_sampler,
+    resolve_smoke_imbalance_config,
+)
 from metrics import multiclass_f1_report, validate_cell_type_ids
 from model import MultiSmokeCancerNet, MultiTaskLoss
 
@@ -478,6 +483,16 @@ class Trainer:
         torch.manual_seed(seed)
         np.random.seed(seed)
 
+        # Phase 2 subject-aware class-imbalance configuration (data/sampling.py).
+        # Absent config resolves to the pre-Phase-2 defaults (shuffle sampler,
+        # train-only inverse-frequency class weights, plain cross-entropy) —
+        # see resolve_smoke_imbalance_config's docstring.
+        self.smoke_imbalance_config = resolve_smoke_imbalance_config(self.cfg.get("smoke_imbalance"))
+        # The most recently constructed subject-balanced batch sampler, if
+        # any — kept so _save() can persist its realized sampling
+        # diagnostics (populated only after a full epoch has been iterated).
+        self._last_subject_balanced_sampler: Optional[SubjectBalancedBatchSampler] = None
+
         # Experiment metadata carried into every saved checkpoint (section 8/22).
         self.split_manifest_path:      Optional[str] = None
         self.preprocessing_artifact_path: Optional[str] = None
@@ -657,6 +672,13 @@ class Trainer:
             "effective_label_mapping": self.effective_label_mapping,
             "rare_class_policy":  self.rare_class_policy,
             "transductive_batch_correction": self.transductive_batch_correction,
+            "smoke_imbalance_config": self.smoke_imbalance_config,
+            "smoke_sampling_diagnostics": (
+                self._last_subject_balanced_sampler.last_realized_diagnostics.to_dict()
+                if self._last_subject_balanced_sampler is not None
+                and self._last_subject_balanced_sampler.last_realized_diagnostics is not None
+                else None
+            ),
             "random_seed":        self.seed,
             "metric_name":        metric_name,
             "metric_value":       metric,
@@ -694,6 +716,71 @@ class Trainer:
     def _make_optimizer(self, params, lr: float, wd: float = 1e-4):
         return torch.optim.Adam(params, lr=lr, weight_decay=wd)
 
+    def _train_cell_loader(self, train_cell_dataset: "CellLevelDataset", batch_size: int) -> DataLoader:
+        """
+        Build the Phase 1 / Phase 3 / final-fit training cell DataLoader
+        per self.smoke_imbalance_config["sampler"]:
+
+          "shuffle"           — the original DataLoader(shuffle=True) behaviour.
+          "subject_balanced"  — data.sampling.SubjectBalancedBatchSampler
+                                 (class -> subject -> cell). Never combined
+                                 with shuffle=True — DataLoader forbids
+                                 batch_sampler together with shuffle/sampler/
+                                 batch_size/drop_last, which is correct here too.
+
+        Only ever called with a TRAINING dataset — validation/test loaders
+        are built directly with shuffle=False and never call this method.
+        """
+        mode = self.smoke_imbalance_config["sampler"]
+        if mode == "subject_balanced":
+            sampler = build_subject_balanced_sampler(
+                train_cell_dataset, num_classes=self.model.num_smoke,
+                batch_size=batch_size, seed=self.seed,
+                resolved_cfg=self.smoke_imbalance_config,
+            )
+            self._last_subject_balanced_sampler = sampler
+            return DataLoader(train_cell_dataset, batch_sampler=sampler)
+
+        self._last_subject_balanced_sampler = None
+        return DataLoader(
+            train_cell_dataset, batch_size=batch_size, shuffle=True,
+            drop_last=len(train_cell_dataset) >= batch_size,
+            generator=self._generator(),
+        )
+
+    def _smoke_loss_weights_and_type(
+        self, train_cell_dataset: "CellLevelDataset", explicit_weights: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], str, float]:
+        """
+        Resolve (reported_weights, loss_alpha, loss_type, focal_gamma) for
+        the smoke-type loss, per self.smoke_imbalance_config.
+
+        reported_weights — what class_weighting actually produced (or the
+        caller's explicit override); this is what gets logged/persisted as
+        "the class weights for this run", regardless of whether focal's
+        alpha ends up using them.
+        loss_alpha — what is actually passed into CrossEntropyLoss/FocalLoss
+        as the class weight/alpha term. Equal to reported_weights UNLESS
+        loss="focal" and focal_alpha_mode="none", in which case it is None
+        — applying inverse-frequency correction via BOTH subject-balanced
+        sampling and loss weighting is a real double-correction risk (see
+        README.md), so focal_alpha_mode gives an explicit way to keep
+        sampling-only correction even when class_weighting=inverse_frequency.
+        """
+        cfg = self.smoke_imbalance_config
+        if explicit_weights is not None:
+            reported = explicit_weights
+        elif cfg["class_weighting"] == "inverse_frequency":
+            reported = train_cell_dataset.smoke_class_weights(num_classes=self.model.num_smoke)
+        else:
+            reported = None
+
+        loss_alpha = reported
+        if cfg["loss"] == "focal" and cfg["focal_alpha_mode"] == "none":
+            loss_alpha = None
+
+        return reported, loss_alpha, cfg["loss"], cfg["focal_gamma"]
+
     # ── Phase 1: Cell-level pre-training ─────────────────────────────────────
 
     def phase1(
@@ -725,24 +812,30 @@ class Trainer:
         lr         = self.cfg.get("phase1_lr",         1e-3)
         batch_size = self.cfg.get("phase1_batch_size", 512)
 
-        if smoke_class_weights is None:
-            # num_classes = the model's actual output width, not the fixed
-            # 6-class constant — a rare-class policy may have shrunk it to
-            # K < 6 (see data/label_mapping.py); weighting a merged/excluded
-            # class that no longer exists in the model's output would be
-            # silently meaningless.
-            smoke_class_weights = train_cell_dataset.smoke_class_weights(num_classes=self.model.num_smoke)
-            self._log(f"  smoke class weights (auto, inverse-freq, train-only): "
+        # num_classes = the model's actual output width, not the fixed
+        # 6-class constant — a rare-class policy may have shrunk it to K < 6
+        # (see data/label_mapping.py); weighting/sampling a merged/excluded
+        # class that no longer exists in the model's output would be
+        # silently meaningless. class_weighting/loss/focal_gamma come from
+        # self.smoke_imbalance_config (data/sampling.py) unless the caller
+        # passed an explicit override.
+        smoke_class_weights, loss_alpha, loss_type, focal_gamma = self._smoke_loss_weights_and_type(
+            train_cell_dataset, smoke_class_weights,
+        )
+        self._log(f"  smoke imbalance config: sampler={self.smoke_imbalance_config['sampler']!r} "
+                   f"class_weighting={self.smoke_imbalance_config['class_weighting']!r} "
+                   f"loss={loss_type!r}")
+        if smoke_class_weights is not None:
+            self._log(f"  smoke class weights (train-only): "
                        f"{[round(w, 3) for w in smoke_class_weights.tolist()]}")
 
-        train_dl = DataLoader(train_cell_dataset, batch_size=batch_size, shuffle=True,
-                               drop_last=len(train_cell_dataset) >= batch_size,
-                               generator=self._generator())
+        train_dl = self._train_cell_loader(train_cell_dataset, batch_size)
         val_dl   = DataLoader(val_cell_dataset,   batch_size=batch_size, shuffle=False)
 
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.50, lambda_malignancy=0.50,
-            smoke_class_weights=smoke_class_weights.to(self.device),
+            smoke_class_weights=loss_alpha.to(self.device) if loss_alpha is not None else None,
+            loss_type=loss_type, focal_gamma=focal_gamma,
         )
         params  = [
             *self.model.encoder.parameters(),
@@ -928,15 +1021,21 @@ class Trainer:
         lr = self.cfg.get("phase1_lr", 1e-3)
         batch_size = self.cfg.get("phase1_batch_size", 512)
 
-        if smoke_class_weights is None:
-            smoke_class_weights = train_cell_dataset.smoke_class_weights(num_classes=self.model.num_smoke)
+        # The imbalance strategy (sampler/class-weighting/loss) is decided
+        # during development and FROZEN by the time this runs — this refit
+        # uses whatever self.smoke_imbalance_config already holds (set at
+        # Trainer construction / from_experiment_context), deriving class/
+        # subject/class-weight statistics only from train_cell_dataset (the
+        # full development pool passed in here), never from test data.
+        smoke_class_weights, loss_alpha, loss_type, focal_gamma = self._smoke_loss_weights_and_type(
+            train_cell_dataset, smoke_class_weights,
+        )
 
-        train_dl = DataLoader(train_cell_dataset, batch_size=batch_size, shuffle=True,
-                               drop_last=len(train_cell_dataset) >= batch_size,
-                               generator=self._generator())
+        train_dl = self._train_cell_loader(train_cell_dataset, batch_size)
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.50, lambda_malignancy=0.50,
-            smoke_class_weights=smoke_class_weights.to(self.device),
+            smoke_class_weights=loss_alpha.to(self.device) if loss_alpha is not None else None,
+            loss_type=loss_type, focal_gamma=focal_gamma,
         )
         params = [
             *self.model.encoder.parameters(),
@@ -965,7 +1064,17 @@ class Trainer:
 
         self._log(f"Phase 1 (final fit) done — trained {epochs} epoch(s) on all "
                    f"{len(train_cell_dataset)} cells, no held-out checkpoint selection.")
-        return {"epochs": epochs, "n_cells": len(train_cell_dataset)}
+        return {
+            "epochs": epochs, "n_cells": len(train_cell_dataset),
+            "smoke_imbalance_config": self.smoke_imbalance_config,
+            "smoke_class_weights": smoke_class_weights.tolist() if smoke_class_weights is not None else None,
+            "smoke_sampling_diagnostics": (
+                self._last_subject_balanced_sampler.last_realized_diagnostics.to_dict()
+                if self._last_subject_balanced_sampler is not None
+                and self._last_subject_balanced_sampler.last_realized_diagnostics is not None
+                else None
+            ),
+        }
 
     def phase2_final_fit(
         self,
@@ -1054,18 +1163,19 @@ class Trainer:
         epochs = self.cfg.get("phase3_epochs", 8)
         lr     = self.cfg.get("phase3_lr",     1e-4)
 
-        cell_dl  = DataLoader(train_cell_dataset, batch_size=256, shuffle=True,
-                               drop_last=len(train_cell_dataset) >= 256,
-                               generator=self._generator())
+        cell_dl  = self._train_cell_loader(train_cell_dataset, 256)
         sub_dl   = DataLoader(train_subject_dataset, batch_size=1, shuffle=True,
                                collate_fn=subject_collate_fn, generator=self._generator())
         val_dl   = DataLoader(val_subject_dataset,   batch_size=1, shuffle=False,
                                collate_fn=subject_collate_fn)
 
+        smoke_class_weights, loss_alpha, loss_type, focal_gamma = self._smoke_loss_weights_and_type(
+            train_cell_dataset, None,
+        )
         loss_fn = MultiTaskLoss(
             lambda_smoke=0.30, lambda_malignancy=0.30, lambda_subject=0.40,
-            smoke_class_weights=train_cell_dataset.smoke_class_weights(
-                num_classes=self.model.num_smoke).to(self.device),
+            smoke_class_weights=loss_alpha.to(self.device) if loss_alpha is not None else None,
+            loss_type=loss_type, focal_gamma=focal_gamma,
         )
         params  = list(self.model.parameters())
         opt     = self._make_optimizer(params, lr, wd=1e-5)

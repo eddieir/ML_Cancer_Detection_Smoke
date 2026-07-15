@@ -330,13 +330,71 @@ class MultiSmokeCancerNet(nn.Module):
         return self.forward_subject(x_bag, cell_type_ids)
 
 
+# ─── Focal loss (smoke-head imbalance ablation) ──────────────────────────────
+
+VALID_SMOKE_LOSS_TYPES = ("cross_entropy", "focal")
+
+
+class FocalLoss(nn.Module):
+    """
+    Multiclass focal loss (Lin et al., ICCV 2017) for the smoke-type head —
+    a configurable ABLATION against plain CrossEntropyLoss (see
+    MultiTaskLoss's loss_type parameter), never an unconditional
+    replacement.
+
+    Computes per-example cross-entropy first, derives pt = exp(-ce), then
+    scales by (1 - pt) ** gamma so confidently-correct ("easy") examples
+    contribute progressively less to the loss as gamma increases; gamma=0
+    makes the scaling factor exactly 1 for every example, i.e. identical to
+    plain (optionally class-weighted) cross-entropy. class_weight (alpha),
+    if given, is passed once into the underlying per-example cross-entropy
+    term — it is never applied a second time to the reduced/modulated loss,
+    which would double-count the class correction.
+    """
+
+    def __init__(
+        self,
+        gamma:        float                   = 2.0,
+        class_weight: Optional[torch.Tensor] = None,
+        reduction:    str                     = "mean",
+    ):
+        super().__init__()
+        if gamma < 0:
+            raise ValueError(f"FocalLoss: gamma must be >= 0, got {gamma}.")
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"FocalLoss: reduction must be 'mean', 'sum' or 'none', got {reduction!r}.")
+        self.gamma = gamma
+        self.class_weight = class_weight
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, weight=self.class_weight, reduction="none")
+        # clamp(max=1.0) guards against a pt slightly > 1.0 from floating-point
+        # error when ce is extremely close to 0, which would make (1-pt)
+        # negative and (1-pt)**gamma NaN for non-integer gamma.
+        pt = torch.exp(-ce).clamp(max=1.0)
+        focal = ((1.0 - pt) ** self.gamma) * ce
+        if self.reduction == "mean":
+            return focal.mean()
+        if self.reduction == "sum":
+            return focal.sum()
+        return focal
+
+
 # ─── Multi-Task Loss ──────────────────────────────────────────────────────────
 
 class MultiTaskLoss(nn.Module):
     """
-    Phase 1 : λ_smoke·L_CE(smoke)  +  λ_malig·L_BCE(malignancy)
+    Phase 1 : λ_smoke·L_smoke  +  λ_malig·L_BCE(malignancy)
     Phase 2 : L_BCE(subject)
-    Phase 3 : λ_smoke·L_CE  +  λ_malig·L_BCE(cell)  +  λ_sub·L_BCE(subject)
+    Phase 3 : λ_smoke·L_smoke  +  λ_malig·L_BCE(cell)  +  λ_sub·L_BCE(subject)
+
+    L_smoke is plain CrossEntropyLoss by default (loss_type="cross_entropy")
+    or FocalLoss (loss_type="focal") — a controlled, explicitly configured
+    ablation for the class-imbalance work in Phase 2 (see
+    data/sampling.py's module docstring for the sampling side of that same
+    problem). smoke_class_weights is used as the alpha term for whichever
+    loss is selected; it is applied exactly once either way.
 
     Private helpers _ls / _lm / _lsb keep the three public methods DRY.
     """
@@ -349,14 +407,23 @@ class MultiTaskLoss(nn.Module):
         lambda_dose:      float                   = 0.10,
         dose_margin:      float                   = 0.05,
         smoke_class_weights: Optional[torch.Tensor] = None,
+        loss_type:         str                    = "cross_entropy",
+        focal_gamma:        float                  = 2.0,
     ):
         super().__init__()
+        if loss_type not in VALID_SMOKE_LOSS_TYPES:
+            raise ValueError(f"MultiTaskLoss: loss_type={loss_type!r} must be one of {VALID_SMOKE_LOSS_TYPES}")
         self.λs   = lambda_smoke
         self.λm   = lambda_malignancy
         self.λsb  = lambda_subject
         self.λd   = lambda_dose
         self.margin = dose_margin
-        self.ce   = nn.CrossEntropyLoss(weight=smoke_class_weights)
+        self.loss_type = loss_type
+        self.focal_gamma = focal_gamma
+        if loss_type == "focal":
+            self.ce = FocalLoss(gamma=focal_gamma, class_weight=smoke_class_weights)
+        else:
+            self.ce = nn.CrossEntropyLoss(weight=smoke_class_weights)
         self.bce  = nn.BCELoss()
         self.mse  = nn.MSELoss()
 

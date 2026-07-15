@@ -57,6 +57,14 @@ class NeuralSmokeAdapter:
             "n_parameters": count_parameters(self.trainer.model) if self.trainer else None,
             "fit_seconds": self.fit_seconds,
             "pooling": getattr(self.trainer.model, "pooling", None) if self.trainer else None,
+            "smoke_imbalance_config": self.trainer.smoke_imbalance_config if self.trainer else None,
+            "smoke_sampling_diagnostics": (
+                self.trainer._last_subject_balanced_sampler.last_realized_diagnostics.to_dict()
+                if self.trainer is not None
+                and self.trainer._last_subject_balanced_sampler is not None
+                and self.trainer._last_subject_balanced_sampler.last_realized_diagnostics is not None
+                else None
+            ),
         }
 
 
@@ -144,6 +152,10 @@ class NeuralCancerAdapter:
             "n_parameters": count_parameters(self.trainer.model) if self.trainer else None,
             "n_aggregator_parameters": count_parameters(self.trainer.model.aggregator) if self.trainer else None,
             "fit_seconds": self.fit_seconds,
+            # cell-level (Phase 1 pretraining) imbalance config — Phase 2/2_final_fit
+            # train the subject-level aggregator, which has no per-cell class
+            # imbalance concept of its own.
+            "smoke_imbalance_config": self.trainer.smoke_imbalance_config if self.trainer else None,
         }
 
     def model_state_fingerprint(self) -> str:
