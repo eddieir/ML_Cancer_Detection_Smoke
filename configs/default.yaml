@@ -164,6 +164,49 @@ model:
   head_dropout: 0.2
   attention_dim: 128
 
+  # Phase 5 — pathway-aware hierarchical MIL (src/pathway_hierarchical_mil.py).
+  # A research-candidate architecture, disabled by default. Enabling it does
+  # not change MultiSmokeCancerNet's behavior in any way; the two models are
+  # selected explicitly and never mixed within one run.
+  pathway_hierarchical_mil:
+    enabled: false
+    embedding_dim: 128
+    residual_gene_dim: 64
+    attention_dim: 64
+    dropout: 0.2
+    use_gene_residual: true
+    use_cell_type_embedding: true
+    cell_type_embedding_dim: 16
+    use_source_embedding: false
+    source_embedding_dim: 8
+    use_species_embedding: false
+    species_embedding_dim: 4
+    smoke_loss_weight: 1.0
+    cancer_loss_weight: 1.0
+    return_attention_during_training: false
+    num_cell_type_buckets: 5
+    num_sources: 1
+    num_species: 2
+    empty_batch_policy: skip
+    uncertainty:
+      mc_dropout_enabled: false
+      mc_passes: 20
+    # Gene modules define the masked gene-to-module projection this model
+    # depends on (see GeneModuleCollection). No pathway resource is
+    # downloaded automatically and none is committed to this repository.
+    # path: null with allow_synthetic_modules: true is only valid for
+    # synthetic/test workflows — a real training run requires a supplied
+    # GMT-format module file, or the model fails to construct with an
+    # actionable configuration error.
+    gene_modules:
+      path: null
+      format: gmt
+      identifier_namespace: gene_symbol
+      minimum_genes_per_module: 3
+      minimum_module_coverage: 0.5
+      empty_module_policy: error
+      allow_synthetic_modules: false
+
 train:
   phase1_epochs: 15
   phase1_lr: 1.0e-3
