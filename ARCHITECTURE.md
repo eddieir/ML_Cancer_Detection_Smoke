@@ -1107,3 +1107,123 @@ Architectural summary:
     this module's existence — no real (non-synthetic) ablation evidence has
     yet been produced, so the pre-Phase-2 default remains authoritative
     until such evidence exists.
+
+## 14. Dataset Provenance, Label State, and Species/Assay Boundaries ("Phase 3/4")
+
+This section covers the additions layered on top of §11's existing
+split/leakage machinery: explicit dataset provenance, a shared label-state
+vocabulary, and hard boundaries around cross-species and bulk/single-cell
+mixing.
+
+### 14.1 Dataset manifest and provenance flow
+
+`configs/datasets.yaml` (checked in) records the facts about each dataset
+that don't depend on the local filesystem: accession, source/official-record
+URLs, species, assay type, identifier fields, and documented limitations.
+`src/data/manifest.py::build_dataset_manifest` reads that seed and adds the
+facts that DO depend on what's actually downloaded — real SHA-256 checksums
+for files present under `data/raw/<raw_subdir>`, `files_present=False` and
+`null` checksums for anything not found. `DatasetManifestEntry.validate()`
+refuses an entry missing a required provenance field, and refuses a
+checksum recorded without `files_present=True` (a checksum must never be
+fabricated for a file that wasn't actually hashed).
+`manifest_fingerprint()` hashes every entry's provenance fields (excluding
+`download_date`, which changes without the underlying data changing) — this
+is the value meant to be folded into `PreprocessingArtifact`/experiment
+identity so a changed accession or label-policy version changes what an
+experiment "is."
+
+### 14.2 Label-state model
+
+`src/data/label_state.py` defines five states — `known_positive`,
+`known_negative`, `unknown`, `not_applicable`, `excluded_by_policy` — and a
+`LabelProvenance` record (status/source/method/confidence/limitation) for
+any label-producing code to attach to a value. It is deliberately additive:
+the existing `malignancy_known`/`cancer_label_known` boolean gates already
+wired through `data/assembly.py`, `data/labellers.py`, and `model.py`'s
+`MultiTaskLoss` remain the actual enforcement points for those two labels.
+`smoke_type` does not yet have an equivalent per-cell known/unknown gate —
+see §14.4 below and README.md's COPD-proxy note for the specific,
+disclosed gap this leaves in GSE136831's default smoke-type label.
+
+### 14.3 Subject-split boundary and fit/transform preprocessing interface
+
+Unchanged from §11: `run_pipeline_split_aware` computes the subject-level
+split before `fit_preprocessing` runs, and `fit_preprocessing`/
+`apply_preprocessing` (`data/preprocessing.py`) enforce the fit/transform
+split for HVG selection and scaling. This section's additions don't modify
+that interface; `tests/test_leakage_regression.py` re-exercises the
+guarantee alongside the newer boundaries below in one file.
+
+### 14.4 Cross-species boundary
+
+`src/constants.py` defines four experiment modes (`human_only` — the
+default, `mouse_only`, `cross_species_pretraining`,
+`cross_species_domain_adaptation`). `src/data/species_policy.py` is the
+single enforcement point:
+
+- `preprocess.py::_load_all_sources` never loads the mouse source
+  (GSE288003) at all unless `data.experiment_mode` excludes `human_only`.
+- Every loader stamps `obs["species"]`; `data/loaders.py::load_mouse_scrna`
+  namespaces subject/animal IDs (`mouse::<id>`) so they cannot collide with
+  a human `subject_id`.
+- `data/assembly.py::merge_sources` checks every source's species against
+  `experiment_mode` before concatenating anything, and raises
+  `SpeciesPolicyError` if more than one species is present without an
+  explicit cross-species mode.
+- `data/ortholog.py` replaces the old uncached, "pick the first match"
+  live BioMart call with a versioned `OrthologMappingArtifact`
+  (source/release/policy/mapping/counts), resolvable from an injected
+  fixture, a cached file, or (last resort) a live query.
+
+`cross_species_pretraining`/`cross_species_domain_adaptation` are
+implemented only as safe hooks: they allow `merge_sources` to combine
+species when explicitly requested, but there is no pretraining loop or
+domain-adaptation training procedure built on top of them in this change.
+Both remain disabled by default.
+
+### 14.5 Bulk/single-cell boundary
+
+`src/constants.py` defines `single_cell`/`bulk_tcga` assay modes;
+`src/data/assay_mode.py::assert_no_pseudo_bulk_rows` /
+`assert_no_single_cell_rows` are guards a single-cell-only or bulk-only code
+path can call. **This is not yet wired into the existing default
+pipeline**: `configs/default.yaml`'s `microarray_sources` already includes
+TCGA-LUAD/TCGA-LUSC pseudo-bulk samples merged into the same AnnData used
+to build `CellLevelDataset`, a pre-existing design choice this change does
+not retroactively undo (see README.md's bulk/single-cell note for the
+reasoning). The guard exists for new code paths and as a named target for
+retrofitting the default pipeline as follow-up work.
+
+### 14.6 Controlled-access boundary (NLST)
+
+`src/data/nlst_adapter.py` resolves a local data root from an environment
+variable (`NLST_DATA_ROOT` by default, configurable via
+`data.nlst.local_root_env`) — never a committed path, never a credential in
+config. `check_nlst_availability`/`require_nlst_available` validate that
+`screen.csv`/`prsn.csv` are actually present with the required columns
+before anything downstream trusts them, and report unavailability as an
+explicit status rather than substituting a fixture. No participant-level
+row content is included in the availability report. This project has no
+approved NCI Data Use Agreement in this environment; `src/data/
+downloaders.py::print_nlst_instructions` documents the real, manual,
+authorized-access steps.
+
+### 14.7 Frozen-test access boundary
+
+Unchanged: `src/benchmarks/test_guard.py` remains the sole point that may
+touch held-out test data, and nothing in this change modifies it. The new
+dataset-manifest and label-quality-report machinery in this section
+operates entirely on development-partition data and provenance metadata; it
+never inspects frozen-test labels or outcomes.
+
+### 14.8 Label-quality report
+
+`src/data/label_quality_report.py::build_label_quality_report` derives a
+per-split/known-vs-unknown summary directly from
+`run_pipeline_split_aware`'s existing return value (`split_manifest.report`,
+`label_provenance_report`) rather than recomputing those counts
+independently, so the report can't drift from what the pipeline itself
+recorded. It flags at minimum: zero subjects with a known cancer outcome,
+and classes that couldn't be stratified across splits. Persisted as JSON
+(full detail) plus a compact per-split CSV summary.

@@ -63,6 +63,103 @@ per-cell from GEO's own `*_AllCells.Samples.CellType.MetadataTable.txt.gz`
 (exact barcode match, not a prefix guess — see
 [converters.py](src/data/converters.py) `_load_gse136831_cell_metadata`).
 
+## Dataset status, label integrity, and leakage-safe preprocessing
+
+This section tracks each data source's actual implementation status, and
+the policies that keep label handling and preprocessing honest.
+
+### Dataset status
+
+| Dataset | Status | Notes |
+|---|---|---|
+| GSE994 | Implemented, verified public download | Bulk microarray, cigarette smoking status from series metadata. |
+| GSE123352 | Implemented, verified public download | Bulk RNA-seq, ever/never-smoker status from series metadata (not independently re-verified against GEO in this change — no network access in this environment; see `configs/datasets.yaml`). |
+| GSE136831 | Implemented, adapter uses a documented weak proxy | Real per-cell donor IDs and disease status (COPD/IPF/Control); `cigarette` is currently still applied as an accession-level default rather than gated per-cell by the new `data.weak_labels.enabled` flag — see the caveat below. |
+| GSE288003 (mouse) | Implemented, species-separated | Real per-sample e-cig/control condition; excluded from the pipeline entirely unless `data.experiment_mode` is set away from the default `human_only` (see `src/data/species_policy.py`). Ortholog mapping is now a versioned, cacheable artifact (`src/data/ortholog.py`) instead of an uncached live BioMart query. |
+| GSE307690 (CANUCK) | Adapter implemented; sample completeness not independently re-verified in this environment | See `configs/datasets.yaml`'s `known_limitations` for this entry. |
+| TCGA-LUAD / TCGA-LUSC | Adapter implemented; downloading requires a personal GDC token (not present in this environment) | Bulk RNA-seq — see the bulk/single-cell note below. |
+| NLST | Controlled-access, blocked in this environment | No participant-level file has been obtained or committed. `src/data/nlst_adapter.py` resolves a local path from `NLST_DATA_ROOT` (or `data.nlst.local_root_env`) and validates required columns; with no approved DUA in this environment, real ingestion is unavailable and the adapter says so explicitly rather than substituting a fixture. |
+
+### Label integrity
+
+- A missing label is never converted into a negative label. `malignancy_known`
+  and `cancer_label_known` (already existed pre-this-change) gate which cells/
+  subjects contribute to their respective supervised losses and metrics —
+  see `data/labellers.py::add_malignancy_labels` and
+  `data/assembly.py::assemble_subject_bags`. `src/data/label_state.py` adds a
+  shared five-state vocabulary (known positive / known negative / unknown /
+  not applicable / excluded by policy) for any new label-producing code to
+  use instead of inventing another ad hoc pair of columns.
+- **COPD proxy policy (GSE136831)**: `Disease_Identity=COPD` is a weak proxy
+  for cigarette exposure, not a verified smoking record — this dataset is an
+  interstitial lung disease atlas, not a smoking cohort. **Known limitation**:
+  the smoke-type label-state infrastructure (`label_state.py`,
+  `data.weak_labels.enabled`) exists, but GSE136831's converter has not yet
+  been rewired to route through it — it still applies `cigarette` as a
+  blanket accession-level default for every cell regardless of
+  Disease_Identity. Treat any smoke-type result trained against GSE136831 as
+  using an unverified, non-per-subject smoking label until this is fixed.
+- **TCGA smoking/bulk policy**: TCGA smoke type is never defaulted to
+  cigarette. TCGA is primarily bulk RNA-seq; `data.tcga.mode` and
+  `src/data/assay_mode.py` name the single_cell/bulk_tcga distinction
+  explicitly. **Known limitation**: the existing default pipeline
+  (`configs/default.yaml`'s `microarray_sources`) already merges TCGA
+  pseudo-bulk samples into the same cell-level dataset as real single-cell
+  sources — a pre-existing design predating this change. `assay_mode.py`'s
+  guard is available for new single-cell-only code paths but has not been
+  retrofitted into the existing default pipeline; doing so would change
+  default training data composition and is left as follow-up work.
+
+### Human/mouse separation
+
+`data.experiment_mode` (default `human_only`) gates whether any mouse data
+is loaded at all — see `src/data/species_policy.py`. Mouse subject/animal
+IDs are namespaced (`mouse::<id>`) so they can never collide with a human
+subject_id. `data/assembly.py::merge_sources` refuses to concatenate sources
+spanning more than one species unless `experiment_mode` is explicitly
+`cross_species_pretraining` or `cross_species_domain_adaptation` — both
+exist only as safe hooks in this change (disabled by default); a real
+domain-adaptation training loop is not implemented.
+
+### Ortholog mapping
+
+`src/data/ortholog.py` resolves mouse→human gene pairs through an explicit,
+versioned `OrthologMappingArtifact` — ambiguous cases (one mouse gene with
+several human candidates, several mouse genes mapping to the same human
+gene) are dropped under the default `one_to_one_only` policy rather than
+resolved by picking the first match. The artifact can be cached to disk and
+reloaded (`artifact_path=`) so tests and CI never need a live BioMart query.
+
+### Split-before-preprocessing, train-only HVG/scaling
+
+Unchanged from the existing pipeline (already implemented before this
+change; see `src/preprocess.py::run_pipeline_split_aware` and
+`src/data/preprocessing.py`): the subject-level split is computed before
+`fit_preprocessing` ever runs, and gene selection/scaling are fit on the
+training partition's cells only. `tests/test_leakage_regression.py`
+consolidates the isolation regression tests for this and the additions
+above into one auditable file.
+
+### Batch correction
+
+`preprocessing.batch_correction.mode` is `none` by default (no Harmony run
+at all in the leakage-free path). `transductive_diagnostic_only` is the
+named opt-in for running Harmony across the full train+val+test dataset —
+this is explicitly disclosed as non-leakage-free and must not be used for
+frozen-test evaluation. `train_fitted_inductive` is accepted as a config
+value but currently always raises: Harmony has no train-only-fit /
+apply-to-new-data transform, so there is no inductive implementation behind
+that name yet.
+
+### Dataset manifest
+
+`configs/datasets.yaml` is the checked-in provenance seed (accession, URLs,
+species, identifier fields, documented limitations) for every dataset above.
+`src/data/manifest.py` builds the full manifest, computing real SHA-256
+checksums only for files actually present locally — an entry for a dataset
+with no local files yet still validates, with `files_present=false` and
+every checksum explicitly `null`, never a fabricated placeholder.
+
 ## Current results (real data)
 
 As of the last real run (not synthetic), with GSE994 + GSE307690 merged and
