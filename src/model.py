@@ -488,7 +488,24 @@ class MultiTaskLoss(nn.Module):
         self.bce  = nn.BCELoss()
         self.mse  = nn.MSELoss()
 
-    def _ls (self, logits, targets): return self.ce (logits, targets)
+    def _ls(self, logits, targets, known_mask=None):
+        """
+        Smoke-classification loss, optionally restricted to cells with a
+        verified (or explicitly opted-in weak-proxy) smoke label. A cell
+        with no such label carries a numeric placeholder in `targets` (see
+        train.CellLevelDataset's docstring) — training against that
+        placeholder as if it were a real label would teach the model a
+        smoke type nobody actually measured for that cell, the same failure
+        mode _lm already guards against for malignancy. known_mask=None
+        preserves the previous unmasked behaviour for callers (tests, the
+        model.py smoke test) that pass fully-synthetic, fully-known labels.
+        """
+        if known_mask is not None:
+            known_mask = known_mask.view(-1).bool()
+            if known_mask.sum() == 0:
+                return logits.sum() * 0.0
+            logits, targets = logits[known_mask], targets[known_mask]
+        return self.ce(logits, targets)
 
     def _lm(self, preds, targets, known_mask=None):
         """
@@ -560,8 +577,9 @@ class MultiTaskLoss(nn.Module):
         smoke_logits: torch.Tensor, smoke_targets: torch.Tensor,
         malig_preds:  torch.Tensor, malig_targets: torch.Tensor,
         malig_known:  Optional[torch.Tensor] = None,
+        smoke_known:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        ls = self._ls(smoke_logits, smoke_targets)
+        ls = self._ls(smoke_logits, smoke_targets, smoke_known)
         lm = self._lm(malig_preds, malig_targets, malig_known)
         total  = self.λs * ls + self.λm * lm
         return total, {"total": total.item(), "smoke": ls.item(), "malignancy": lm.item()}
@@ -579,9 +597,10 @@ class MultiTaskLoss(nn.Module):
         malig_preds:  torch.Tensor, malig_targets: torch.Tensor,
         cancer_prob:  torch.Tensor, cancer_target: torch.Tensor,
         malig_known:  Optional[torch.Tensor] = None,
+        smoke_known:  Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         ls, lm, lsb = (
-            self._ls (smoke_logits, smoke_targets),
+            self._ls (smoke_logits, smoke_targets, smoke_known),
             self._lm (malig_preds,  malig_targets, malig_known),
             self._lsb(cancer_prob,  cancer_target),
         )

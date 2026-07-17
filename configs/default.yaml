@@ -1,24 +1,82 @@
 data:
+  # Governs cross-species (human/mouse) and bulk/single-cell mode gating —
+  # see src/data/species_policy.py, src/constants.py. Default is human_only:
+  # the mouse source below (gse288003_path) is NOT loaded unless this is
+  # changed explicitly. One of: human_only | mouse_only |
+  # cross_species_pretraining | cross_species_domain_adaptation.
+  experiment_mode: human_only
+  # Machine-readable dataset provenance/checksum manifest — see
+  # src/data/manifest.py and README.md's dataset-status table.
+  dataset_manifest: configs/datasets.yaml
+  # verified_only (default): only smoke_label rows with a verified,
+  # non-weak-proxy source contribute to smoke-type supervision/metrics.
+  # weak_labels.enabled must be explicitly set true to opt a documented
+  # weak proxy (e.g. GSE136831's COPD-diagnosis proxy) into training — see
+  # README.md's COPD-proxy policy section.
+  label_policy: verified_only
+  weak_labels:
+    enabled: false
+  species:
+    evaluation_species: human
+    mouse_usage: disabled
+    ortholog_mapping:
+      source: ensembl
+      policy: one_to_one_only
+      artifact: null
+  tcga:
+    enabled: false
+    mode: bulk
+    projects: [TCGA-LUAD, TCGA-LUSC]
+    manifest_path: null
+    # TCGA bulk expression CSVs (data/converters.py::convert_tcga output) —
+    # deliberately NOT part of scrna_sources/microarray_sources below.
+    # assay_mode=bulk_tcga records must never enter the single-cell
+    # pipeline (see src/data/assay_mode.py, src/preprocess.py::
+    # _load_all_sources, src/preprocess.py::load_tcga_bulk_dataset).
+    # data.tcga.enabled stays false by default — real bulk training is not
+    # implemented; enabling this only unlocks the dedicated bulk manifest/
+    # validation/loading path, with an actionable error if a caller then
+    # tries to actually train against it.
+    bulk_sources:
+      - [data/processed/converted/TCGA-LUAD.csv, TCGA-LUAD]
+      - [data/processed/converted/TCGA-LUSC.csv, TCGA-LUSC]
+  nlst:
+    enabled: false
+    local_root_env: NLST_DATA_ROOT
+    manifest_path: null
   # Populated by:
   #   python3 src/data/downloaders.py --all
   #   python3 src/data/converters.py --all
   # A source is silently skipped by run_pipeline() if its file doesn't exist
   # yet, so this is safe to check in with real paths even before download.
   scrna_sources:
-    - [data/processed/converted/GSE136831.h5ad, cigarette, donor_id]
+    # smoke_type here is only the fallback used if the converter had NOT
+    # already stamped a per-cell smoke_type_name — for GSE136831 it always
+    # has (every cell gets "unknown" + smoke_type_known=False; see
+    # data/converters.py::_load_gse136831_cell_metadata), so this value is
+    # never actually applied. Kept as "unknown" rather than "cigarette" so
+    # this line cannot be misread as a real label.
+    - [data/processed/converted/GSE136831.h5ad, unknown, donor_id]
   # GSE123352 (Illumina HumanHT-12 probes) now converts through GPL10558's
   # platform annotation file (converters.py::_load_probe_to_symbol_map),
   # so its probe IDs are real gene symbols before they ever reach
   # harmonize_gene_ids() / merge_sources() — no more BioMart dependency.
+  # TCGA-LUAD/TCGA-LUSC are deliberately NOT listed here — they are bulk
+  # RNA-seq (assay_mode=bulk_tcga), not single-cell data, and must never be
+  # merged into the same matrix as the sources below. See data.tcga.
+  # bulk_sources above for the dedicated bulk path.
   microarray_sources:
     - [data/processed/converted/GSE994.csv, cigarette]
     - [data/processed/converted/GSE123352.csv, cigarette]
-    - [data/processed/converted/TCGA-LUAD.csv, cigarette]
-    - [data/processed/converted/TCGA-LUSC.csv, cigarette]
     - [data/processed/converted/GSE307690.csv, cannabis]
   gse288003_path: data/processed/converted/GSE288003.h5ad
   nlst_csv: data/raw/subjects/NLST/screen.csv
   nlst_outcomes_csv: data/processed/converted/nlst_outcomes.csv
+  # TCGA outcome CSVs carry only subject_id + cancer_label (tumor/normal ->
+  # a subject-level cancer outcome) for MIL-bag supervision — this is
+  # subject-level metadata, never TCGA's bulk expression matrix itself, so
+  # it does not cross the bulk/single-cell boundary the way microarray_
+  # sources would.
   extra_outcomes_csvs:
     - data/processed/converted/TCGA-LUAD_outcomes.csv
     - data/processed/converted/TCGA-LUSC_outcomes.csv
@@ -49,14 +107,37 @@ rare_class:
   target_classes: [cigar]
 
 preprocessing:
+  # Enforced structurally by preprocess.py::run_pipeline_split_aware (split
+  # happens before fit_preprocessing is ever called) — this flag documents
+  # the invariant rather than switching behavior; see data/preprocessing.py.
+  split_before_fit: true
+  hvg:
+    fit_partition: train
+    n_top_genes: 2000
+  scaling:
+    fit_partition: train
+    zero_variance_policy: unit_scale
+  missing_gene_policy: error
   batch_correction:
     method: harmony
-    # Harmony has no train-only-fit / apply-to-new-data mode, so running it
-    # uses held-out (val/test) expression values to compute the batch
-    # correction embedding — a transductive, NOT leakage-free, step. Default
-    # is strict: batch correction is SKIPPED in run_pipeline_split_aware.
-    # Set true only as a deliberate, documented opt-in — the resulting
-    # experiment must not be described as fully leakage-free.
+    # mode: none (default) | train_fitted_inductive | transductive_diagnostic_only
+    # Harmony (this project's only implemented method) has no train-only-fit
+    # / apply-to-new-data mode, so "train_fitted_inductive" is not currently
+    # available — requesting it fails clearly rather than silently running
+    # the transductive path. "transductive_diagnostic_only" is the
+    # explicitly-named opt-in for the legacy allow_transductive_harmony
+    # behavior below; it must never be used for frozen-test evaluation (see
+    # src/benchmarks/test_guard.py) and results produced under it must not
+    # be described as leakage-free.
+    mode: none
+    # Legacy flag, kept for backward compatibility: true is equivalent to
+    # mode: transductive_diagnostic_only. Harmony has no train-only-fit /
+    # apply-to-new-data mode, so running it uses held-out (val/test)
+    # expression values to compute the batch correction embedding — a
+    # transductive, NOT leakage-free, step. Default is strict: batch
+    # correction is SKIPPED in run_pipeline_split_aware. Set true only as a
+    # deliberate, documented opt-in — the resulting experiment must not be
+    # described as fully leakage-free.
     allow_transductive_harmony: false
 
 model:

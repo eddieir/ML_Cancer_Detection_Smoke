@@ -1107,3 +1107,176 @@ Architectural summary:
     this module's existence — no real (non-synthetic) ablation evidence has
     yet been produced, so the pre-Phase-2 default remains authoritative
     until such evidence exists.
+
+## 14. Dataset Provenance, Label State, and Species/Assay Boundaries ("Phase 3/4")
+
+This section covers the additions layered on top of §11's existing
+split/leakage machinery: explicit dataset provenance, a shared label-state
+vocabulary, and hard boundaries around cross-species and bulk/single-cell
+mixing.
+
+### 14.1 Dataset manifest and provenance flow
+
+`configs/datasets.yaml` (checked in) records the facts about each dataset
+that don't depend on the local filesystem: accession, source/official-record
+URLs, species, assay type, identifier fields, and documented limitations.
+`src/data/manifest.py::build_dataset_manifest` reads that seed and adds the
+facts that DO depend on what's actually downloaded — real SHA-256 checksums
+for files present under `data/raw/<raw_subdir>`, `files_present=False` and
+`null` checksums for anything not found. `DatasetManifestEntry.validate()`
+refuses an entry missing a required provenance field, and refuses a
+checksum recorded without `files_present=True` (a checksum must never be
+fabricated for a file that wasn't actually hashed).
+`manifest_fingerprint()` hashes every entry's provenance fields (excluding
+`download_date`, which changes without the underlying data changing) — this
+is the value meant to be folded into `PreprocessingArtifact`/experiment
+identity so a changed accession or label-policy version changes what an
+experiment "is."
+
+### 14.2 Label-state model
+
+`src/data/label_state.py` defines five states — `known_positive`,
+`known_negative`, `unknown`, `not_applicable`, `excluded_by_policy` — and a
+`LabelProvenance` record (status/source/method/confidence/limitation) for
+any label-producing code to attach to a value. `malignancy_known`/
+`cancer_label_known` (`data/assembly.py`, `data/labellers.py`, `model.py`'s
+`MultiTaskLoss`) were the first two enforcement points; `smoke_type_known`
+is the same pattern applied to the smoke label, gating:
+
+- `train.CellLevelDataset.smoke_class_weights` (class-weight computation)
+- `data.sampling.SubjectClassIndex` (subject-balanced sampling's class
+  index — a cell with `smoke_known=False` keeps its true position but is
+  never added to any subject's sampleable index)
+- `model.MultiTaskLoss._ls` (the smoke-classification loss term)
+- `evaluate.Evaluator._known_smoke_metrics` (accuracy/F1/confusion matrix)
+- `preprocess.py::run_pipeline_split_aware`'s subject-level stratification
+  (a subject with no known smoke label is stratified as `None` — pooled,
+  unstratified placement — not counted toward any class's proportion)
+
+`data/converters.py::_load_gse136831_cell_metadata` is the first real
+producer of `smoke_type_known=False` rows: GSE136831 has no verified
+per-subject smoking record, so every cell defaults to unknown, and
+`weak_smoke_proxy_*` fields carry COPD status as a separate, clearly
+labeled proxy. `data/labellers.py::apply_weak_smoke_proxies` is the only
+path that ever promotes a weak proxy into the primary smoke label, gated
+by `data.weak_labels.enabled` (default `false`).
+
+`data/nlst_smoking.py::parse_nlst_smoking_row` is the explicit parser for
+NLST's `CIGSMOK`/`CIGAR` fields: it only recognizes the codes documented in
+`src/data/downloaders.py::print_nlst_instructions` (`CIGSMOK` 1/2,
+`CIGAR` 1) as verified evidence, and treats every other value — missing,
+blank, null, an undocumented code, or malformed input — as unknown, never
+raising and never guessing at an unconfirmed codebook meaning.
+`data/labellers.py::transfer_nlst_labels` calls it per matched subject and
+writes `smoke_type_known` plus `smoke_type_source`/`smoke_type_method`/
+`smoke_type_limitation` provenance columns (default `None` for every cell
+this function doesn't touch); it can overwrite an upstream
+`smoke_type_known=True` back to `False` when NLST linkage itself finds no
+usable evidence, since NLST is this project's intended source of truth for
+a scRNA-seq subject's smoking status. The same pattern (a per-sample value
+that doesn't parse to a documented code stays unknown rather than
+inheriting the accession-level default) applies to GSE994/GSE123352
+(`data/converters.py::_infer_smoke_column`) and GSE307690/CANUCK
+(`convert_canuck`'s empty-metadata case).
+
+### 14.3 Subject-split boundary and fit/transform preprocessing interface
+
+Unchanged from §11: `run_pipeline_split_aware` computes the subject-level
+split before `fit_preprocessing` runs, and `fit_preprocessing`/
+`apply_preprocessing` (`data/preprocessing.py`) enforce the fit/transform
+split for HVG selection and scaling. This section's additions don't modify
+that interface; `tests/test_leakage_regression.py` re-exercises the
+guarantee alongside the newer boundaries below in one file.
+
+### 14.4 Cross-species boundary
+
+`src/constants.py` defines four experiment modes (`human_only` — the
+default, `mouse_only`, `cross_species_pretraining`,
+`cross_species_domain_adaptation`). `src/data/species_policy.py` is the
+single enforcement point:
+
+- `preprocess.py::_load_all_sources` never loads the mouse source
+  (GSE288003) at all unless `data.experiment_mode` excludes `human_only`.
+- Every loader stamps `obs["species"]`; `data/loaders.py::load_mouse_scrna`
+  namespaces subject/animal IDs (`mouse::<id>`) so they cannot collide with
+  a human `subject_id`.
+- `data/assembly.py::merge_sources` checks every source's species against
+  `experiment_mode` before concatenating anything, and raises
+  `SpeciesPolicyError` if more than one species is present without an
+  explicit cross-species mode.
+- `data/ortholog.py` replaces the old uncached, "pick the first match"
+  live BioMart call with a versioned `OrthologMappingArtifact`
+  (source/release/policy/mapping/counts), resolvable from an injected
+  fixture, a cached file, or (last resort) a live query.
+
+`cross_species_pretraining`/`cross_species_domain_adaptation` are
+implemented only as safe hooks: they allow `merge_sources` to combine
+species when explicitly requested, but there is no pretraining loop or
+domain-adaptation training procedure built on top of them in this change.
+Both remain disabled by default.
+
+### 14.5 Bulk/single-cell boundary
+
+`src/constants.py` defines `human_single_cell`/`bulk_tcga` assay modes.
+Every loader stamps `obs["assay_mode"]`, defaulting to `human_single_cell`;
+`data/converters.py::convert_tcga` is the only producer of
+`assay_mode="bulk_tcga"` (written into its `samples_meta.csv` output,
+picked up by `data/loaders.py::load_microarray`). Enforcement:
+
+- `configs/default.yaml`'s `microarray_sources` no longer lists TCGA-LUAD/
+  TCGA-LUSC — they moved to `data.tcga.bulk_sources`, a separate config key
+  the default single-cell loading path never reads.
+- `preprocess.py::_load_all_sources` additionally checks every loaded
+  source's `assay_mode` column directly and raises `AssayModeError`
+  (`data/assay_mode.py`) if any `bulk_tcga` row is present — a defensive
+  check against a config that still manually lists a bulk source under
+  `scrna_sources`/`microarray_sources`, not just reliance on the config
+  default being correct.
+- `preprocess.py::load_tcga_bulk_dataset` is the only sanctioned way to
+  load TCGA's bulk matrices: it requires `data.tcga.enabled=true`,
+  validates every loaded source actually carries `assay_mode="bulk_tcga"`,
+  and raises `BulkTrainingNotImplementedError` if asked for a trainable
+  dataset (`require_trainable=True`) — this project has no bulk RNA-seq
+  model or training loop, and that gap is a raised error, not a silent
+  fallback onto the single-cell model.
+- TCGA's `sample_type`-derived malignancy (tumor vs. solid-tissue-normal)
+  is written only into this bulk path's `samples_meta.csv`; it is never
+  reachable from a single-cell `CellLevelDataset`/MIL bag because the
+  bulk CSV itself never enters `_load_all_sources`.
+
+`data/assay_mode.py::assert_no_pseudo_bulk_rows`/`assert_no_single_cell_rows`
+remain available as generic guards for any additional single-cell-only or
+bulk-only code path that needs the same check.
+
+### 14.6 Controlled-access boundary (NLST)
+
+`src/data/nlst_adapter.py` resolves a local data root from an environment
+variable (`NLST_DATA_ROOT` by default, configurable via
+`data.nlst.local_root_env`) — never a committed path, never a credential in
+config. `check_nlst_availability`/`require_nlst_available` validate that
+`screen.csv`/`prsn.csv` are actually present with the required columns
+before anything downstream trusts them, and report unavailability as an
+explicit status rather than substituting a fixture. No participant-level
+row content is included in the availability report. This project has no
+approved NCI Data Use Agreement in this environment; `src/data/
+downloaders.py::print_nlst_instructions` documents the real, manual,
+authorized-access steps.
+
+### 14.7 Frozen-test access boundary
+
+Unchanged: `src/benchmarks/test_guard.py` remains the sole point that may
+touch held-out test data, and nothing in this change modifies it. The new
+dataset-manifest and label-quality-report machinery in this section
+operates entirely on development-partition data and provenance metadata; it
+never inspects frozen-test labels or outcomes.
+
+### 14.8 Label-quality report
+
+`src/data/label_quality_report.py::build_label_quality_report` derives a
+per-split/known-vs-unknown summary directly from
+`run_pipeline_split_aware`'s existing return value (`split_manifest.report`,
+`label_provenance_report`) rather than recomputing those counts
+independently, so the report can't drift from what the pipeline itself
+recorded. It flags at minimum: zero subjects with a known cancer outcome,
+and classes that couldn't be stratified across splits. Persisted as JSON
+(full detail) plus a compact per-split CSV summary.

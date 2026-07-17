@@ -252,7 +252,7 @@ class Evaluator:
         batch_size:   int = 512,
     ) -> Dict:
         """Single forward pass over cell_dataset — shared by cell_level() and full_report()."""
-        smoke_preds, smoke_true = [], []
+        smoke_preds, smoke_true, smoke_known = [], [], []
         malig_probs, malig_true, malig_known = [], [], []
 
         self.model.eval()
@@ -261,14 +261,31 @@ class Evaluator:
                 _, logits, malig = self.model.forward_cell(batch["x"].to(self.device))
                 smoke_preds.extend(logits.argmax(1).cpu().tolist())
                 smoke_true.extend(batch["smoke_label"].tolist())
+                smoke_known.extend(batch["smoke_known"].tolist())
                 malig_probs.extend(malig.squeeze().cpu().tolist())
                 malig_true.extend(batch["malignancy_label"].tolist())
                 malig_known.extend(batch["malignancy_known"].tolist())
 
         return {
-            "smoke_pred": smoke_preds, "smoke_true": smoke_true,
+            "smoke_pred": smoke_preds, "smoke_true": smoke_true, "smoke_known": smoke_known,
             "malig_prob": malig_probs, "malig_true": malig_true, "malig_known": malig_known,
         }
+
+    def _known_smoke_metrics(self, p: Dict) -> Dict:
+        """
+        Restrict smoke-type metrics to cells with a verified (or
+        explicitly opted-in weak-proxy) smoke label — a cell with
+        smoke_known=False carries a meaningless placeholder target (see
+        train.CellLevelDataset's docstring) and must not count toward
+        accuracy/F1/confusion-matrix the way an unlabeled malignancy cell
+        must not count toward malignancy AUC (see _known_malignancy_metrics).
+        """
+        known_true = [t for t, k in zip(p["smoke_true"], p["smoke_known"]) if k]
+        known_pred = [pr for pr, k in zip(p["smoke_pred"], p["smoke_known"]) if k]
+        metrics = _smoke_metrics(known_true, known_pred, self._num_classes(), self._class_names())
+        metrics["n_known"] = len(known_true)
+        metrics["n_unknown"] = len(p["smoke_true"]) - len(known_true)
+        return metrics
 
     @staticmethod
     def _known_malignancy_metrics(p: Dict) -> Dict:
@@ -295,8 +312,7 @@ class Evaluator:
         p = self._cell_predictions(cell_dataset, batch_size)
         return {
             "n_cells":    len(p["smoke_true"]),
-            "smoke_type": _smoke_metrics(p["smoke_true"], p["smoke_pred"],
-                                          self._num_classes(), self._class_names()),
+            "smoke_type": self._known_smoke_metrics(p),
             "malignancy": self._known_malignancy_metrics(p),
         }
 
@@ -357,8 +373,7 @@ class Evaluator:
         report = {
             "cell_level": {
                 "n_cells":    len(cell_preds["smoke_true"]),
-                "smoke_type": _smoke_metrics(cell_preds["smoke_true"], cell_preds["smoke_pred"],
-                                              self._num_classes(), self._class_names()),
+                "smoke_type": self._known_smoke_metrics(cell_preds),
                 "malignancy": self._known_malignancy_metrics(cell_preds),
             },
             "subject_level":    self._subject_metrics_from_records(records, threshold),

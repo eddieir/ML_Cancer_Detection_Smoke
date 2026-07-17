@@ -13,7 +13,7 @@ import yaml
 
 from data.loaders    import load_scrna, load_microarray, load_mouse_scrna
 from data.transforms import map_mouse_to_human, harmonize_gene_ids, qc_filter, normalize, smoke_aware_hvg, batch_correct, annotate_cell_types
-from data.labellers  import transfer_nlst_labels, add_malignancy_labels, compute_smoke_class_weights
+from data.labellers  import transfer_nlst_labels, add_malignancy_labels, compute_smoke_class_weights, apply_weak_smoke_proxies
 from data.assembly   import merge_sources, assemble_subject_bags, export_cell_dataset
 from constants       import N_HVGS_DEFAULT
 
@@ -27,7 +27,24 @@ def load_config(config: Union[dict, str, Path]) -> dict:
 
 
 def _load_all_sources(cfg: dict) -> list:
-    """Shared source-loading step for run_pipeline() and run_pipeline_split_aware()."""
+    """
+    Shared source-loading step for run_pipeline() and run_pipeline_split_aware().
+
+    data.experiment_mode (default "human_only" — see constants.py,
+    data/species_policy.py) gates whether the mouse source (GSE288003,
+    gse288003_path) is loaded at all. human_only (the default) never loads
+    it, regardless of whether gse288003_path is configured — a config
+    written before species separation existed must not silently start
+    mixing mouse cells into a human run just because the path is still
+    present in configs/default.yaml. Loading it requires explicitly setting
+    experiment_mode to "mouse_only", "cross_species_pretraining", or
+    "cross_species_domain_adaptation".
+    """
+    from constants import EXPERIMENT_MODE_HUMAN_ONLY
+    from data.species_policy import species_allowed, validate_experiment_mode
+    from constants import SPECIES_HUMAN, SPECIES_MOUSE
+
+    experiment_mode = validate_experiment_mode(cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY))
     adatas = []
 
     def _exists(path: str) -> bool:
@@ -36,17 +53,48 @@ def _load_all_sources(cfg: dict) -> list:
             print(f"[preprocess] skip  {path}  (not found — run downloaders.py / converters.py)")
         return ok
 
-    for path, stype, scol in cfg.get("scrna_sources", []):
-        if _exists(path):
-            adatas.append(normalize(qc_filter(harmonize_gene_ids(load_scrna(path, stype, scol)))))
+    def _reject_bulk_tcga(a, path: str):
+        """
+        Defensive enforcement of the human_single_cell/bulk_tcga boundary
+        (see data/assay_mode.py): even if a config manually lists a
+        bulk_tcga source under scrna_sources/microarray_sources (the
+        sanctioned path is data.tcga.bulk_sources + load_tcga_bulk_dataset
+        instead), this pipeline refuses to merge it into the human
+        single-cell matrix rather than silently accepting it.
+        """
+        from data.assay_mode import AssayModeError
+        from constants import ASSAY_MODE_BULK_TCGA
+        if "assay_mode" in a.obs.columns:
+            is_bulk = (a.obs["assay_mode"] == ASSAY_MODE_BULK_TCGA).values
+            if is_bulk.any():
+                raise AssayModeError(
+                    f"{path!r} contains {int(is_bulk.sum())} assay_mode='bulk_tcga' row(s) — "
+                    "bulk TCGA data must never enter the human single-cell pipeline. Remove it "
+                    "from data.scrna_sources/data.microarray_sources and configure it under "
+                    "data.tcga.bulk_sources instead (see preprocess.py::load_tcga_bulk_dataset)."
+                )
+        return a
 
-    for path, stype in cfg.get("microarray_sources", []):
-        if _exists(path):
-            adatas.append(normalize(harmonize_gene_ids(load_microarray(path, stype))))
+    if species_allowed(experiment_mode, SPECIES_HUMAN):
+        for path, stype, scol in cfg.get("scrna_sources", []):
+            if _exists(path):
+                a = _reject_bulk_tcga(load_scrna(path, stype, scol), path)
+                adatas.append(normalize(qc_filter(harmonize_gene_ids(a))))
 
-    if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
-        a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
-        adatas.append(normalize(qc_filter(a)))
+        for path, stype in cfg.get("microarray_sources", []):
+            if _exists(path):
+                a = _reject_bulk_tcga(load_microarray(path, stype), path)
+                adatas.append(normalize(harmonize_gene_ids(a)))
+
+    if species_allowed(experiment_mode, SPECIES_MOUSE):
+        if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
+            a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
+            adatas.append(normalize(qc_filter(a)))
+    elif cfg.get("gse288003_path"):
+        print(f"[preprocess] skip  {cfg['gse288003_path']}  (mouse source — "
+              f"experiment_mode={experiment_mode!r} does not include species=mouse; "
+              "set data.experiment_mode to mouse_only/cross_species_pretraining/"
+              "cross_species_domain_adaptation to include it)")
 
     if not adatas:
         raise ValueError(
@@ -76,6 +124,87 @@ def _load_outcomes(cfg: dict) -> Optional[pd.DataFrame]:
         .astype({"subject_id": str})
         .groupby("subject_id", as_index=False)["cancer_label"].max()
     )
+
+
+class BulkTrainingNotImplementedError(RuntimeError):
+    """Raised by load_tcga_bulk_dataset when a caller asks for a trainable
+    bulk dataset — TCGA bulk RNA-seq loading/validation is implemented, but
+    there is no bulk model/training path in this project yet. This is an
+    explicit, actionable failure, never a silent fallback to merging bulk
+    samples into the single-cell pipeline."""
+
+
+def load_tcga_bulk_dataset(config: Union[dict, str, Path], require_trainable: bool = False) -> dict:
+    """
+    Dedicated bulk_tcga loading path — the ONLY sanctioned way to load
+    TCGA's bulk expression matrices in this project. Never call
+    load_microarray on a TCGA CSV from the human single-cell pipeline (see
+    preprocess.py::_load_all_sources's _reject_bulk_tcga guard, which
+    exists precisely to catch that mistake).
+
+    config keys (under data.tcga):
+      enabled       bool — must be true, or this raises immediately.
+      bulk_sources  list[(csv_path, project_id)]
+
+    Returns {"project_id": AnnData} for every configured project whose CSV
+    exists, each AnnData carrying assay_mode="bulk_tcga",
+    is_pseudo_bulk=True, smoke_type_known=False (see data/converters.py::
+    convert_tcga — no verified per-patient smoking history), and a real
+    bulk sample_type-derived malignancy field that is explicitly a BULK
+    SAMPLE label (tumor vs. solid-tissue-normal), not a per-cell call.
+
+    require_trainable=True additionally raises BulkTrainingNotImplementedError
+    — there is no bulk model/training loop in this project yet. This
+    function's job is limited to loading/validating the bulk manifest, per
+    the documented scope: bulk training stays disabled with an actionable
+    error rather than silently reusing the single-cell model on bulk data.
+    """
+    from constants import ASSAY_MODE_BULK_TCGA
+    full_cfg = load_config(config)
+    cfg = full_cfg.get("data", full_cfg)
+    tcga_cfg = cfg.get("tcga", {})
+
+    if not tcga_cfg.get("enabled", False):
+        raise ValueError(
+            "load_tcga_bulk_dataset: data.tcga.enabled is false (the default) — TCGA bulk "
+            "loading is disabled by default. Set data.tcga.enabled=true to load/validate the "
+            "configured data.tcga.bulk_sources. This does not enable bulk TRAINING (see "
+            "require_trainable/BulkTrainingNotImplementedError)."
+        )
+
+    datasets = {}
+    for path, project_id in tcga_cfg.get("bulk_sources", []):
+        if not Path(path).exists():
+            print(f"[preprocess] skip  {path}  (bulk_tcga source not found — "
+                  f"run: python3 src/data/converters.py --tcga {project_id})")
+            continue
+        adata = load_microarray(path, "unknown")
+        if "assay_mode" not in adata.obs.columns or not (adata.obs["assay_mode"] == ASSAY_MODE_BULK_TCGA).all():
+            raise ValueError(
+                f"{path!r} did not load with assay_mode='bulk_tcga' for every sample — "
+                "check that it was produced by data/converters.py::convert_tcga (which writes "
+                "the required samples_meta.csv assay_mode column) and not hand-edited."
+            )
+        datasets[project_id] = adata
+        print(f"[preprocess] bulk_tcga  {project_id}  {adata.n_obs:,} samples x {adata.n_vars:,} genes "
+              f"(assay_mode=bulk_tcga, smoke_type_known=False)")
+
+    if not datasets:
+        raise ValueError(
+            "load_tcga_bulk_dataset: data.tcga.enabled=true but no configured bulk_sources "
+            "were found on disk. Run: python3 src/data/downloaders.py --tcga --token ... "
+            "then python3 src/data/converters.py --tcga <PROJECT>."
+        )
+
+    if require_trainable:
+        raise BulkTrainingNotImplementedError(
+            f"Loaded/validated {len(datasets)} TCGA bulk project(s) "
+            f"({sorted(datasets)}), but this project has no bulk RNA-seq model or training "
+            "loop implemented — only manifest/query/validation/loading support exists. "
+            "Bulk training is intentionally left disabled rather than silently reusing the "
+            "single-cell model on bulk expression."
+        )
+    return datasets
 
 
 def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
@@ -117,35 +246,10 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     """
     cfg    = load_config(config)
     cfg    = cfg.get("data", cfg)  # configs/default.yaml nests these under "data:"
-    adatas = []
+    adatas = _load_all_sources(cfg)
 
-    def _exists(path: str) -> bool:
-        ok = Path(path).exists()
-        if not ok:
-            print(f"[preprocess] skip  {path}  (not found — run downloaders.py / converters.py)")
-        return ok
-
-    for path, stype, scol in cfg.get("scrna_sources", []):
-        if _exists(path):
-            adatas.append(normalize(qc_filter(harmonize_gene_ids(load_scrna(path, stype, scol)))))
-
-    for path, stype in cfg.get("microarray_sources", []):
-        if _exists(path):
-            adatas.append(normalize(harmonize_gene_ids(load_microarray(path, stype))))
-
-    if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
-        a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
-        adatas.append(normalize(qc_filter(a)))
-
-    if not adatas:
-        raise ValueError(
-            "No data sources found. Run:\n"
-            "  python3 src/data/downloaders.py --all\n"
-            "  python3 src/data/converters.py --all\n"
-            "or pass a config with paths to already-converted files."
-        )
-
-    merged = merge_sources(*adatas)
+    from constants import EXPERIMENT_MODE_HUMAN_ONLY
+    merged = merge_sources(*adatas, experiment_mode=cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY))
     merged = smoke_aware_hvg(merged, n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT))
     merged = batch_correct(merged)
     # cell_type_allow_diagnostic_fallback defaults to False (fail-closed on
@@ -162,6 +266,7 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
         merged = transfer_nlst_labels(merged, cfg["nlst_csv"])
 
     merged = add_malignancy_labels(merged, cfg.get("tumor_barcodes"))
+    merged = apply_weak_smoke_proxies(merged, enabled=cfg.get("weak_labels", {}).get("enabled", False))
 
     cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
 
@@ -208,9 +313,27 @@ def _nlst_join_report(cfg: dict, merged) -> dict:
     nlst_subjects = set(nlst["pid"].astype(str)) if "pid" in nlst.columns else set()
     data_subjects = set(merged.obs["subject_id"].astype(str))
     matched = nlst_subjects & data_subjects
+
+    # Per-cell known/unknown breakdown among cells transfer_nlst_labels
+    # actually touched (identified by smoke_type_source, stamped only by
+    # that function — see data/nlst_smoking.py) — a matched subject whose
+    # CIGSMOK/CIGAR didn't parse to a documented positive code counts as
+    # "matched but unknown", not silently folded into n_subjects_matched
+    # as if a label was produced.
+    n_cells_verified = n_cells_unknown = 0
+    if "smoke_type_source" in merged.obs.columns:
+        from data.nlst_smoking import SOURCE_NLST_CIGSMOK_CIGAR
+        nlst_touched = merged.obs["smoke_type_source"] == SOURCE_NLST_CIGSMOK_CIGAR
+        if nlst_touched.any():
+            known = merged.obs.loc[nlst_touched, "smoke_type_known"].astype(bool)
+            n_cells_verified = int(known.sum())
+            n_cells_unknown = int((~known).sum())
+
     return {
         "nlst_csv_used": True,
         "n_subjects_matched": len(matched),
+        "nlst_cells_verified_smoke_label": n_cells_verified,
+        "nlst_cells_unknown_smoke_label": n_cells_unknown,
         "note": (
             None if matched else
             "NLST CSV present but ZERO subject ID overlap with this dataset — no "
@@ -279,13 +402,17 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     from data.splitting import load_or_create_split, subject_train_val_test_split
     from train import CellLevelDataset
 
+    from constants import EXPERIMENT_MODE_HUMAN_ONLY
+    experiment_mode = cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY)
     adatas = _load_all_sources(cfg)
-    merged = merge_sources(*adatas, scale=False)   # gene intersection + concat only, NOT scaled
+    merged = merge_sources(*adatas, scale=False, experiment_mode=experiment_mode)   # gene intersection + concat only, NOT scaled
 
     # ── 2. Final labels BEFORE anything that depends on them ────────────────
     if cfg.get("nlst_csv"):
         merged = transfer_nlst_labels(merged, cfg["nlst_csv"])
     merged = add_malignancy_labels(merged, cfg.get("tumor_barcodes"))
+    weak_labels_enabled = cfg.get("weak_labels", {}).get("enabled", False)
+    merged = apply_weak_smoke_proxies(merged, enabled=weak_labels_enabled)
     nlst_report = _nlst_join_report(cfg, merged)
 
     # ── 3. Rare-class policy on the FINAL label — actually wired in ─────────
@@ -314,6 +441,23 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
           f"classes={label_mapping.class_names}  policy={rare_policy!r}")
 
     # ── 4. Subject-level split on the FINAL effective label ─────────────────
+    # Stratify using None (not the numeric placeholder) for any cell with
+    # smoke_type_known=False — a subject whose smoke label is entirely
+    # unknown (e.g. GSE136831 under the default verified_only policy) must
+    # not be silently counted as a member of whatever placeholder class its
+    # numeric smoke_type happens to hold; splitting.py already supports
+    # per-subject label=None (pooled, unstratified placement — see
+    # subject_train_val_test_split's `unstratified_classes` report), which
+    # is the correct treatment here: the subject is still placed into
+    # exactly one split, just not used to balance smoke-type class
+    # proportions across splits.
+    if "smoke_type_known" in merged.obs.columns:
+        strat_labels = merged.obs["smoke_type"].astype(object).where(
+            merged.obs["smoke_type_known"].astype(bool), None
+        ).values
+    else:
+        strat_labels = merged.obs["smoke_type"].values
+
     split_kwargs = dict(
         train_frac=split_cfg.get("train_frac", 0.70),
         val_frac=split_cfg.get("val_frac", 0.15),
@@ -325,13 +469,13 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     if manifest_path:
         manifest = load_or_create_split(
             manifest_path,
-            merged.obs["subject_id"].values, merged.obs["smoke_type"].values,
+            merged.obs["subject_id"].values, strat_labels,
             force_regenerate=split_cfg.get("force_regenerate", False),
             **split_kwargs,
         )
     else:
         manifest = subject_train_val_test_split(
-            merged.obs["subject_id"].values, merged.obs["smoke_type"].values,
+            merged.obs["subject_id"].values, strat_labels,
             **split_kwargs,
         )
 
@@ -389,7 +533,27 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────
-    allow_transductive = pp_cfg.get("batch_correction", {}).get("allow_transductive_harmony", False)
+    bc_cfg = pp_cfg.get("batch_correction", {})
+    bc_mode = bc_cfg.get("mode", "none")
+    valid_bc_modes = {"none", "train_fitted_inductive", "transductive_diagnostic_only"}
+    if bc_mode not in valid_bc_modes:
+        raise ValueError(
+            f"preprocessing.batch_correction.mode={bc_mode!r} is not one of {sorted(valid_bc_modes)}."
+        )
+    if bc_mode == "train_fitted_inductive":
+        raise ValueError(
+            "preprocessing.batch_correction.mode='train_fitted_inductive' was requested, but "
+            "Harmony (this project's only implemented batch-correction method) has no "
+            "train-only-fit / apply-to-new-data transform — there is no inductive "
+            "implementation to run. Use mode='none' (default, leakage-free) or explicitly "
+            "opt into mode='transductive_diagnostic_only' for a disclosed non-leakage-free "
+            "diagnostic run outside frozen-test evaluation."
+        )
+    # Legacy boolean is equivalent to mode='transductive_diagnostic_only'.
+    allow_transductive = (
+        bc_mode == "transductive_diagnostic_only"
+        or bc_cfg.get("allow_transductive_harmony", False)
+    )
     if allow_transductive:
         print("[preprocess] preprocessing.batch_correction.allow_transductive_harmony=True — "
               "running Harmony across the FULL merged dataset (train+val+test). This step is "
@@ -469,6 +633,16 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
             "cancer_outcome_unknown_subjects": n_outcome_unknown,
             "malignancy_known_cells":   int(cell_data["malignancy_known"].sum()),
             "malignancy_unknown_cells": int((~cell_data["malignancy_known"]).sum()),
+            # Verified vs. weak-proxy vs. unknown smoke labels — see
+            # data/labellers.py::apply_weak_smoke_proxies and
+            # data/converters.py::_load_gse136831_cell_metadata.
+            "weak_labels_enabled":       weak_labels_enabled,
+            "smoke_verified_known_cells": int(cell_data["smoke_labels_known"].sum()),
+            "smoke_unknown_cells":        int((~cell_data["smoke_labels_known"]).sum()),
+            "smoke_weak_proxy_cells": (
+                int(merged.obs["weak_smoke_proxy_known"].astype(bool).sum())
+                if "weak_smoke_proxy_known" in merged.obs.columns else 0
+            ),
         },
         "transductive_batch_correction": transductive_used,
         # pre-HVG, pre-scaling normalized AnnData — see the comment at its

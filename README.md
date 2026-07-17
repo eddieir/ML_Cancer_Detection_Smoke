@@ -29,10 +29,10 @@ fetches all of them (except NLST and TCGA, which need extra steps — see below)
 |---|---|---|---|
 | [GSE994](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE994) | Bronchial epithelial microarray, 75 subjects | Cigarette (active/former/never) | Free, no login |
 | [GSE123352](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE123352) | Lung tissue RNA-seq, 176 subjects (118 ever-smokers, 58 never-smokers) | Cigarette (ever/never) | Free, no login — Illumina probe IDs mapped to real gene symbols via GEO's own GPL10558 platform annotation file, merged into `microarray_sources` |
-| [GSE136831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136831) | Lung scRNA-seq atlas, 312,928 real single cells | Cigarette (documented approximation — see caveat below) | Free, no login — largest source (~2GB), converted via the streaming mtx parser (`src/data/converters.py::_read_mtx_streaming`), with real per-cell donor IDs from GEO's own metadata table |
+| [GSE136831](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136831) | Lung scRNA-seq atlas, 312,928 real single cells | Unknown by default; COPD status available as an explicit, opt-in weak proxy — see caveat below | Free, no login — largest source (~2GB), converted via the streaming mtx parser (`src/data/converters.py::_read_mtx_streaming`), with real per-cell donor IDs from GEO's own metadata table |
 | [GSE288003](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE288003) | Mouse lung scRNA-seq, e-cig aerosol exposure — 23,595 real cells (10,467 unexposed control + 13,128 e-cig exposed) | Vape/e-cig (per-sample, real condition) | Free, no login — its real count matrix ships inside `RAW.tar`, which the downloader now extracts; each of the two GSM samples keeps its real exposure condition instead of a blanket label |
 | [GSE307690](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE307690) (CANUCK study) | Real human airway epithelial brushings, 61 samples (139 cannabis smokers + 57 never-smokers in the full published cohort) | Cannabis, dual-use, cigarette, vape, unexposed | Free, no login |
-| TCGA-LUAD / TCGA-LUSC | Tumor + adjacent-normal tissue, real per-sample malignancy labels | Cigarette (default; TCGA doesn't record smoke type) | Free, but needs a personal [GDC token](https://portal.gdc.cancer.gov/) (register → profile menu → "Download Token") |
+| TCGA-LUAD / TCGA-LUSC | Tumor + adjacent-normal tissue, real per-sample malignancy labels | Unknown — TCGA doesn't record verified smoking history; never defaulted | Free, but needs a personal [GDC token](https://portal.gdc.cancer.gov/) (register → profile menu → "Download Token"). Bulk RNA-seq, loaded only through the dedicated bulk_tcga path — never merged into the single-cell pipeline |
 | NLST | ~26,722 subjects, 10-year cancer outcome + smoking history (cigar/dual-use labels) | — (label source, not expression data) | Requires a Data Use Agreement via [cdas.cancer.gov/nlst](https://cdas.cancer.gov/nlst/) (manual, 1–3 business days) — cannot be automated |
 
 ```bash
@@ -55,13 +55,153 @@ verify on GEO yourself, treat it as unverified until you check.
 **A note on GSE136831's smoke_type label**: this accession is the
 Vanderbilt/Habermann interstitial lung disease atlas — its real per-cell
 metadata (`Disease_Identity`) is COPD, IPF, or Control, not a direct
-smoking-status field. `cigarette` is applied as a documented approximation
-(COPD is strongly smoking-associated, and no better per-subject label
-exists for this accession), the same pattern already used for TCGA-LUAD/
-LUSC below. Donor IDs and the disease label itself are real, joined
-per-cell from GEO's own `*_AllCells.Samples.CellType.MetadataTable.txt.gz`
-(exact barcode match, not a prefix guess — see
-[converters.py](src/data/converters.py) `_load_gse136831_cell_metadata`).
+smoking-status field. Every cell's smoke label defaults to unknown
+(`smoke_type_known=False`); COPD status is preserved as a separate,
+explicitly opt-in weak proxy rather than being written into the primary
+smoke label — see "Dataset status, label integrity, and leakage-safe
+preprocessing" below for the full policy. Donor IDs and the disease label
+itself are real, joined per-cell from GEO's own
+`*_AllCells.Samples.CellType.MetadataTable.txt.gz` (exact barcode match,
+not a prefix guess — see [converters.py](src/data/converters.py)
+`_load_gse136831_cell_metadata`).
+
+## Dataset status, label integrity, and leakage-safe preprocessing
+
+This section tracks each data source's actual implementation status, and
+the policies that keep label handling and preprocessing honest.
+
+### Dataset status
+
+| Dataset | Status | Notes |
+|---|---|---|
+| GSE994 | Implemented, verified public download | Bulk microarray; per-sample smoking status parsed from series metadata where it matches a documented pattern, otherwise `smoke_type_known=False` rather than the accession-level default. |
+| GSE123352 | Implemented, verified public download | Bulk RNA-seq, ever/never-smoker status from series metadata under the same known/unknown parsing as GSE994 (not independently re-verified against GEO in this change — no network access in this environment; see `configs/datasets.yaml`). |
+| GSE136831 | Implemented, verified-label default with an explicit opt-in weak proxy | Real per-cell donor IDs and disease status (COPD/IPF/Control). Every cell's smoke label defaults to unknown (`smoke_type_known=False`); COPD status is recorded as a separate, documented weak proxy (`weak_smoke_proxy_*` fields) that only feeds smoke-classification supervision when `data.weak_labels.enabled=true` — see the caveat below. |
+| GSE288003 (mouse) | Implemented, species-separated | Real per-sample e-cig/control condition; excluded from the pipeline entirely unless `data.experiment_mode` is set away from the default `human_only` (see `src/data/species_policy.py`). Ortholog mapping is now a versioned, cacheable artifact (`src/data/ortholog.py`) instead of an uncached live BioMart query. |
+| GSE307690 (CANUCK) | Adapter implemented; sample completeness not independently re-verified in this environment | See `configs/datasets.yaml`'s `known_limitations` for this entry. |
+| TCGA-LUAD / TCGA-LUSC | Adapter implemented; downloading requires a personal GDC token (not present in this environment) | Bulk RNA-seq, kept out of the single-cell pipeline by construction — see the bulk/single-cell note below. |
+| NLST | Controlled-access, blocked in this environment | No participant-level file has been obtained or committed. `src/data/nlst_adapter.py` resolves a local path from `NLST_DATA_ROOT` (or `data.nlst.local_root_env`) and validates required columns; with no approved DUA in this environment, real ingestion is unavailable and the adapter says so explicitly rather than substituting a fixture. |
+
+### Label integrity
+
+- A missing label is never converted into a negative label. `malignancy_known`
+  and `cancer_label_known` (already existed pre-this-change) gate which cells/
+  subjects contribute to their respective supervised losses and metrics —
+  see `data/labellers.py::add_malignancy_labels` and
+  `data/assembly.py::assemble_subject_bags`. `src/data/label_state.py` adds a
+  shared five-state vocabulary (known positive / known negative / unknown /
+  not applicable / excluded by policy) for any new label-producing code to
+  use instead of inventing another ad hoc pair of columns.
+- **COPD proxy policy (GSE136831)**: `Disease_Identity=COPD` is a weak proxy
+  for cigarette exposure, not a verified smoking record — this dataset is an
+  interstitial lung disease atlas, not a smoking cohort. Every GSE136831
+  cell's converter output carries `smoke_type_name="unknown"` and
+  `smoke_type_known=False` by default (see
+  `data/converters.py::_load_gse136831_cell_metadata`); COPD-diagnosed
+  donors additionally carry `weak_smoke_proxy_known=True`,
+  `weak_smoke_proxy_type="COPD_diagnosis"`,
+  `weak_smoke_proxy_value="cigarette"`, and a `weak_smoke_proxy_limitation`
+  string. `smoke_type_known=False` cells are excluded from smoke-
+  classification loss, class-weighting, subject-balanced sampling
+  distributions, stratification, and evaluation metrics (see
+  `train.CellLevelDataset.smoke_class_weights`,
+  `model.MultiTaskLoss._ls`, `data.sampling.SubjectClassIndex`,
+  `evaluate.Evaluator._known_smoke_metrics`) — a corrupted or arbitrary
+  placeholder value for these cells cannot change any of those outputs,
+  since they're masked out before the placeholder is ever read.
+  `data/labellers.py::apply_weak_smoke_proxies` is the only way COPD's
+  weak proxy is ever promoted into the primary smoke label, and it only
+  runs when `data.weak_labels.enabled=true` (default `false`) — this is a
+  disclosed, non-default experiment, never silent.
+- **TCGA smoking/bulk policy**: TCGA smoke type is never defaulted to
+  cigarette — `data/converters.py::convert_tcga` writes
+  `smoke_type="unknown"`/`smoke_type_known=False` for every sample. TCGA is
+  primarily bulk RNA-seq: `configs/default.yaml`'s `microarray_sources` no
+  longer lists TCGA-LUAD/TCGA-LUSC at all, and every TCGA sample carries
+  `assay_mode="bulk_tcga"` (`src/data/assay_mode.py`), which
+  `preprocess.py::_load_all_sources` refuses to load into the human
+  single-cell pipeline even if a config is misconfigured to reference it —
+  see `preprocess.py::load_tcga_bulk_dataset` for the dedicated bulk
+  loading/validation path, which stays disabled by default
+  (`data.tcga.enabled=false`) and raises `BulkTrainingNotImplementedError`
+  if asked to produce a trainable bulk dataset (no bulk model exists in
+  this project). TCGA's tumor/solid-tissue-normal `sample_type` remains a
+  bulk-sample-level malignancy label, reachable only through that same
+  bulk-only path — it is never merged into a single-cell dataset's
+  per-cell malignancy field.
+
+### Human/mouse separation
+
+`data.experiment_mode` (default `human_only`) gates whether any mouse data
+is loaded at all — see `src/data/species_policy.py`. Mouse subject/animal
+IDs are namespaced (`mouse::<id>`) so they can never collide with a human
+subject_id. `data/assembly.py::merge_sources` refuses to concatenate sources
+spanning more than one species unless `experiment_mode` is explicitly
+`cross_species_pretraining` or `cross_species_domain_adaptation` — both
+exist only as safe hooks in this change (disabled by default); a real
+domain-adaptation training loop is not implemented.
+
+### Ortholog mapping
+
+`src/data/ortholog.py` resolves mouse→human gene pairs through an explicit,
+versioned `OrthologMappingArtifact` — ambiguous cases (one mouse gene with
+several human candidates, several mouse genes mapping to the same human
+gene) are dropped under the default `one_to_one_only` policy rather than
+resolved by picking the first match. The artifact can be cached to disk and
+reloaded (`artifact_path=`) so tests and CI never need a live BioMart query.
+
+### Split-before-preprocessing, train-only HVG/scaling
+
+Unchanged from the existing pipeline (already implemented before this
+change; see `src/preprocess.py::run_pipeline_split_aware` and
+`src/data/preprocessing.py`): the subject-level split is computed before
+`fit_preprocessing` ever runs, and gene selection/scaling are fit on the
+training partition's cells only. `tests/test_leakage_regression.py`
+consolidates the isolation regression tests for this and the additions
+above into one auditable file.
+
+### Batch correction
+
+`preprocessing.batch_correction.mode` is `none` by default (no Harmony run
+at all in the leakage-free path). `transductive_diagnostic_only` is the
+named opt-in for running Harmony across the full train+val+test dataset —
+this is explicitly disclosed as non-leakage-free and must not be used for
+frozen-test evaluation. `train_fitted_inductive` is accepted as a config
+value but currently always raises: Harmony has no train-only-fit /
+apply-to-new-data transform, so there is no inductive implementation behind
+that name yet.
+
+### Dataset manifest
+
+`configs/datasets.yaml` is the checked-in provenance seed (accession, URLs,
+species, identifier fields, documented limitations) for every dataset above.
+`src/data/manifest.py` builds the full manifest, computing real SHA-256
+checksums only for files actually present locally — an entry for a dataset
+with no local files yet still validates, with `files_present=false` and
+every checksum explicitly `null`, never a fabricated placeholder.
+
+### NLST smoking-history and cancer-outcome handling
+
+`data/nlst_smoking.py` parses NLST's `CIGSMOK`/`CIGAR` fields against only
+the codes this repository's own reviewed access instructions document
+(`CIGSMOK` 1=current/2=former smoker, `CIGAR` 1=yes) — any other value
+(missing, blank, null, an undocumented code such as `0`, or a malformed
+entry) stays an unknown smoking history rather than being coerced into
+cigarette, cigar, or "unexposed". `data/labellers.py::transfer_nlst_labels`
+uses this parser for every matched subject, so NLST participation alone is
+never treated as cigarette exposure — the subject's own CIGSMOK/CIGAR
+values have to actually parse to a documented code. `smoke_type_known`
+gates loss/class-weighting/sampling/stratification/metrics the same way it
+does everywhere else in this pipeline. `data/converters.py::
+convert_nlst_outcomes` similarly excludes a subject with a missing `candx`
+value from the outcomes CSV rather than writing `cancer_label=0` for them.
+
+The same missing-value-must-not-become-a-verified-label rule applies to
+GSE994/GSE123352 (`data/converters.py::_infer_smoke_column`) and GSE307690/
+CANUCK (`convert_canuck`): a sample whose GEO characteristics don't parse
+to a documented smoking-status pattern is written as
+`smoke_type_known=False`, never silently defaulted to the accession-level
+label declared in `configs/default.yaml`.
 
 ## Current results (real data)
 

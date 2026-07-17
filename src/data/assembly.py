@@ -10,10 +10,11 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 
-from constants import DOSE_UNKNOWN
+from constants import DOSE_UNKNOWN, SPECIES_HUMAN, DEFAULT_EXPERIMENT_MODE
 
 
-def merge_sources(*adatas: ad.AnnData, scale: bool = True) -> ad.AnnData:
+def merge_sources(*adatas: ad.AnnData, scale: bool = True,
+                   experiment_mode: str = DEFAULT_EXPERIMENT_MODE) -> ad.AnnData:
     """
     Concatenate heterogeneous sources on common gene intersection.
     Assigns batch column for downstream Harmony correction.
@@ -26,7 +27,24 @@ def merge_sources(*adatas: ad.AnnData, scale: bool = True) -> ad.AnnData:
     path (preprocess.py::run_pipeline_split_aware, data/preprocessing.py)
     calls merge_sources(*adatas, scale=False) and fits scaling on the
     train split only via PreprocessingArtifact.
+
+    Species safety (see data/species_policy.py): every source's
+    obs["species"] (defaulting to "human" for sources that predate this
+    field) is checked against `experiment_mode` before concatenating.
+    human_only (the default) refuses to merge anything but human cells;
+    mixing species requires experiment_mode='cross_species_pretraining' or
+    'cross_species_domain_adaptation'. This is the single enforcement point
+    for the rule that ortholog-mapped mouse expression must never be
+    silently treated as the same domain as measured human expression.
     """
+    from data.species_policy import assert_single_species_or_explicit
+
+    species_values = [
+        (a.obs["species"].iloc[0] if "species" in a.obs.columns and a.n_obs else SPECIES_HUMAN)
+        for a in adatas
+    ]
+    assert_single_species_or_explicit(species_values, experiment_mode)
+
     genes = adatas[0].var_names
     for a in adatas[1:]:
         genes = genes.intersection(a.var_names)
@@ -106,6 +124,11 @@ def assemble_subject_bags(
             "gene_matrix":        X[mask],
             "cell_type_ids":      adata.obs["cell_type_id"].values[mask].astype(int),
             "smoke_labels":       adata.obs["smoke_type"].values[mask].astype(int),
+            "smoke_known":        (
+                adata.obs["smoke_type_known"].values[mask].astype(bool)
+                if "smoke_type_known" in adata.obs.columns
+                else np.ones(mask.sum(), dtype=bool)  # legacy sources: treated as known, unchanged
+            ),
             "malig_labels":       adata.obs["malignancy"].values[mask].astype(np.float32),
             "malig_known":        (
                 adata.obs["malignancy_known"].values[mask].astype(bool)
@@ -135,6 +158,9 @@ def export_cell_dataset(
 
     X     = np.array(adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray(), dtype=np.float32)
     smoke = adata.obs["smoke_type"].values.astype(np.int64)
+    smoke_known = (adata.obs["smoke_type_known"].values.astype(bool)
+                   if "smoke_type_known" in adata.obs.columns
+                   else np.ones(X.shape[0], dtype=bool))  # legacy sources: treated as known, unchanged
     malig = adata.obs["malignancy"].values.astype(np.float32)
     malig_known = (adata.obs["malignancy_known"].values.astype(bool)
                    if "malignancy_known" in adata.obs.columns
@@ -146,6 +172,7 @@ def export_cell_dataset(
 
     np.save(out / "gene_matrix.npy",       X)
     np.save(out / "smoke_labels.npy",      smoke)
+    np.save(out / "smoke_labels_known.npy", smoke_known)
     np.save(out / "malignancy_labels.npy", malig)
     np.save(out / "malignancy_known.npy",  malig_known)
     np.save(out / "cell_type_ids.npy",     ctype)
@@ -157,11 +184,14 @@ def export_cell_dataset(
     n_malig_known_pos = int((malig_known & (malig == 1.0)).sum())
     n_malig_known_neg = int((malig_known & (malig == 0.0)).sum())
     n_malig_unknown   = int((~malig_known).sum())
+    n_smoke_known   = int(smoke_known.sum())
+    n_smoke_unknown = int((~smoke_known).sum())
     print(f"[assembly] export  {X.shape[0]:,} x {X.shape[1]} → {out}/")
-    print(f"           smoke   {dict((i, int((smoke==i).sum())) for i in range(6))}")
+    print(f"           smoke   known={n_smoke_known:,}  unknown={n_smoke_unknown:,}  "
+          f"{dict((i, int((smoke[smoke_known]==i).sum())) for i in range(6))}")
     print(f"           malig   known_positive={n_malig_known_pos:,}  "
           f"known_negative={n_malig_known_neg:,}  unknown={n_malig_unknown:,}")
     print(f"           dose    {n_known:,} cells with known exposure duration")
-    return {"gene_matrix": X, "smoke_labels": smoke,
+    return {"gene_matrix": X, "smoke_labels": smoke, "smoke_labels_known": smoke_known,
             "malignancy_labels": malig, "malignancy_known": malig_known,
             "cell_type_ids": ctype, "exposure_dose": dose}

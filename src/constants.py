@@ -54,3 +54,36 @@ N_HVGS_DEFAULT  = 2000
 # No wired source currently supplies a real per-cell exposure duration, so
 # every cell is stamped DOSE_UNKNOWN today — see model.py::DoseResponseHead.
 DOSE_UNKNOWN      = -1.0
+
+# ─── Species / cross-domain policy ─────────────────────────────────────────
+# Every loader stamps obs["species"] with one of these (data/loaders.py).
+# merge_sources() (data/assembly.py) refuses to silently concatenate cells
+# whose species differs unless the caller explicitly acknowledges it via
+# allow_mixed_species=True — see that function's docstring.
+SPECIES_HUMAN = "human"
+SPECIES_MOUSE = "mouse"
+VALID_SPECIES = frozenset({SPECIES_HUMAN, SPECIES_MOUSE})
+
+# Explicit experiment modes governing whether/how mouse (cross-species) data
+# may enter a run — see data/species_policy.py. Default is human_only:
+# mouse sources are never loaded at all unless a caller opts into one of the
+# other modes.
+EXPERIMENT_MODE_HUMAN_ONLY                  = "human_only"
+EXPERIMENT_MODE_MOUSE_ONLY                  = "mouse_only"
+EXPERIMENT_MODE_CROSS_SPECIES_PRETRAINING   = "cross_species_pretraining"
+EXPERIMENT_MODE_CROSS_SPECIES_DOMAIN_ADAPT  = "cross_species_domain_adaptation"
+VALID_EXPERIMENT_MODES = frozenset({
+    EXPERIMENT_MODE_HUMAN_ONLY,
+    EXPERIMENT_MODE_MOUSE_ONLY,
+    EXPERIMENT_MODE_CROSS_SPECIES_PRETRAINING,
+    EXPERIMENT_MODE_CROSS_SPECIES_DOMAIN_ADAPT,
+})
+DEFAULT_EXPERIMENT_MODE = EXPERIMENT_MODE_HUMAN_ONLY
+
+# ─── Assay mode (single-cell vs. TCGA-style bulk) ──────────────────────────
+# TCGA is primarily bulk expression; it must never be silently combined with
+# true single-cell sources into one training loader — see data/tcga_mode.py.
+ASSAY_MODE_SINGLE_CELL = "human_single_cell"
+ASSAY_MODE_BULK_TCGA   = "bulk_tcga"
+VALID_ASSAY_MODES = frozenset({ASSAY_MODE_SINGLE_CELL, ASSAY_MODE_BULK_TCGA})
+DEFAULT_ASSAY_MODE = ASSAY_MODE_SINGLE_CELL
