@@ -160,6 +160,67 @@ training partition's cells only. `tests/test_leakage_regression.py`
 consolidates the isolation regression tests for this and the additions
 above into one auditable file.
 
+### Preprocessing artifacts and reproducibility
+
+`fit_preprocessing`/`apply_preprocessing` (`src/data/preprocessing.py`)
+already separated fitting (train subjects only) from applying (val/test/
+inference, unchanged). On top of that, `PreprocessingArtifact` now carries:
+
+* **A scientific fingerprint** (`artifact.scientific_fingerprint()`): a
+  SHA-256 over the artifact's gene list, scaling statistics, HVG/label/
+  cell-type provenance, and gene-contract policy — deliberately excluding
+  `created_at` and free-text notes. Two artifacts fit from the same
+  training subjects, config, and code produce the same fingerprint
+  regardless of output directory or wall-clock time; changing any
+  scientifically meaningful input changes it.
+* **An explicit gene contract**: `missing_gene_policy` (`error` by
+  default), `duplicate_gene_policy` (`error`, unconditionally — no
+  aggregation policy is implemented), `unexpected_gene_policy` (`ignore`
+  by default — recorded in `apply_preprocessing`'s output
+  `uns["preprocessing_compatibility_diagnostics"]`, never fatal on its
+  own), and `minimum_gene_coverage` (`1.0` by default). These match
+  `configs/default.yaml`'s `preprocessing.*` keys
+  (`tests/test_preprocessing_artifact_contract.py::test_config_defaults_match_code_defaults`
+  fails the build if they drift). `zero_fill` for missing genes is
+  supported but never the default — it must be requested explicitly, is
+  recorded in the artifact and in the per-call diagnostics, and is never
+  presented as observed expression.
+* **A checkpoint-artifact binding**: `Trainer._save()` embeds the
+  fingerprint of whichever `PreprocessingArtifact` the run was actually
+  wired with (`Trainer.set_preprocessing_artifact`) into the checkpoint.
+  `Predictor.from_config()` recomputes the fingerprint of whatever
+  `preprocessing_artifact.json` sits next to that checkpoint and refuses to
+  pair them (`ArtifactCompatibilityError`) if they disagree — this closes
+  the gap where a stale or swapped artifact file could silently be treated
+  as compatible with an unrelated checkpoint.
+* **Safe, atomic serialization**: `PreprocessingArtifact.save()` writes
+  through the same temp-file-plus-`os.replace()` atomic path the rest of
+  this project's reporting/guard files use
+  (`src/benchmarks/atomic_io.py`), so a reader never observes a partially
+  written artifact. `.load()` rejects unparsable JSON, an unrecognized
+  schema version, and a payload that doesn't match the current
+  `PreprocessingArtifact` fields, all with a specific exception type
+  (`PreprocessingArtifactError`, `GeneContractError`,
+  `ArtifactCompatibilityError`, `LegacyArtifactError` — see
+  `src/data/preprocessing.py`) rather than an opaque failure.
+* **A read-only inspection report**: `artifact.inspect()` returns schema
+  version, fingerprint, selected gene count, gene-contract policy, cell-type
+  annotation provenance, and creation metadata as a plain dict — never the
+  raw scaling arrays or participant-level data — suitable for logging or
+  attaching to a run's report.
+
+This closes gaps that existed even though the underlying leakage-safe
+fit/apply split was already correct: previously, `missing_gene_policy` was
+declared in config but never actually read by `apply_preprocessing`, and a
+checkpoint recorded only a (never-populated) artifact *path*, not the
+artifact's actual fitted content — so a checkpoint could silently be paired
+with any file that happened to sit at that path. Per-fold artifacts
+(`src/benchmarks/fold_preprocessing.py`, already fit independently per
+fold before this change) and the frozen-test guard
+(`src/benchmarks/test_guard.py`, already a durable, atomically-acquired
+one-time lock) were audited and are unchanged — both already met the bar
+this section describes.
+
 ### Batch correction
 
 `preprocessing.batch_correction.mode` is `none` by default (no Harmony run

@@ -531,6 +531,17 @@ class Trainer:
         # Experiment metadata carried into every saved checkpoint (section 8/22).
         self.split_manifest_path:      Optional[str] = None
         self.preprocessing_artifact_path: Optional[str] = None
+        # The actual fitted PreprocessingArtifact this Trainer's data was
+        # transformed with, if known — set via set_preprocessing_artifact()
+        # (called automatically by from_experiment_context()). _save()
+        # embeds its scientific_fingerprint() in every checkpoint so a
+        # later loader (Predictor.from_config, evaluate.py) can reject a
+        # checkpoint paired with a DIFFERENT preprocessing artifact instead
+        # of silently trusting whatever preprocessing_artifact.json happens
+        # to sit next to the checkpoint file. None means "no artifact was
+        # wired in" (legacy/diagnostic/synthetic run) — checkpoints saved
+        # this way carry no fingerprint to check against.
+        self.preprocessing_artifact = None
         self.effective_label_mapping:  Optional[Dict] = None
         self.rare_class_policy:        Optional[str] = None
         self.transductive_batch_correction: bool = False
@@ -603,7 +614,31 @@ class Trainer:
         trainer.set_label_mapping(context.label_mapping)
         trainer.transductive_batch_correction = context.transductive_batch_correction
         trainer.rare_class_policy = context.label_mapping.policy
+        # getattr, not context.preprocessing_artifact directly: some
+        # lightweight/fake ExperimentContext test doubles (and any future
+        # minimal context) may not define this attribute at all — treated
+        # the same as "no artifact wired in" (None), matching Trainer's own
+        # default, rather than an AttributeError unrelated to preprocessing.
+        trainer.set_preprocessing_artifact(getattr(context, "preprocessing_artifact", None))
         return trainer
+
+    def set_preprocessing_artifact(self, artifact) -> None:
+        """Wire this Trainer's PreprocessingArtifact in so _save() can embed
+        its scientific_fingerprint() in every checkpoint — see the
+        docstring on self.preprocessing_artifact. Also cross-checks the
+        artifact's selected-gene count against self.model.input_dim
+        (when set), since a checkpoint whose model input width doesn't
+        match its own artifact's gene count is already unusable — better to
+        fail here than after training."""
+        if artifact is not None:
+            model_input_dim = getattr(self.model, "input_dim", None)
+            if model_input_dim is not None and model_input_dim != len(artifact.gene_list):
+                raise ValueError(
+                    f"Trainer.set_preprocessing_artifact: model.input_dim={model_input_dim} "
+                    f"does not match artifact.gene_list length={len(artifact.gene_list)} — "
+                    "this model cannot consume this artifact's output."
+                )
+        self.preprocessing_artifact = artifact
 
     def set_label_mapping(self, mapping: "EffectiveLabelMapping") -> None:
         """
@@ -704,6 +739,22 @@ class Trainer:
             "training_config":    self.cfg,
             "split_manifest_path": self.split_manifest_path,
             "preprocessing_artifact_path": self.preprocessing_artifact_path,
+            # Scientific fingerprint (data/preprocessing.py::
+            # PreprocessingArtifact.scientific_fingerprint) of the artifact
+            # this checkpoint's training data was actually transformed
+            # with, plus its selected-gene count — None when no artifact
+            # was wired in (see set_preprocessing_artifact). A loader
+            # (Predictor.from_config) that finds BOTH this fingerprint and
+            # a preprocessing_artifact.json on disk must verify they match
+            # before trusting the pair together.
+            "preprocessing_artifact_fingerprint": (
+                self.preprocessing_artifact.scientific_fingerprint()
+                if self.preprocessing_artifact is not None else None
+            ),
+            "preprocessing_artifact_gene_count": (
+                len(self.preprocessing_artifact.gene_list)
+                if self.preprocessing_artifact is not None else None
+            ),
             "effective_label_mapping": self.effective_label_mapping,
             "rare_class_policy":  self.rare_class_policy,
             "transductive_batch_correction": self.transductive_batch_correction,

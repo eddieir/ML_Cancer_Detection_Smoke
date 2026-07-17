@@ -184,9 +184,28 @@ class Predictor:
         artifact = None
         artifact_path = ckpt_dir / "preprocessing_artifact.json"
         if artifact_path.exists():
-            from data.preprocessing import PreprocessingArtifact
+            from data.preprocessing import ArtifactCompatibilityError, PreprocessingArtifact
             artifact = PreprocessingArtifact.load(artifact_path)
             print(f"[inference] loaded preprocessing artifact  ({artifact_path})")
+            ckpt_fp = ckpt_meta.get("preprocessing_artifact_fingerprint") if ckpt.exists() else None
+            if ckpt_fp is not None and ckpt_fp != artifact.scientific_fingerprint():
+                raise ArtifactCompatibilityError(
+                    f"Predictor.from_config: checkpoint {ckpt} was trained with a "
+                    f"preprocessing artifact fingerprint {ckpt_fp[:16]}... but the artifact "
+                    f"loaded from {artifact_path} has fingerprint "
+                    f"{artifact.scientific_fingerprint()[:16]}... — this checkpoint and this "
+                    "preprocessing_artifact.json do not come from the same fitted run. Using "
+                    "them together would silently transform inference input with the wrong "
+                    "gene selection/scaling. Restore the matching preprocessing_artifact.json "
+                    "for this checkpoint."
+                )
+            ckpt_gene_count = ckpt_meta.get("preprocessing_artifact_gene_count") if ckpt.exists() else None
+            if ckpt_gene_count is not None and ckpt_gene_count != len(artifact.gene_list):
+                raise ArtifactCompatibilityError(
+                    f"Predictor.from_config: checkpoint {ckpt} was trained with "
+                    f"{ckpt_gene_count} genes but the loaded artifact selects "
+                    f"{len(artifact.gene_list)} genes — refusing to pair them."
+                )
             if artifact.label_mapping and label_mapping is not None:
                 EffectiveLabelMapping.from_dict(artifact.label_mapping).validate_compatible(
                     label_mapping, self_name="preprocessing_artifact", other_name="checkpoint",

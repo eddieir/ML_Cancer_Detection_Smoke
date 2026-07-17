@@ -1280,3 +1280,63 @@ independently, so the report can't drift from what the pipeline itself
 recorded. It flags at minimum: zero subjects with a known cancer outcome,
 and classes that couldn't be stratified across splits. Persisted as JSON
 (full detail) plus a compact per-split CSV summary.
+
+### 14.9 Preprocessing artifact contract ("Phase 4")
+
+The fit/apply boundary itself (§14.3) was already correct: `fit_preprocessing`
+only ever sees training-subject cells, and `apply_preprocessing` only ever
+subsets/reorders/scales using parameters already fixed at fit time. What
+this section adds is a stricter, checkable contract around that boundary.
+
+**Fingerprint hierarchy.** `PreprocessingArtifact.scientific_fingerprint()`
+hashes a fixed, explicit field list (`_FINGERPRINT_FIELDS` in
+`data/preprocessing.py`): gene list/order, scaling statistics, HVG count,
+forced-marker list, fit cell/subject counts, label-mapping, cell-type
+annotation provenance, and gene-contract policy. `created_at` and free-text
+`notes` are excluded — they're informational, not scientific state. This is
+a single flat fingerprint over the artifact itself, not a tree of
+sub-fingerprints; `fold_preprocessing.py::artifact_fingerprint` (already
+present) computes a related but distinct identity used specifically for
+per-fold/OOF bookkeeping and is unchanged by this section.
+
+**Checkpoint/artifact binding.** `Trainer._save()` embeds
+`preprocessing_artifact_fingerprint` (and the artifact's gene count) in
+every checkpoint, sourced from whichever artifact `Trainer.
+set_preprocessing_artifact()` was given (`Trainer.from_experiment_context`
+wires this automatically from `ExperimentContext.preprocessing_artifact`).
+`Predictor.from_config()` recomputes the fingerprint of the
+`preprocessing_artifact.json` it finds next to the checkpoint and raises
+`ArtifactCompatibilityError` if the two disagree, or if the artifact's gene
+count doesn't match what the checkpoint was trained with. A checkpoint
+saved without a wired-in artifact (legacy runs, or a Trainer that never
+called `set_preprocessing_artifact`) records `None` and is treated by
+`Predictor.from_config` exactly as before this change: it proceeds only
+under the existing `unsafe_legacy_mode` opt-in.
+
+**Gene contract.** `verify_compatible()` now performs four checks, each
+independently configurable on the artifact and defaulting to the
+conservative option: duplicate identifiers in the input (always fatal —
+no aggregation policy exists), missing required genes
+(`missing_gene_policy`, default `error`; `zero_fill` is available only as
+an explicit, recorded, non-default opt-in applied inside
+`apply_preprocessing`, never silently), genes present but outside the
+artifact's selected panel (`unexpected_gene_policy`, default `ignore` —
+recorded in `uns["preprocessing_compatibility_diagnostics"]`, never fatal
+by itself), and overall coverage against `minimum_gene_coverage` (default
+`1.0`). `configs/default.yaml`'s `preprocessing.*` keys mirror these
+defaults exactly, checked by a dedicated consistency test.
+
+**Serialization.** `PreprocessingArtifact.save()`/`.load()` route through
+`benchmarks/atomic_io.py`'s existing temp-file-plus-`os.replace()` atomic
+write path (the same primitive `test_guard.py` and `reporting.py` already
+use) and raise typed errors (`PreprocessingArtifactError`,
+`GeneContractError`, `ArtifactCompatibilityError`, `LegacyArtifactError`)
+on corruption, an unrecognized schema version, or a field-set mismatch,
+rather than a generic exception or a silent partial load.
+
+**Scope note.** This section hardens the artifact's own identity,
+contract, and its binding to a checkpoint. It does not introduce a new
+artifact directory layout, a new inductive batch-correction method, or new
+sentinel objects around the frozen-test guard beyond what `test_guard.py`
+already enforced before this change (§14.7) — those remain areas for
+future work, not claims made by this section.
