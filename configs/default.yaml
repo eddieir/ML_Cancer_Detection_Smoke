@@ -80,3 +80,70 @@ train:
   patience: 5
   grad_clip: 1.0
   checkpoint_dir: checkpoints
+
+  # Phase 2 — subject-aware class-imbalance correction (src/data/sampling.py,
+  # model.py's FocalLoss). Every key below is optional; omitting this whole
+  # section (or any individual key) resolves to the explicit backward-
+  # compatible defaults in data/sampling.py::DEFAULT_SMOKE_IMBALANCE_CONFIG,
+  # which reproduce pre-Phase-2 behaviour exactly (DataLoader(shuffle=True),
+  # auto train-only inverse-frequency class weights, plain cross-entropy).
+  smoke_imbalance:
+    # "shuffle" (pre-Phase-2 default) | "subject_balanced" (class -> subject
+    # -> cell sampling — a subject's cell count never affects its own
+    # selection probability; see data/sampling.py's module docstring).
+    # Stays "shuffle" here deliberately: no real (non-synthetic) held-out
+    # comparison has established that subject_balanced (or any other
+    # strategy) outperforms this default — see benchmarks/imbalance_ablation.py,
+    # which exists to produce that development-only evidence but has not
+    # yet been run against real data. Switching this default requires real
+    # development-only evidence, never a frozen-test result and never the
+    # mere existence of the subject_balanced sampler. subject_balanced is a
+    # supported, tested, but experimental/opt-in configuration until then.
+    sampler: shuffle
+    # Only used when sampler=subject_balanced.
+    # "uniform" (equal probability per observed effective class, default),
+    # "natural" (proportional to unique-subject count per class), or
+    # "inverse_subject_frequency" (proportional to 1 / unique-subject count).
+    class_selection: uniform
+    # Only "uniform" is currently implemented: within a selected class,
+    # every unique subject has equal selection probability regardless of
+    # its cell count.
+    subject_selection: uniform
+    # Exactly one of these may be set (both null uses one batch per
+    # ceil(n_train_cells / batch_size), matching a normal epoch's length).
+    batches_per_epoch: null
+    samples_per_epoch: null
+    # Maximum cells drawn from any one subject within a single batch. Null
+    # (the backward-compatible default — must match
+    # data/sampling.py::DEFAULT_SMOKE_IMBALANCE_CONFIG exactly) means
+    # unbounded: a very-high-cell-count subject can still fill a batch,
+    # subject only to the subject-selection draw itself. A concrete cap
+    # (e.g. 8, as used by benchmarks/imbalance_ablation.py's
+    # subject_balanced_* strategies) is a hard per-batch ceiling once set —
+    # see data/sampling.py's SubjectBalancedBatchSampler docstring.
+    cells_per_subject_per_batch: null
+    # Whether a cell may be drawn more than once from the same subject
+    # within one batch. replacement=false requires cells_per_subject_per_batch
+    # to be set and requires every subject to have at least that many cells.
+    replacement: true
+    # "none" | "inverse_frequency" (pre-Phase-2 default — train-only
+    # inverse-frequency CrossEntropyLoss weights, computed per
+    # CellLevelDataset.smoke_class_weights).
+    class_weighting: inverse_frequency
+    # "cross_entropy" (default) | "focal" (model.py's FocalLoss — a
+    # configurable ablation, not an unconditional replacement).
+    loss: cross_entropy
+    # Only used when loss=focal. Must be >= 0; gamma=0 is equivalent to
+    # plain (optionally class-weighted) cross-entropy.
+    focal_gamma: 2.0
+    # Only used when loss=focal. "class_weights" applies class_weighting's
+    # resolved weights as focal's alpha term (default). "none" runs focal
+    # loss unweighted — use this to avoid double-correcting when
+    # class_weighting=inverse_frequency AND sampler=subject_balanced are
+    # both active (see README.md's imbalance-ablation section).
+    focal_alpha_mode: class_weights
+    # Added to the Trainer's seed when constructing the subject-balanced
+    # sampler's RNG, so a multi-seed benchmark loop (same base seed,
+    # different imbalance ablations) draws independent sampling sequences
+    # instead of accidentally sharing one.
+    seed_offset: 0

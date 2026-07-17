@@ -613,11 +613,11 @@ Not yet done, tracked in README's "What this pass does not include": the
 full raw-count preprocessing chain reproduced inside `predict_h5ad` (species/
 gene-ID/normalization steps — `input_stage="raw_counts"` is explicitly
 rejected rather than silently mishandled, but not implemented); checkpoint
-checksum verification and optimizer/scheduler resume; subject-aware sampling
-wired into `train.py`'s own curriculum (it exists for benchmark baselines,
-§12); bulk/single-cell/MIL mode separation; species/ortholog-mapping safety
-beyond the config-driven check in §12's leave-one-source-out; dose-head
-supervision gating.
+checksum verification and optimizer/scheduler resume; bulk/single-cell/MIL
+mode separation; species/ortholog-mapping safety beyond the config-driven
+check in §12's leave-one-source-out; dose-head supervision gating.
+Subject-aware class -> subject -> cell sampling wired into `train.py`'s own
+curriculum (`data/sampling.py`) is now implemented — see §13.
 
 The `ExperimentContext`/`Trainer.from_experiment_context()` auto-wiring,
 baseline/grouped-CV/MIL-comparison experiment runners, and
@@ -975,3 +975,135 @@ Benchmarking framework section for the full list):
 
 Full list of what's fixed vs. still open: README's Benchmarking framework
 section.
+
+## 13. Subject-Aware Class-Imbalance Correction ("Phase 2")
+
+Referred to as "Phase 2" in README/PR history — distinct from §5's
+per-run training-curriculum "Phase 1/2/3" (cell-level pretraining /
+aggregator training / end-to-end fine-tuning), which is unchanged by this
+work. Full rationale, configuration reference, and ablation protocol: see
+README's "Phase 2 — subject-aware class-imbalance correction" section.
+Architectural summary:
+
+- **`data/sampling.py`** is a new, standalone module: `SubjectClassIndex`
+  (validated class -> subject -> cell-index mapping, built once from a
+  training `CellLevelDataset`'s `subject_ids`/`smoke` arrays) and
+  `SubjectBalancedBatchSampler` (a `torch.utils.data.Sampler` yielding
+  batches of dataset indices by drawing class, then subject within that
+  class, then cell within that subject, on every single index — never a
+  per-cell inverse-frequency weight applied directly, which does not
+  prevent a cell-heavy subject from dominating a class). Consumed via
+  `DataLoader(dataset, batch_sampler=...)`, never combined with
+  `shuffle=True`.
+  - `cells_per_subject_cap` is a **hard per-batch maximum**, not a required
+    minimum — a subject with fewer cells than the cap is still a valid
+    participant. Each subject's *effective* capacity, computed once at
+    construction (`_effective_capacity`), is `cap` when `replacement=True`
+    (redraws allowed) or `min(cap, that subject's own unique cell count)`
+    when `replacement=False` (cannot yield more distinct cells than it
+    has). Per-batch remaining-capacity bookkeeping
+    (`class_remaining_subjects`) is tracked against this effective value:
+    once every subject of a class is at ITS effective capacity within the
+    batch being built, that class is excluded from the remaining draws
+    (probability renormalized over the classes still eligible) — there is
+    no fallback to an already-exhausted subject. Feasibility is judged
+    against the sum of effective capacities across all subjects (not
+    `cap * n_unique_subjects`) versus the largest batch the sampler will
+    ever need to produce; this is checked once at construction, and an
+    infeasible configuration raises `SamplingImpossibleError` immediately,
+    not mid-iteration. Without-replacement uniqueness is scoped to one
+    batch — the same physical cell may reappear in a later batch — and
+    capacity always resets fully between batches.
+  - `samples_per_epoch` is resolved into an exact, explicit list of
+    per-batch sizes (`_batch_sizes`) at construction — full `batch_size`
+    batches followed by exactly one partial batch of the exact remainder —
+    rather than a batch count derived by ceiling division and then filled
+    with full-size batches (which would silently over-sample). `__len__`
+    returns `len(_batch_sizes)`.
+  - After a batch_sampler-driven `DataLoader` completes one full epoch,
+    `last_realized_diagnostics` is populated with per-batch realized
+    provenance: `realized_total_samples`, `realized_batch_sizes`,
+    `realized_cells_per_subject`, `realized_subject_counts_per_batch`,
+    `realized_max_subject_cells_per_batch`, and
+    `realized_repeated_cell_draws_per_batch`/`_total` — computed
+    incrementally during `__iter__` and committed to
+    `last_realized_diagnostics` only after every batch has yielded, so an
+    interrupted or failed epoch leaves the prior value (or `None`)
+    unchanged rather than exposing a mislabeled partial result. `epoch_index`
+    and `complete` identify which epoch a realized block describes.
+- **`Trainer._train_cell_loader()`** (`train.py`) is the single place every
+  training cell `DataLoader` is now built (`phase1`, `phase1_final_fit`,
+  `phase3`'s cell-level component) — it reads
+  `self.smoke_imbalance_config["sampler"]` (`"shuffle"` |
+  `"subject_balanced"`) and dispatches accordingly. Validation/test
+  `DataLoader`s are built inline elsewhere with `shuffle=False`, exactly as
+  before, and never call this method.
+- **`Trainer._smoke_loss_weights_and_type()`** resolves
+  (reported class weights, loss alpha, loss type, focal gamma) from
+  `self.smoke_imbalance_config` — `class_weighting` (`"none"` |
+  `"inverse_frequency"`) controls whether weights are computed at all
+  (train-partition-only, via the pre-existing
+  `CellLevelDataset.smoke_class_weights`, unchanged); `loss` (`"cross_entropy"`
+  | `"focal"`) selects `model.py`'s new `FocalLoss` vs. the existing
+  `nn.CrossEntropyLoss`; `focal_alpha_mode` (`"class_weights"` | `"none"`)
+  is the explicit double-correction guard for when both subject-balanced
+  sampling AND inverse-frequency weighting are active simultaneously.
+- **`model.py`'s `FocalLoss`** — standard per-example
+  `(1-pt)**gamma * CE` formulation with `pt` derived from **unweighted**
+  cross-entropy; class alpha (if given) is applied exactly once, multiplied
+  onto the already gamma-modulated per-example loss, never folded into the
+  cross-entropy term `pt` is computed from (which would let alpha distort
+  the focal modulation itself, not just the final scale). `gamma=0` without
+  alpha is mathematically identical to plain unweighted `CrossEntropyLoss`
+  under the same reduction; `reduction="mean"` is a plain arithmetic mean
+  (not `CrossEntropyLoss(weight=...)`'s weight-normalized mean) — a
+  deliberate, documented, tested choice. Constructor/forward validate
+  `gamma >= 0`, `class_weight` shape/finiteness/non-negativity, class-count
+  match, and target validity. `MultiTaskLoss` gained `loss_type`/
+  `focal_gamma` constructor parameters; the malignancy/cancer/
+  dose-response loss terms are untouched.
+- **`data/sampling.py::resolve_smoke_imbalance_config`** merges a
+  (possibly absent) `train.smoke_imbalance` config block with an explicit
+  default dict that reproduces exact pre-Phase-2 behavior
+  (`sampler: shuffle`, `class_weighting: inverse_frequency`,
+  `loss: cross_entropy`) — absent configuration changes nothing for
+  existing configs/checkpoints. Every value is validated at resolution
+  time (`SamplingConfigurationError` on anything invalid), never silently
+  coerced.
+- **Provenance**: `train.smoke_imbalance` lives inside
+  `ExperimentContext.config`, so §12's `config_fingerprint`/
+  `guard_identity_fingerprint` already change with it — no separate
+  fingerprint plumbing was needed. `Trainer._save()` persists the resolved
+  `smoke_imbalance_config` and (when the subject-balanced sampler ran) its
+  realized per-epoch `SamplingDiagnostics` in every checkpoint;
+  `NeuralSmokeAdapter`/`NeuralCancerAdapter.metadata()` expose the same
+  fields for benchmark reports.
+- **`benchmarks/imbalance_ablation.py::run_smoke_imbalance_ablation`** — a
+  focused, standalone experiment function (not folded into §12's nested-
+  hyperparameter-search machinery, since imbalance strategy is a
+  qualitatively different axis than a hyperparameter grid) comparing five
+  named strategies over identical outer folds/seeds/preprocessing/
+  architecture, development data (context's train+val pool) only.
+  - Only `cap_cell_dataset` on the fold's TRAINING split; every strategy in
+    a fold shares the fold's exact, uncapped, natural validation set —
+    each fold record carries a `validation_fingerprint` proving this.
+  - Primary metrics (`subject_level`, via `metrics.py::
+    subject_weighted_full_smoke_metrics_report`) are majority-voted to one
+    prediction per subject before computing macro-F1/balanced accuracy/
+    per-class precision-recall-F1-support/confusion matrix; the equivalent
+    cell-level numbers are kept only under `cell_level_diagnostic`.
+  - `comparisons` reuses `reporting.py::compare_models`/
+    `summarize_comparison` (§12's own statistical-comparison machinery) to
+    report win/tie/loss counts, mean/median paired differences, and a
+    seed-level bootstrap CI when >=2 seeds ran, with `summary.
+    meaningfully_better` staying `False` whenever the evidence doesn't
+    support a confident selection.
+  - `write_imbalance_ablation_artifact`/`read_imbalance_ablation_artifact`
+    persist/reload the report as a schema-versioned JSON (+ CSV) artifact
+    under `<run_dir>/metrics/`, using the same `atomic_io.py` writes and
+    `_environment_snapshot` every other benchmark artifact uses. Wired into
+    `benchmarks/runner.py`'s CLI via `--imbalance-ablation` (smoke task only).
+  - The default `configs/default.yaml` `sampler: shuffle` is unchanged by
+    this module's existence — no real (non-synthetic) ablation evidence has
+    yet been produced, so the pre-Phase-2 default remains authoritative
+    until such evidence exists.
