@@ -159,3 +159,19 @@ def test_preprocess_load_all_sources_never_loads_mouse_under_default_mode(tmp_pa
         # no human sources configured either -> "no data sources found",
         # proving the mouse source was skipped rather than silently loaded
         _load_all_sources(cfg)
+
+
+# ─── configs/default.yaml agrees with the documented human_only default ────
+
+def test_default_config_experiment_mode_is_human_only():
+    """A regression guard against config drift: if someone accidentally
+    flips configs/default.yaml's data.experiment_mode away from
+    human_only, GSE288003 (mouse) would silently re-enter every default
+    run. This test fails loudly the moment that default changes, rather
+    than relying on a human reviewer to notice a one-line YAML edit."""
+    import yaml
+
+    repo_root = Path(__file__).parents[1]
+    with open(repo_root / "configs" / "default.yaml") as f:
+        cfg = yaml.safe_load(f)
+    assert cfg["data"]["experiment_mode"] == EXPERIMENT_MODE_HUMAN_ONLY

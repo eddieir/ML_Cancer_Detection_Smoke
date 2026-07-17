@@ -268,3 +268,19 @@ def test_evaluate_known_smoke_metrics_excludes_unknown_cells():
     assert metrics["n_known"] == 2
     assert metrics["n_unknown"] == 2
     assert metrics["accuracy"] == 1.0  # only the two KNOWN, correct cells count
+
+
+# ─── configs/default.yaml agrees with the documented opt-in-only default ───
+
+def test_default_config_weak_labels_disabled_by_default():
+    """A regression guard against config drift: if someone accidentally
+    flips configs/default.yaml's data.weak_labels.enabled to true,
+    GSE136831's COPD proxy would silently start feeding smoke-
+    classification supervision on every default run. This test fails
+    loudly the moment that default changes."""
+    import yaml
+
+    repo_root = Path(__file__).parents[1]
+    with open(repo_root / "configs" / "default.yaml") as f:
+        cfg = yaml.safe_load(f)
+    assert cfg["data"]["weak_labels"]["enabled"] is False
