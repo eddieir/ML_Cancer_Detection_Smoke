@@ -124,6 +124,11 @@ def assemble_subject_bags(
             "gene_matrix":        X[mask],
             "cell_type_ids":      adata.obs["cell_type_id"].values[mask].astype(int),
             "smoke_labels":       adata.obs["smoke_type"].values[mask].astype(int),
+            "smoke_known":        (
+                adata.obs["smoke_type_known"].values[mask].astype(bool)
+                if "smoke_type_known" in adata.obs.columns
+                else np.ones(mask.sum(), dtype=bool)  # legacy sources: treated as known, unchanged
+            ),
             "malig_labels":       adata.obs["malignancy"].values[mask].astype(np.float32),
             "malig_known":        (
                 adata.obs["malignancy_known"].values[mask].astype(bool)
@@ -153,6 +158,9 @@ def export_cell_dataset(
 
     X     = np.array(adata.X if not hasattr(adata.X, "toarray") else adata.X.toarray(), dtype=np.float32)
     smoke = adata.obs["smoke_type"].values.astype(np.int64)
+    smoke_known = (adata.obs["smoke_type_known"].values.astype(bool)
+                   if "smoke_type_known" in adata.obs.columns
+                   else np.ones(X.shape[0], dtype=bool))  # legacy sources: treated as known, unchanged
     malig = adata.obs["malignancy"].values.astype(np.float32)
     malig_known = (adata.obs["malignancy_known"].values.astype(bool)
                    if "malignancy_known" in adata.obs.columns
@@ -164,6 +172,7 @@ def export_cell_dataset(
 
     np.save(out / "gene_matrix.npy",       X)
     np.save(out / "smoke_labels.npy",      smoke)
+    np.save(out / "smoke_labels_known.npy", smoke_known)
     np.save(out / "malignancy_labels.npy", malig)
     np.save(out / "malignancy_known.npy",  malig_known)
     np.save(out / "cell_type_ids.npy",     ctype)
@@ -175,11 +184,14 @@ def export_cell_dataset(
     n_malig_known_pos = int((malig_known & (malig == 1.0)).sum())
     n_malig_known_neg = int((malig_known & (malig == 0.0)).sum())
     n_malig_unknown   = int((~malig_known).sum())
+    n_smoke_known   = int(smoke_known.sum())
+    n_smoke_unknown = int((~smoke_known).sum())
     print(f"[assembly] export  {X.shape[0]:,} x {X.shape[1]} → {out}/")
-    print(f"           smoke   {dict((i, int((smoke==i).sum())) for i in range(6))}")
+    print(f"           smoke   known={n_smoke_known:,}  unknown={n_smoke_unknown:,}  "
+          f"{dict((i, int((smoke[smoke_known]==i).sum())) for i in range(6))}")
     print(f"           malig   known_positive={n_malig_known_pos:,}  "
           f"known_negative={n_malig_known_neg:,}  unknown={n_malig_unknown:,}")
     print(f"           dose    {n_known:,} cells with known exposure duration")
-    return {"gene_matrix": X, "smoke_labels": smoke,
+    return {"gene_matrix": X, "smoke_labels": smoke, "smoke_labels_known": smoke_known,
             "malignancy_labels": malig, "malignancy_known": malig_known,
             "cell_type_ids": ctype, "exposure_dose": dose}

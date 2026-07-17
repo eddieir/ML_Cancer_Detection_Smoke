@@ -98,6 +98,10 @@ def build_label_quality_report(
             "cancer_outcome_unknown": prov.get("cancer_outcome_unknown_subjects") if split_name == "all" else None,
             "malignancy_known_cells": prov.get("malignancy_known_cells") if split_name == "all" else None,
             "malignancy_unknown_cells": prov.get("malignancy_unknown_cells") if split_name == "all" else None,
+            "smoke_verified_known_cells": prov.get("smoke_verified_known_cells") if split_name == "all" else None,
+            "smoke_weak_proxy_cells": prov.get("smoke_weak_proxy_cells") if split_name == "all" else None,
+            "smoke_unknown_cells": prov.get("smoke_unknown_cells") if split_name == "all" else None,
+            "weak_labels_enabled": prov.get("weak_labels_enabled") if split_name == "all" else None,
         }
     per_split["all"] = {
         "n_subjects": sum(s.get("n_subjects", 0) for s in split_report.values()),
@@ -106,6 +110,10 @@ def build_label_quality_report(
         "cancer_outcome_unknown": prov.get("cancer_outcome_unknown_subjects"),
         "malignancy_known_cells": prov.get("malignancy_known_cells"),
         "malignancy_unknown_cells": prov.get("malignancy_unknown_cells"),
+        "smoke_verified_known_cells": prov.get("smoke_verified_known_cells"),
+        "smoke_weak_proxy_cells": prov.get("smoke_weak_proxy_cells"),
+        "smoke_unknown_cells": prov.get("smoke_unknown_cells"),
+        "weak_labels_enabled": prov.get("weak_labels_enabled"),
     }
 
     flags: List[str] = []
@@ -120,6 +128,14 @@ def build_label_quality_report(
         flags.append(
             f"unstratified_classes: {manifest.report['unstratified_classes']} could not be "
             "stratified across splits (too few independent subjects)."
+        )
+    n_weak_proxy = prov.get("smoke_weak_proxy_cells") or 0
+    if n_weak_proxy and not prov.get("weak_labels_enabled"):
+        flags.append(
+            f"weak_smoke_proxy_present_but_disabled: {n_weak_proxy} cell(s) carry a "
+            "documented weak smoke-type proxy (e.g. GSE136831's COPD-diagnosis proxy) that "
+            "is excluded from smoke supervision under the default verified_only policy — "
+            "set data.weak_labels.enabled=true to opt in."
         )
 
     return LabelQualityReport(

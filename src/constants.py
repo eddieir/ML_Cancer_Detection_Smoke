@@ -83,7 +83,7 @@ DEFAULT_EXPERIMENT_MODE = EXPERIMENT_MODE_HUMAN_ONLY
 # ─── Assay mode (single-cell vs. TCGA-style bulk) ──────────────────────────
 # TCGA is primarily bulk expression; it must never be silently combined with
 # true single-cell sources into one training loader — see data/tcga_mode.py.
-ASSAY_MODE_SINGLE_CELL = "single_cell"
+ASSAY_MODE_SINGLE_CELL = "human_single_cell"
 ASSAY_MODE_BULK_TCGA   = "bulk_tcga"
 VALID_ASSAY_MODES = frozenset({ASSAY_MODE_SINGLE_CELL, ASSAY_MODE_BULK_TCGA})
 DEFAULT_ASSAY_MODE = ASSAY_MODE_SINGLE_CELL

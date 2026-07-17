@@ -211,11 +211,11 @@ def test_9_mouse_expression_cannot_influence_human_only_fit():
 def test_10_pseudo_bulk_rows_rejected_from_single_cell_only_assay_mode():
     is_pseudo_bulk = [False, False, True, False]  # one TCGA-style bulk row
     with pytest.raises(AssayModeError):
-        assert_no_pseudo_bulk_rows(is_pseudo_bulk, assay_mode="single_cell")
+        assert_no_pseudo_bulk_rows(is_pseudo_bulk, assay_mode="human_single_cell")
 
 
 def test_10_pure_single_cell_rows_pass_single_cell_only_assay_mode():
-    assert_no_pseudo_bulk_rows([False, False, False], assay_mode="single_cell")  # must not raise
+    assert_no_pseudo_bulk_rows([False, False, False], assay_mode="human_single_cell")  # must not raise
 
 
 # 11. Controlled-access safety (NLST) — see tests/test_nlst_adapter.py for

@@ -1138,13 +1138,28 @@ experiment "is."
 `src/data/label_state.py` defines five states — `known_positive`,
 `known_negative`, `unknown`, `not_applicable`, `excluded_by_policy` — and a
 `LabelProvenance` record (status/source/method/confidence/limitation) for
-any label-producing code to attach to a value. It is deliberately additive:
-the existing `malignancy_known`/`cancer_label_known` boolean gates already
-wired through `data/assembly.py`, `data/labellers.py`, and `model.py`'s
-`MultiTaskLoss` remain the actual enforcement points for those two labels.
-`smoke_type` does not yet have an equivalent per-cell known/unknown gate —
-see §14.4 below and README.md's COPD-proxy note for the specific,
-disclosed gap this leaves in GSE136831's default smoke-type label.
+any label-producing code to attach to a value. `malignancy_known`/
+`cancer_label_known` (`data/assembly.py`, `data/labellers.py`, `model.py`'s
+`MultiTaskLoss`) were the first two enforcement points; `smoke_type_known`
+is the same pattern applied to the smoke label, gating:
+
+- `train.CellLevelDataset.smoke_class_weights` (class-weight computation)
+- `data.sampling.SubjectClassIndex` (subject-balanced sampling's class
+  index — a cell with `smoke_known=False` keeps its true position but is
+  never added to any subject's sampleable index)
+- `model.MultiTaskLoss._ls` (the smoke-classification loss term)
+- `evaluate.Evaluator._known_smoke_metrics` (accuracy/F1/confusion matrix)
+- `preprocess.py::run_pipeline_split_aware`'s subject-level stratification
+  (a subject with no known smoke label is stratified as `None` — pooled,
+  unstratified placement — not counted toward any class's proportion)
+
+`data/converters.py::_load_gse136831_cell_metadata` is the first real
+producer of `smoke_type_known=False` rows: GSE136831 has no verified
+per-subject smoking record, so every cell defaults to unknown, and
+`weak_smoke_proxy_*` fields carry COPD status as a separate, clearly
+labeled proxy. `data/labellers.py::apply_weak_smoke_proxies` is the only
+path that ever promotes a weak proxy into the primary smoke label, gated
+by `data.weak_labels.enabled` (default `false`).
 
 ### 14.3 Subject-split boundary and fit/transform preprocessing interface
 
@@ -1184,16 +1199,36 @@ Both remain disabled by default.
 
 ### 14.5 Bulk/single-cell boundary
 
-`src/constants.py` defines `single_cell`/`bulk_tcga` assay modes;
-`src/data/assay_mode.py::assert_no_pseudo_bulk_rows` /
-`assert_no_single_cell_rows` are guards a single-cell-only or bulk-only code
-path can call. **This is not yet wired into the existing default
-pipeline**: `configs/default.yaml`'s `microarray_sources` already includes
-TCGA-LUAD/TCGA-LUSC pseudo-bulk samples merged into the same AnnData used
-to build `CellLevelDataset`, a pre-existing design choice this change does
-not retroactively undo (see README.md's bulk/single-cell note for the
-reasoning). The guard exists for new code paths and as a named target for
-retrofitting the default pipeline as follow-up work.
+`src/constants.py` defines `human_single_cell`/`bulk_tcga` assay modes.
+Every loader stamps `obs["assay_mode"]`, defaulting to `human_single_cell`;
+`data/converters.py::convert_tcga` is the only producer of
+`assay_mode="bulk_tcga"` (written into its `samples_meta.csv` output,
+picked up by `data/loaders.py::load_microarray`). Enforcement:
+
+- `configs/default.yaml`'s `microarray_sources` no longer lists TCGA-LUAD/
+  TCGA-LUSC — they moved to `data.tcga.bulk_sources`, a separate config key
+  the default single-cell loading path never reads.
+- `preprocess.py::_load_all_sources` additionally checks every loaded
+  source's `assay_mode` column directly and raises `AssayModeError`
+  (`data/assay_mode.py`) if any `bulk_tcga` row is present — a defensive
+  check against a config that still manually lists a bulk source under
+  `scrna_sources`/`microarray_sources`, not just reliance on the config
+  default being correct.
+- `preprocess.py::load_tcga_bulk_dataset` is the only sanctioned way to
+  load TCGA's bulk matrices: it requires `data.tcga.enabled=true`,
+  validates every loaded source actually carries `assay_mode="bulk_tcga"`,
+  and raises `BulkTrainingNotImplementedError` if asked for a trainable
+  dataset (`require_trainable=True`) — this project has no bulk RNA-seq
+  model or training loop, and that gap is a raised error, not a silent
+  fallback onto the single-cell model.
+- TCGA's `sample_type`-derived malignancy (tumor vs. solid-tissue-normal)
+  is written only into this bulk path's `samples_meta.csv`; it is never
+  reachable from a single-cell `CellLevelDataset`/MIL bag because the
+  bulk CSV itself never enters `_load_all_sources`.
+
+`data/assay_mode.py::assert_no_pseudo_bulk_rows`/`assert_no_single_cell_rows`
+remain available as generic guards for any additional single-cell-only or
+bulk-only code path that needs the same check.
 
 ### 14.6 Controlled-access boundary (NLST)
 

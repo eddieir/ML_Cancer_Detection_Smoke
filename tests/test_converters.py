@@ -372,6 +372,29 @@ def test_convert_nlst_outcomes(tmp_paths):
     assert out.set_index("subject_id")["cancer_label"].to_dict() == {"p1": 1, "p2": 0, "p3": 1}
 
 
+def test_convert_nlst_outcomes_drops_missing_candx_instead_of_defaulting_to_zero(tmp_paths):
+    """A subject with no candx value recorded must be EXCLUDED from the
+    outcomes CSV (unknown outcome), never written as cancer_label=0."""
+    tmp, converted = tmp_paths
+    prsn = tmp / "prsn.csv"
+    pd.DataFrame({"pid": ["p1", "p2", "p3"], "candx": [1, None, 0]}).to_csv(prsn, index=False)
+
+    out_path = converters.convert_nlst_outcomes(prsn)
+    out = pd.read_csv(out_path)
+    assert set(out["subject_id"].astype(str)) == {"p1", "p3"}
+    assert out.set_index("subject_id")["cancer_label"].to_dict() == {"p1": 1, "p3": 0}
+
+
+def test_convert_nlst_outcomes_missing_candx_column_writes_empty_not_all_negative(tmp_paths):
+    tmp, converted = tmp_paths
+    prsn = tmp / "prsn.csv"
+    pd.DataFrame({"pid": ["p1", "p2"]}).to_csv(prsn, index=False)
+
+    out_path = converters.convert_nlst_outcomes(prsn)
+    out = pd.read_csv(out_path)
+    assert len(out) == 0
+
+
 def test_convert_tcga_splits_tumor_and_normal(tmp_paths):
     tmp, converted = tmp_paths
     src = tmp / "TCGA-LUAD"

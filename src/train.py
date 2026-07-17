@@ -42,6 +42,7 @@ class CellLevelDataset(Dataset):
         cell_type_ids:     np.ndarray,              # [N]         int64
         exposure_dose:     Optional[np.ndarray] = None,  # [N]  float32, DOSE_UNKNOWN if absent
         malignancy_known:  Optional[np.ndarray] = None,  # [N]  bool, False if absent (see labellers.py)
+        smoke_known:       Optional[np.ndarray] = None,  # [N]  bool, True if absent (legacy sources — see labellers.py)
         subject_ids:       Optional[np.ndarray] = None,  # [N]  str — required unless diagnostic_mode
         split_name:        Optional[str] = None,          # "train" | "val" | "test" | None
         dataset_source:    Optional[np.ndarray] = None,  # [N]  str, e.g. GEO accession per cell
@@ -55,6 +56,21 @@ class CellLevelDataset(Dataset):
         purely synthetic dataset (e.g. a smoke test with random data and no
         real subjects) — in that mode missing/"unknown" subject_ids are
         allowed and no disjointness guarantee is implied.
+
+        smoke_known=None defaults to all-True — this is the legacy behaviour
+        for every existing caller/source that has no verified/unknown
+        distinction wired in yet, NOT a claim that every cell's smoke_type
+        is actually verified. Sources that DO carry a real distinction (e.g.
+        GSE136831's weak-proxy-only cells — see data/loaders.py::
+        _attach_standard_obs, data/assembly.py::export_cell_dataset) pass a
+        real per-cell array here. smoke_known=False cells still carry SOME
+        integer value in self.smoke (there is no separate "unknown" slot in
+        the fixed smoke-class space) — that value is a placeholder only,
+        and every consumer of self.smoke (smoke_class_weights below,
+        model.py's MultiTaskLoss._ls via the smoke_known mask threaded
+        through train.py's loss calls, data.sampling's class index) must
+        gate on smoke_known, never read the placeholder as if it were a
+        real label.
         """
         n = len(gene_matrix)
         self.X     = torch.FloatTensor(gene_matrix)
@@ -68,6 +84,10 @@ class CellLevelDataset(Dataset):
         self.malig_known = torch.BoolTensor(
             malignancy_known if malignancy_known is not None
             else np.zeros(n, dtype=bool)
+        )
+        self.smoke_known = torch.BoolTensor(
+            smoke_known if smoke_known is not None
+            else np.ones(n, dtype=bool)
         )
 
         self.diagnostic_mode = diagnostic_mode
@@ -101,6 +121,7 @@ class CellLevelDataset(Dataset):
         return {
             "x":               self.X[idx],
             "smoke_label":     self.smoke[idx],
+            "smoke_known":     self.smoke_known[idx],
             "malignancy_label":self.malig[idx],
             "malignancy_known": self.malig_known[idx],
             "cell_type_id":    self.ctype[idx],
@@ -124,6 +145,7 @@ class CellLevelDataset(Dataset):
             cell_type_ids     = self.ctype[mask].numpy(),
             exposure_dose     = self.dose[mask].numpy(),
             malignancy_known  = self.malig_known[mask].numpy(),
+            smoke_known       = self.smoke_known[mask].numpy(),
             subject_ids       = self.subject_ids[mask],
             dataset_source    = self.dataset_source[mask],
             diagnostic_mode   = self.diagnostic_mode,
@@ -138,6 +160,7 @@ class CellLevelDataset(Dataset):
         d = Path(processed_dir)
         dose_path = d / "exposure_dose.npy"
         malig_known_path = d / "malignancy_known.npy"
+        smoke_known_path = d / "smoke_labels_known.npy"
         meta_path = d / "cell_metadata.csv"
 
         subject_ids = None
@@ -156,6 +179,7 @@ class CellLevelDataset(Dataset):
             cell_type_ids     = np.load(d / "cell_type_ids.npy"),
             exposure_dose     = np.load(dose_path) if dose_path.exists() else None,
             malignancy_known  = np.load(malig_known_path) if malig_known_path.exists() else None,
+            smoke_known       = np.load(smoke_known_path) if smoke_known_path.exists() else None,
             subject_ids       = subject_ids,
             dataset_source    = dataset_source,
             diagnostic_mode   = diagnostic_mode,
@@ -172,12 +196,21 @@ class CellLevelDataset(Dataset):
         weight[c] = n_samples / (num_classes * count[c]), the standard
         sklearn/PyTorch balanced-weight formula. Classes absent from this
         dataset get weight 0 (nothing to learn, and 1/0 would be inf).
+
+        Only cells with smoke_known=True contribute to the counts — a cell
+        with no verified (or explicitly opted-in weak-proxy) smoke label
+        carries a meaningless placeholder in self.smoke (see __init__'s
+        docstring) and must never influence class weighting, the same way
+        malignancy_known already gates the malignancy loss.
         """
-        counts = np.bincount(self.smoke.numpy(), minlength=num_classes).astype(np.float64)
+        known = self.smoke_known.numpy()
+        labels = self.smoke.numpy()[known] if known.any() else np.array([], dtype=np.int64)
+        counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
         n = counts.sum()
         weights = np.zeros(num_classes, dtype=np.float32)
-        present = counts > 0
-        weights[present] = n / (num_classes * counts[present])
+        if n > 0:
+            present = counts > 0
+            weights[present] = n / (num_classes * counts[present])
         return torch.FloatTensor(weights)
 
 
@@ -313,10 +346,12 @@ class SubjectLevelDataset(Dataset):
             )
         n = len(b["malig_labels"])
         malig_known = b.get("malig_known")
+        smoke_known = b.get("smoke_known")
         return {
             "gene_matrix":   torch.FloatTensor(b["gene_matrix"]),
             "cell_type_ids": torch.LongTensor(b["cell_type_ids"]),
             "smoke_labels":  torch.LongTensor(b["smoke_labels"]),
+            "smoke_known":   torch.BoolTensor(smoke_known if smoke_known is not None else np.ones(n, dtype=bool)),
             "malig_labels":  torch.FloatTensor(b["malig_labels"]),
             "malig_known":   torch.BoolTensor(malig_known if malig_known is not None else np.zeros(n, dtype=bool)),
             "cancer_label":  torch.FloatTensor([cancer_label]),
@@ -855,11 +890,12 @@ class Trainer:
             for batch in train_dl:
                 x      = batch["x"].to(self.device)
                 smoke_t= batch["smoke_label"].to(self.device)
+                smoke_k= batch["smoke_known"].to(self.device)
                 malig_t= batch["malignancy_label"].to(self.device)
                 malig_k= batch["malignancy_known"].to(self.device)
                 dose_t = batch["exposure_dose"].to(self.device)
                 z, logits, malig = self.model.forward_cell(x)
-                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k)
+                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k, smoke_known=smoke_k)
                 dose_loss, _ = loss_fn.dose_response_loss(self.model.dose_head(z), dose_t, malig)
                 self._grad_step(loss + lambda_dose * dose_loss, opt, params)
             sched.step()
@@ -870,9 +906,23 @@ class Trainer:
             with torch.no_grad():
                 for batch in val_dl:
                     _, logits, _ = self.model.forward_cell(batch["x"].to(self.device))
-                    preds.extend(logits.argmax(1).cpu().tolist())
-                    targets.extend(batch["smoke_label"].tolist())
+                    known = batch["smoke_known"].bool()
+                    # Cells with no verified (or opted-in weak-proxy) smoke
+                    # label carry a meaningless placeholder target — scoring
+                    # against it would silently corrupt smoke_acc/macro_f1
+                    # (and therefore Phase 1 checkpoint selection) with
+                    # fabricated "ground truth". See CellLevelDataset's
+                    # smoke_known docstring.
+                    preds.extend(logits.argmax(1)[known].cpu().tolist())
+                    targets.extend(batch["smoke_label"][known].tolist())
 
+            if not targets:
+                raise ValueError(
+                    "Phase 1 validation set has zero cells with a known smoke label — "
+                    "smoke_acc/smoke_macro_f1 are undefined. Check that val_cell_dataset "
+                    "isn't entirely weak-proxy-only cells under the default verified_only "
+                    "label policy."
+                )
             acc = sum(p == t for p, t in zip(preds, targets)) / len(targets)
             # Same definition evaluate.py's _smoke_metrics uses (explicit
             # label list over ALL effective classes, not just classes
@@ -1052,11 +1102,12 @@ class Trainer:
             for batch in train_dl:
                 x = batch["x"].to(self.device)
                 smoke_t = batch["smoke_label"].to(self.device)
+                smoke_k = batch["smoke_known"].to(self.device)
                 malig_t = batch["malignancy_label"].to(self.device)
                 malig_k = batch["malignancy_known"].to(self.device)
                 dose_t = batch["exposure_dose"].to(self.device)
                 z, logits, malig = self.model.forward_cell(x)
-                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k)
+                loss, _ = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k, smoke_known=smoke_k)
                 dose_loss, _ = loss_fn.dose_response_loss(self.model.dose_head(z), dose_t, malig)
                 self._grad_step(loss + lambda_dose * dose_loss, opt, params)
             sched.step()
@@ -1196,10 +1247,11 @@ class Trainer:
                     cb = next(cell_iter)
                     x      = cb["x"].to(self.device)
                     smoke_t= cb["smoke_label"].to(self.device)
+                    smoke_k= cb["smoke_known"].to(self.device)
                     malig_t= cb["malignancy_label"].to(self.device)
                     malig_k= cb["malignancy_known"].to(self.device)
                     _, logits, malig = self.model.forward_cell(x)
-                    cl, _  = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k)
+                    cl, _  = loss_fn.cell_level_loss(logits, smoke_t, malig, malig_t, malig_known=malig_k, smoke_known=smoke_k)
                     loss   = loss + cl * 0.5
                 except StopIteration:
                     pass

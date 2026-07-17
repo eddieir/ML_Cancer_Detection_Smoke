@@ -59,6 +59,18 @@ class SubjectClassIndex:
     labels:        np.ndarray            # [N] int, effective smoke label per cell
     num_classes:   int
     is_synthetic:  bool = False          # provenance only — never relaxes validation
+    # [N] bool, True if absent (legacy/synthetic callers — unchanged
+    # behaviour). A cell with known_mask[i]=False has no verified (or
+    # opted-in weak-proxy) smoke label — its class distribution/subject
+    # weighting must never be influenced by it, so it is excluded from
+    # subject_to_indices/class_to_subjects entirely below, the same
+    # guarantee CellLevelDataset.smoke_class_weights enforces for the loss
+    # weighting side of this same problem. Its position (index `i`) is
+    # still a valid, unchanged index into the ORIGINAL dataset — it is
+    # simply never offered up by this index, never physically removed or
+    # renumbered, so every index this class DOES hand out remains a correct
+    # index into the caller's full, unfiltered dataset.
+    known_mask:    Optional[np.ndarray] = None
 
     unique_subjects:     List[str]              = field(init=False)
     subject_to_indices:  Dict[str, np.ndarray]  = field(init=False)
@@ -104,8 +116,24 @@ class SubjectClassIndex:
             )
         self.labels = labels
 
+        known = (
+            np.asarray(self.known_mask, dtype=bool) if self.known_mask is not None
+            else np.ones(n, dtype=bool)
+        )
+        if len(known) != n:
+            raise SamplingConfigurationError(
+                f"SubjectClassIndex: len(known_mask)={len(known)} != len(subject_ids)={n}."
+            )
+        self.known_mask = known
+        n_excluded = int((~known).sum())
+        if n_excluded:
+            print(f"[sampling] SubjectClassIndex: excluding {n_excluded:,}/{n:,} cell(s) with "
+                  "no verified smoke label from subject-balanced sampling's class index.")
+
         subject_to_indices: Dict[str, List[int]] = {}
         for i, s in enumerate(self.subject_ids):
+            if not known[i]:
+                continue
             subject_to_indices.setdefault(s, []).append(i)
 
         subject_to_label: Dict[str, int] = {}
@@ -133,13 +161,25 @@ class SubjectClassIndex:
     @classmethod
     def from_cell_dataset(cls, dataset, num_classes: int) -> "SubjectClassIndex":
         """Build directly from a train.CellLevelDataset (or any object with
-        the same .subject_ids / .smoke / .diagnostic_mode contract)."""
+        the same .subject_ids / .smoke / .smoke_known / .diagnostic_mode
+        contract). Cells with smoke_known=False (no verified or opted-in
+        weak-proxy smoke label — see CellLevelDataset's docstring) are
+        excluded from the class index; a dataset with no smoke_known
+        attribute at all (a legacy caller predating this field) is treated
+        as fully known, unchanged from previous behaviour."""
         labels = dataset.smoke.numpy() if hasattr(dataset.smoke, "numpy") else np.asarray(dataset.smoke)
+        smoke_known = getattr(dataset, "smoke_known", None)
+        known_mask = (
+            smoke_known.numpy() if hasattr(smoke_known, "numpy")
+            else np.asarray(smoke_known) if smoke_known is not None
+            else None
+        )
         return cls(
             subject_ids  = np.asarray(dataset.subject_ids),
             labels       = labels,
             num_classes  = num_classes,
             is_synthetic = bool(getattr(dataset, "diagnostic_mode", False)),
+            known_mask   = known_mask,
         )
 
     @property

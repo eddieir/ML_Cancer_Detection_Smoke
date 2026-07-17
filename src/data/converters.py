@@ -377,8 +377,19 @@ def convert_scrna_10x(accession: str, src_dir: Path, donor_map: Optional[dict] =
         if n_missing:
             print(f"[convert] {accession}  WARNING: {n_missing:,}/{adata.n_obs:,} "
                   "barcodes had no match in cell_metadata — labelled 'unknown'")
+        # Boolean-known columns (e.g. smoke_type_known, weak_smoke_proxy_known)
+        # must fill missing rows with False, never the string "unknown" —
+        # that would silently corrupt a bool column into mixed
+        # True/False/"unknown" object dtype, and "unknown" is truthy in
+        # Python, which would make a barcode with NO metadata match look
+        # like it has a KNOWN label. Every other column keeps the previous
+        # "unknown" string fill for a missing per-cell value.
+        _bool_known_cols = {c for c in joined.columns if c.endswith("_known")}
         for col in joined.columns:
-            adata.obs[col] = joined[col].fillna("unknown").values
+            if col in _bool_known_cols:
+                adata.obs[col] = joined[col].fillna(False).astype(bool).values
+            else:
+                adata.obs[col] = joined[col].fillna("unknown").values
     elif donor_map:
         prefixes = adata.obs_names.str.extract(r"^([^-_]+)")[0]
         adata.obs["donor_id"] = prefixes.map(donor_map).fillna("unknown").values
@@ -483,22 +494,69 @@ def _load_gse136831_cell_metadata(src_dir: Path) -> Optional[pd.DataFrame]:
 
     Disease_Identity is COPD/IPF/Control, not a direct smoking-status field
     — this dataset is the Vanderbilt/Habermann interstitial lung disease
-    atlas, not a dedicated smoking cohort. smoke_type still defaults to
-    "cigarette" for these samples (COPD is strongly smoking-associated,
-    and this pipeline has no better per-subject label for this accession),
-    the same documented-approximation pattern already used for TCGA in
-    convert_tcga above — not a claim that GSE136831 records smoking status.
+    atlas, not a dedicated smoking cohort. This function does NOT assign a
+    verified smoke_type: it never writes "cigarette" (or any other verified
+    label) for these cells. Instead every cell gets an explicit, honest
+    provenance record:
+
+      smoke_type_name    "unknown" for every cell (loaders.py's
+                          _attach_standard_obs keeps this per-cell value
+                          instead of falling back to the accession-level
+                          blanket default that used to apply "cigarette"
+                          here regardless of Disease_Identity).
+      smoke_type_known    False for every cell — no verified smoking-status
+                          measurement exists for this accession.
+      weak_smoke_proxy_known      True only where Disease_Identity == "COPD"
+                                  (COPD is strongly smoking-associated, but
+                                  is not itself a verified cigarette-exposure
+                                  measurement).
+      weak_smoke_proxy_type       "COPD_diagnosis" where applicable, else None.
+      weak_smoke_proxy_value      "cigarette" where applicable, else None —
+                                  a candidate label, never written into
+                                  smoke_type/smoke_type_name directly. See
+                                  data/labellers.py::apply_weak_smoke_proxies
+                                  for the explicit, opt-in-only promotion
+                                  path (data.weak_labels.enabled).
+      weak_smoke_proxy_source     "GSE136831 Disease_Identity" where applicable.
+      weak_smoke_proxy_limitation human-readable caveat where applicable —
+                                  COPD status is correlational, not a
+                                  verified individual exposure record.
+
+    IPF and Control rows get weak_smoke_proxy_known=False — IPF is not a
+    smoking proxy, and "Control" here means "no interstitial lung disease",
+    not "confirmed never-smoker" (this pipeline has no verified never-smoker
+    field for this accession either, so Control rows stay smoke_type_known
+    =False rather than being labeled "unexposed").
     """
     matches = list(src_dir.glob("*Samples.CellType.MetadataTable*"))
     if not matches:
         return None
     meta = pd.read_csv(matches[0], sep="\t", quotechar='"')
     meta = meta.set_index("CellBarcode_Identity")
+
+    disease = meta["Disease_Identity"]
+    is_copd = disease.astype(str).str.strip().str.upper() == "COPD"
+
+    limitation = (
+        "GSE136831 Disease_Identity=COPD is a documented weak proxy for cigarette "
+        "exposure, not a verified individual smoking record — this accession is the "
+        "Vanderbilt/Habermann interstitial lung disease atlas (COPD/IPF/Control), not "
+        "a dedicated smoking cohort. COPD is strongly smoking-associated but not proof "
+        "of exposure for any single donor."
+    )
+
     return pd.DataFrame({
         "donor_id":         meta["Subject_Identity"],
-        "disease_identity": meta["Disease_Identity"],
+        "disease_identity": disease,
         "cell_type":        meta["CellType_Category"],
-    })
+        "smoke_type_name":  "unknown",
+        "smoke_type_known": False,
+        "weak_smoke_proxy_known":      is_copd,
+        "weak_smoke_proxy_type":       np.where(is_copd, "COPD_diagnosis", None),
+        "weak_smoke_proxy_value":      np.where(is_copd, "cigarette", None),
+        "weak_smoke_proxy_source":     np.where(is_copd, "GSE136831 Disease_Identity", None),
+        "weak_smoke_proxy_limitation": np.where(is_copd, limitation, None),
+    }, index=meta.index)
 
 
 def _read_id_list(path: Path, expected_len: Optional[int] = None,
@@ -544,15 +602,25 @@ def convert_tcga(project: str, src_dir: Path) -> Optional[Path]:
     and subject_id fields load_microarray needs (extended alongside
     smoke_type — see loaders.py).
 
-    Malignancy label: 1.0 for "Primary Tumor" samples, 0.0 for solid tissue
-    normal (NAT), read from downloaders.py's file_meta.csv (case_id +
-    sample_type — the GDC fields the manifest itself doesn't carry).
+    Malignancy label: sample_type ("Primary Tumor" vs. solid tissue normal
+    (NAT), read from downloaders.py's file_meta.csv) is a BULK SAMPLE-LEVEL
+    tumor/normal label, not a per-cell malignancy call — it describes which
+    bulk specimen a sample was dissected from, and is only ever attached
+    through load_microarray's samples_meta.csv pathway, which
+    data/assay_mode.py keeps confined to the dedicated bulk_tcga path (see
+    load_tcga_bulk_dataset in this module / preprocess.py). It must never
+    be interpreted as, or merged into, a per-cell malignancy label for an
+    unrelated single-cell dataset.
 
-    Smoke type: TCGA-LUAD/LUSC don't carry per-patient smoking history in
-    this pipeline, and >85% of these cohorts are smokers (per TCGA clinical
-    characteristics) — defaulted to "cigarette" as a documented approximation,
-    consistent with the cigar/dual-use label-transfer caveats already in
-    ARCHITECTURE.md section 3A.
+    Smoke type: TCGA-LUAD/LUSC do not carry verified per-patient smoking
+    history in this pipeline. ">85% of these cohorts are smokers" (a
+    cohort-level statistic sometimes cited for these projects) describes
+    the COHORT, not any individual patient, and is never written here as a
+    per-sample label — smoke_type_name is "unknown" and smoke_type_known
+    is False for every TCGA sample by default. This replaces an earlier
+    version of this function that defaulted every sample to "cigarette" as
+    a "documented approximation" — that was a fabricated per-patient label
+    with no verified basis and has been removed.
     """
     out_dir  = _mkout()
     meta_csv = src_dir / "file_meta.csv"
@@ -589,9 +657,15 @@ def convert_tcga(project: str, src_dir: Path) -> Optional[Path]:
     expr.to_csv(csv_path)
     pd.DataFrame({
         "sample_id":  expr.columns,
-        "smoke_type": "cigarette",
+        # No verified per-patient smoking history — never "cigarette" by
+        # default. See this function's docstring.
+        "smoke_type": "unknown",
+        "smoke_type_known": False,
+        # sample_type-derived tumor/normal is a bulk-sample label, not a
+        # per-cell malignancy call — see this function's docstring.
         "malignancy": [malignancy[s] for s in expr.columns],
         "subject_id": [subject_id[s] for s in expr.columns],
+        "assay_mode": "bulk_tcga",
     }).to_csv(meta_path, index=False)
 
     n_tumor = sum(v == 1.0 for v in malignancy.values())
@@ -615,13 +689,33 @@ def convert_nlst_outcomes(prsn_csv: Path) -> Path:
     """
     NLST prsn.csv (pid, candx, ...) → clean subject_id/cancer_label CSV for
     assemble_subject_bags()'s `cancer_outcomes` argument.
+
+    A subject with a missing/NaN `candx` value is dropped from this CSV
+    entirely, NOT written as cancer_label=0 — assemble_subject_bags()
+    already treats a subject absent from this CSV as an unknown outcome
+    (cancer_label_known=False), and a NaN candx must be treated identically
+    to "no diagnosis field recorded", never silently promoted to a
+    verified cancer-negative. If the `candx` column is missing from the
+    source file entirely, every subject is dropped the same way (an empty
+    outcomes CSV, not a blanket cancer_label=0 for everyone).
     """
     out_path = _mkout() / "nlst_outcomes.csv"
     df = pd.read_csv(prsn_csv, low_memory=False)
-    out = pd.DataFrame({
-        "subject_id":   df["pid"].astype(str),
-        "cancer_label": (df.get("candx", 0) == 1).astype(int),
-    })
+    if "candx" not in df.columns:
+        print("[convert] NLST outcomes  WARNING: no 'candx' column in "
+              f"{prsn_csv} — writing an empty outcomes CSV (every subject unknown), "
+              "not a fabricated cancer_label.")
+        out = pd.DataFrame({"subject_id": pd.Series(dtype=str), "cancer_label": pd.Series(dtype=int)})
+    else:
+        known = df[df["candx"].notna()]
+        n_dropped = len(df) - len(known)
+        if n_dropped:
+            print(f"[convert] NLST outcomes  {n_dropped:,}/{len(df):,} subjects have a missing "
+                  "candx value — excluded from this CSV (unknown outcome), not defaulted to 0.")
+        out = pd.DataFrame({
+            "subject_id":   known["pid"].astype(str),
+            "cancer_label": (known["candx"] == 1).astype(int),
+        })
     out.to_csv(out_path, index=False)
     print(f"[convert] NLST outcomes  {len(out):,} subjects → {out_path.name}")
     return out_path
