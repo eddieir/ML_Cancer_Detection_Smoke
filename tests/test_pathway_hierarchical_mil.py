@@ -733,3 +733,70 @@ def test_model_type_recorded_in_bundle_extra(tmp_path):
     )
     manifest = load_and_validate_bundle(bundle_dir)
     assert manifest["model_type"] == "pathway_hierarchical_mil"
+
+
+def test_validate_pathway_bundle_identity_accepts_matching_bundle(tmp_path):
+    from benchmarks.pathway_hierarchical_adapter import validate_pathway_bundle_identity
+
+    artifact = _tiny_artifact(tmp_path)
+    model = _model()
+    ckpt_path = tmp_path / "checkpoint.pt"
+    torch.save({"state_dict": model.state_dict()}, ckpt_path)
+    bundle_dir = tmp_path / "bundle"
+    write_model_bundle(
+        bundle_dir=bundle_dir, checkpoint_path=ckpt_path, artifact=artifact,
+        model_config=model.config.__dict__, class_vocabulary=[str(i) for i in range(6)],
+        label_policy="verified_only", species_policy="human_only", assay_mode="human_single_cell",
+        extra={"model_type": model.model_type, "module_fingerprint": model.module_fingerprint},
+    )
+    manifest = load_and_validate_bundle(bundle_dir)
+    validate_pathway_bundle_identity(manifest, model)  # must not raise
+
+
+def test_validate_pathway_bundle_identity_rejects_wrong_model_type(tmp_path):
+    from benchmarks.pathway_hierarchical_adapter import validate_pathway_bundle_identity
+
+    artifact = _tiny_artifact(tmp_path)
+    model = _model()
+    ckpt_path = tmp_path / "checkpoint.pt"
+    torch.save({"state_dict": model.state_dict()}, ckpt_path)
+    bundle_dir = tmp_path / "bundle"
+    write_model_bundle(
+        bundle_dir=bundle_dir, checkpoint_path=ckpt_path, artifact=artifact,
+        model_config=model.config.__dict__, class_vocabulary=[str(i) for i in range(6)],
+        label_policy="verified_only", species_policy="human_only", assay_mode="human_single_cell",
+        extra={"model_type": "some_other_architecture", "module_fingerprint": model.module_fingerprint},
+    )
+    manifest = load_and_validate_bundle(bundle_dir)
+    with pytest.raises(BundleValidationError):
+        validate_pathway_bundle_identity(manifest, model)
+
+
+def test_validate_pathway_bundle_identity_rejects_module_fingerprint_mismatch(tmp_path):
+    from benchmarks.pathway_hierarchical_adapter import validate_pathway_bundle_identity
+
+    artifact = _tiny_artifact(tmp_path)
+    model = _model()
+    other_modules = GeneModuleCollection.synthetic(GENES, n_modules=5, genes_per_module=6, seed=123)
+    ckpt_path = tmp_path / "checkpoint.pt"
+    torch.save({"state_dict": model.state_dict()}, ckpt_path)
+    bundle_dir = tmp_path / "bundle"
+    write_model_bundle(
+        bundle_dir=bundle_dir, checkpoint_path=ckpt_path, artifact=artifact,
+        model_config=model.config.__dict__, class_vocabulary=[str(i) for i in range(6)],
+        label_policy="verified_only", species_policy="human_only", assay_mode="human_single_cell",
+        extra={"model_type": model.model_type, "module_fingerprint": other_modules.fingerprint()},
+    )
+    manifest = load_and_validate_bundle(bundle_dir)
+    with pytest.raises(BundleValidationError):
+        validate_pathway_bundle_identity(manifest, model)
+
+
+def test_checkpoint_from_different_architecture_config_fails_to_load(tmp_path):
+    """A checkpoint trained with a different embedding_dim/module count
+    must not silently load into a differently-configured model — PyTorch's
+    strict state_dict loading raises on the resulting shape mismatch."""
+    small_model = _model(embedding_dim=16)
+    large_model = _model(embedding_dim=64)
+    with pytest.raises(RuntimeError):
+        large_model.load_state_dict(small_model.state_dict())
