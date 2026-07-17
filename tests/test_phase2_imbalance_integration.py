@@ -184,6 +184,15 @@ def test_checkpoint_contains_resolved_imbalance_configuration(tmp_path):
     assert ckpt["smoke_imbalance_config"]["focal_gamma"] == 1.5
     assert ckpt["smoke_sampling_diagnostics"] is not None
     assert "observed_effective_classes" in ckpt["smoke_sampling_diagnostics"]
+    diag = ckpt["smoke_sampling_diagnostics"]
+    assert diag["complete"] is True
+    assert diag["realized_total_samples"] is not None
+    assert diag["realized_batch_sizes"] is not None
+    assert diag["realized_cells_per_subject"] is not None
+    assert diag["realized_subject_counts_per_batch"] is not None
+    assert diag["realized_max_subject_cells_per_batch"] is not None
+    for subject_counts in diag["realized_subject_counts_per_batch"]:
+        assert max(subject_counts.values()) <= 4  # cells_per_subject_per_batch above
 
 
 def test_checkpoint_with_shuffle_sampler_has_null_sampling_diagnostics(tmp_path):
@@ -215,6 +224,8 @@ def test_neural_smoke_adapter_metadata_reports_imbalance_config(tmp_path):
     assert meta["smoke_imbalance_config"]["sampler"] == "subject_balanced"
     assert meta["smoke_imbalance_config"]["loss"] == "focal"
     assert meta["smoke_sampling_diagnostics"] is not None
+    assert meta["smoke_sampling_diagnostics"]["realized_total_samples"] is not None
+    assert meta["smoke_sampling_diagnostics"]["realized_batch_sizes"] is not None
 
 
 class _FakeContext:

@@ -389,6 +389,33 @@ def test_write_and_read_imbalance_ablation_artifact_round_trip():
     assert "results" in loaded and "comparisons" in loaded
 
 
+def test_artifact_round_trip_preserves_realized_sampler_diagnostics_exactly():
+    ctx = build_synthetic_context(seed=42, fast=True)
+    report = run_smoke_imbalance_ablation(
+        ctx, strategies=["natural_no_weight", "subject_balanced_inverse_frequency"],
+        n_folds=2, seeds=[42], device="cpu", max_cells_per_subject=50,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "run_001"
+        run_dir.mkdir()
+        json_path = write_imbalance_ablation_artifact(run_dir, ctx, report, synthetic=True)
+        loaded = read_imbalance_ablation_artifact(json_path)
+
+    shuffle_fold = loaded["results"]["natural_no_weight"]["folds"][0]
+    balanced_fold = loaded["results"]["subject_balanced_inverse_frequency"]["folds"][0]
+    # shuffle-based strategy must never fabricate subject-balanced realized
+    # sampler diagnostics — hyperparameters.smoke_sampling_diagnostics stays
+    # null (see NeuralSmokeAdapter.metadata / Trainer._train_cell_loader).
+    assert shuffle_fold["hyperparameters"]["smoke_sampling_diagnostics"] is None
+    balanced_diag = balanced_fold["hyperparameters"]["smoke_sampling_diagnostics"]
+    assert balanced_diag is not None
+    assert balanced_diag["complete"] is True
+    assert balanced_diag["realized_total_samples"] == sum(balanced_diag["realized_batch_sizes"])
+    assert sum(balanced_diag["realized_cells_per_subject"].values()) == balanced_diag["realized_total_samples"]
+    for subject_counts in balanced_diag["realized_subject_counts_per_batch"]:
+        assert max(subject_counts.values()) <= balanced_diag["cells_per_subject_cap"]
+
+
 def test_artifact_identity_changes_with_imbalance_strategy_config():
     """A config change that changes trained-model behavior (here: which
     strategies were compared/what the resolved config was) must be

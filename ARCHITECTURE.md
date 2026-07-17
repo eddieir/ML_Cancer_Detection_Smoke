@@ -995,21 +995,42 @@ Architectural summary:
   prevent a cell-heavy subject from dominating a class). Consumed via
   `DataLoader(dataset, batch_sampler=...)`, never combined with
   `shuffle=True`.
-  - `cells_per_subject_cap` is a **hard** per-batch ceiling tracked via
-    per-batch remaining-capacity bookkeeping (`class_remaining_subjects`):
-    once every subject of a class is at the cap within the batch being
-    built, that class is excluded from the remaining draws (probability
-    renormalized over the classes still eligible) — there is no fallback to
-    an already-capped subject. Feasibility (`cap * n_unique_subjects >=` the
-    largest batch this sampler will ever need to produce) is checked once
-    at construction; an infeasible configuration raises
-    `SamplingImpossibleError` immediately, not mid-iteration.
+  - `cells_per_subject_cap` is a **hard per-batch maximum**, not a required
+    minimum — a subject with fewer cells than the cap is still a valid
+    participant. Each subject's *effective* capacity, computed once at
+    construction (`_effective_capacity`), is `cap` when `replacement=True`
+    (redraws allowed) or `min(cap, that subject's own unique cell count)`
+    when `replacement=False` (cannot yield more distinct cells than it
+    has). Per-batch remaining-capacity bookkeeping
+    (`class_remaining_subjects`) is tracked against this effective value:
+    once every subject of a class is at ITS effective capacity within the
+    batch being built, that class is excluded from the remaining draws
+    (probability renormalized over the classes still eligible) — there is
+    no fallback to an already-exhausted subject. Feasibility is judged
+    against the sum of effective capacities across all subjects (not
+    `cap * n_unique_subjects`) versus the largest batch the sampler will
+    ever need to produce; this is checked once at construction, and an
+    infeasible configuration raises `SamplingImpossibleError` immediately,
+    not mid-iteration. Without-replacement uniqueness is scoped to one
+    batch — the same physical cell may reappear in a later batch — and
+    capacity always resets fully between batches.
   - `samples_per_epoch` is resolved into an exact, explicit list of
     per-batch sizes (`_batch_sizes`) at construction — full `batch_size`
     batches followed by exactly one partial batch of the exact remainder —
     rather than a batch count derived by ceiling division and then filled
     with full-size batches (which would silently over-sample). `__len__`
     returns `len(_batch_sizes)`.
+  - After a batch_sampler-driven `DataLoader` completes one full epoch,
+    `last_realized_diagnostics` is populated with per-batch realized
+    provenance: `realized_total_samples`, `realized_batch_sizes`,
+    `realized_cells_per_subject`, `realized_subject_counts_per_batch`,
+    `realized_max_subject_cells_per_batch`, and
+    `realized_repeated_cell_draws_per_batch`/`_total` — computed
+    incrementally during `__iter__` and committed to
+    `last_realized_diagnostics` only after every batch has yielded, so an
+    interrupted or failed epoch leaves the prior value (or `None`)
+    unchanged rather than exposing a mislabeled partial result. `epoch_index`
+    and `complete` identify which epoch a realized block describes.
 - **`Trainer._train_cell_loader()`** (`train.py`) is the single place every
   training cell `DataLoader` is now built (`phase1`, `phase1_final_fit`,
   `phase3`'s cell-level component) — it reads

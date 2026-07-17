@@ -975,23 +975,30 @@ never oversampled, duplicated, capped, or reweighted — see
 `tests/test_phase2_imbalance_integration.py`'s validation-loader tests and
 `tests/test_benchmarks_imbalance_ablation.py`'s validation-fingerprint tests.
 
-**`cells_per_subject_per_batch` is a hard, per-batch ceiling — never a soft
-target.** When set, no subject may contribute more than that many cells to
-any single batch; there is no fallback to an already-capped subject. Once
-every subject in a class has reached the cap *within the batch being
-built*, that class simply stops being drawn for the rest of that batch (its
-probability mass is redistributed over classes that still have capacity) —
-a feasible degradation of the requested class balance, never a cap
-violation. Feasibility (`cells_per_subject_per_batch * n_unique_subjects >=
-the largest requested batch size`) is checked once at sampler construction;
-an infeasible combination raises `SamplingImpossibleError` immediately,
-never mid-epoch and never by silently exceeding the cap. Cell replacement
-(`replacement: true`, the default) is independent of this cap: the same
-physical cell may be drawn more than once within a batch when replacement
-is enabled, but a subject's *total* contribution to that batch — repeats
-included — still cannot exceed the cap. See
+**`cells_per_subject_per_batch` is a hard, per-batch MAXIMUM — never a
+required minimum.** A subject with fewer cells than the cap is still a
+fully valid participant; it just has a smaller effective capacity. Each
+subject's effective per-batch capacity is `cells_per_subject_per_batch`
+when `replacement: true` (the same cell can be redrawn), or
+`min(cells_per_subject_per_batch, that subject's own unique cell count)`
+when `replacement: false` (a subject cannot yield more distinct cells than
+it has). No subject may contribute more than its effective capacity to any
+single batch, with no fallback to an already-exhausted subject. Once every
+subject in a class has reached its effective capacity *within the batch
+being built*, that class simply stops being drawn for the rest of that
+batch (its probability mass is redistributed over classes that still have
+capacity) — a feasible degradation of the requested class balance, never a
+cap violation. Feasibility is judged against the *sum of effective
+capacities* across every subject, not `cap * n_unique_subjects` — a
+configuration is infeasible only when that sum cannot fill the largest
+requested batch. This is checked once at sampler construction; an
+infeasible combination raises `SamplingImpossibleError` immediately, never
+mid-epoch and never by silently exceeding the cap. Without replacement, a
+physical cell cannot repeat within one batch, but that uniqueness is scoped
+to the batch, not the epoch — the same cell may reappear in a later batch;
+capacity itself always resets fully between batches. See
 `tests/test_subject_balanced_sampling.py`'s cap-enforcement tests, including
-the exact-capacity-boundary and single-subject-class cases.
+mixed-capacity, exact-boundary, and single-subject-class cases.
 
 **`samples_per_epoch` is an exact sample count, not a rounding target.**
 `samples_per_epoch=95` with `batch_size=10` yields batch lengths `[10] * 9 +
@@ -1121,9 +1128,25 @@ context.py`) with no additional plumbing — two runs with different
 imbalance strategies never share scientific or frozen-test-guard identity.
 Every checkpoint (`Trainer._save`) persists the resolved
 `smoke_imbalance_config` and, when the subject-balanced sampler was used,
-its realized per-epoch sampling diagnostics (observed/absent effective
-classes, unique subjects per class, exact realized samples/batches,
-realized cells/subjects per class); `NeuralSmokeAdapter.metadata()`/
+its realized per-epoch sampling diagnostics (`SamplingDiagnostics`,
+`data/sampling.py`) — populated only after a full epoch has actually been
+iterated, never for a shuffle-based run (which stays `null`, not a
+fabricated value). Alongside the expected/configured fields
+(observed/absent effective classes, unique subjects per class, exact
+`samples_per_epoch`), the realized block records exactly what the sampler
+did: `realized_total_samples` (must equal `samples_per_epoch`),
+`realized_batch_sizes` (the exact yielded size of every batch, including
+the final partial one), `realized_cells_per_subject` (total cells drawn per
+subject across the epoch), `realized_subject_counts_per_batch` (a
+per-subject count for every batch — the direct way to verify the hard cap
+independently), `realized_max_subject_cells_per_batch` (the largest single
+subject's contribution in each batch), and
+`realized_repeated_cell_draws_per_batch`/`_total` (repeated physical-cell
+draws per batch — always zero when `replacement: false`, informative when
+`replacement: true` and a subject's cell pool is smaller than its share of
+the batch). An interrupted or failed epoch leaves the previous
+`last_realized_diagnostics` unchanged rather than exposing a partial,
+mislabeled result. `NeuralSmokeAdapter.metadata()`/
 `NeuralCancerAdapter.metadata()` expose the same fields for benchmark
 reports. `run_smoke_imbalance_ablation`'s own output is not only an
 in-memory dict: `write_imbalance_ablation_artifact` persists it atomically

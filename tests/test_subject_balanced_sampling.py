@@ -376,12 +376,14 @@ def test_replacement_false_without_cap_raises():
 
 
 def test_replacement_false_impossible_cap_raises_at_construction():
-    subj, labels = _dataset([("A", 0, 3), ("B", 1, 3)], num_classes=2)
+    """A: 3 cells, B: 4 cells, cap=5, batch_size=8 -> effective total
+    capacity is min(5,3) + min(5,4) = 7 < 8, genuinely infeasible."""
+    subj, labels = _dataset([("A", 0, 3), ("B", 1, 4)], num_classes=2)
     idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
     with pytest.raises(SamplingImpossibleError):
         SubjectBalancedBatchSampler(
-            idx, batch_size=4, seed=0, batches_per_epoch=1,
-            replacement=False, cells_per_subject_cap=5,  # subjects only have 3 cells each
+            idx, batch_size=8, seed=0, batches_per_epoch=1,
+            replacement=False, cells_per_subject_cap=5,
         )
 
 
@@ -393,6 +395,198 @@ def test_replacement_false_feasible_cap_succeeds_without_repeats():
     )
     batch = next(iter(sampler))
     assert len(batch) == len(set(batch))  # no repeated cell index within the batch
+
+
+# ─── 11b. cells_per_subject_cap is a MAXIMUM, not a required minimum ──────────
+
+def test_no_replacement_subject_below_cap_still_participates():
+    """Subject A has only 3 cells, cap is 5, subject B has 20 — A's
+    effective capacity is 3, not an automatic disqualification."""
+    subj, labels = _dataset([("A", 0, 3), ("B", 0, 20)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=6, seed=0, batches_per_epoch=3,
+        replacement=False, cells_per_subject_cap=5,
+    )
+    for batch in sampler:
+        assert len(batch) == 6
+        assert len(batch) == len(set(batch))
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert per_subject.get("A", 0) <= 3  # A's effective capacity, not the raw cap
+        assert per_subject.get("B", 0) <= 5
+
+
+def test_effective_capacity_for_subject_below_cap_is_its_own_cell_count():
+    subj, labels = _dataset([("A", 0, 3), ("B", 0, 20)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=6, seed=0, batches_per_epoch=1,
+        replacement=False, cells_per_subject_cap=5,
+    )
+    assert sampler._effective_capacity["A"] == 3
+    assert sampler._effective_capacity["B"] == 5
+
+
+def test_mixed_capacity_exact_boundary_succeeds():
+    """A: 3 cells, B: 20 cells, cap=5, batch_size=8 -> exactly
+    min(5,3) + min(5,20) = 3 + 5 = 8, the tightest feasible boundary."""
+    subj, labels = _dataset([("A", 0, 3), ("B", 0, 20)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=8, seed=0, batches_per_epoch=3,
+        replacement=False, cells_per_subject_cap=5,
+    )
+    for batch in sampler:
+        assert len(batch) == 8
+        assert len(batch) == len(set(batch))
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert per_subject.get("A", 0) == 3
+        assert per_subject.get("B", 0) == 5
+
+
+def test_no_replacement_no_duplicate_physical_cell_within_a_batch():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=40, seed=3, batches_per_epoch=10,
+        replacement=False, cells_per_subject_cap=4,
+    )
+    for batch in sampler:
+        assert len(batch) == len(set(batch))
+
+
+def test_no_replacement_subject_removed_when_unique_cells_exhausted_before_cap():
+    """Subject A has only 3 cells but cap is 10 (feasible because B/C/D
+    make up the rest) — A must drop out of the batch after its 3 cells are
+    used, never causing a repeat or a cap violation."""
+    subj, labels = _dataset(
+        [("A", 0, 3), ("B", 0, 30), ("C", 0, 30), ("D", 0, 30)], num_classes=1,
+    )
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=20, seed=0, batches_per_epoch=5,
+        replacement=False, cells_per_subject_cap=10,
+    )
+    for batch in sampler:
+        assert len(batch) == 20
+        assert len(batch) == len(set(batch))
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert per_subject.get("A", 0) <= 3
+
+
+def test_no_replacement_final_partial_batch_respects_cap_and_uniqueness():
+    subj, labels = _dataset([("A", 0, 3), ("B", 0, 30)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=8, seed=0, samples_per_epoch=17,
+        replacement=False, cells_per_subject_cap=5,
+    )
+    batches = list(sampler)
+    assert [len(b) for b in batches] == [8, 8, 1]
+    for batch in batches:
+        assert len(batch) == len(set(batch))
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert per_subject.get("A", 0) <= 3
+        assert per_subject.get("B", 0) <= 5
+
+
+def test_no_replacement_deterministic_replay_for_same_seed_and_epoch():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+
+    def _run():
+        sampler = SubjectBalancedBatchSampler(
+            idx, batch_size=30, seed=7, batches_per_epoch=5,
+            replacement=False, cells_per_subject_cap=4,
+        )
+        return list(sampler)
+
+    assert _run() == _run()
+
+
+def test_no_replacement_varies_across_seeds_and_epochs():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler_a = SubjectBalancedBatchSampler(
+        idx, batch_size=30, seed=1, batches_per_epoch=5, replacement=False, cells_per_subject_cap=4,
+    )
+    sampler_b = SubjectBalancedBatchSampler(
+        idx, batch_size=30, seed=2, batches_per_epoch=5, replacement=False, cells_per_subject_cap=4,
+    )
+    assert list(sampler_a) != list(sampler_b)
+
+    epoch1 = list(sampler_a)
+    epoch2 = list(sampler_a)
+    assert epoch1 != epoch2  # different epoch index -> different sequence
+
+
+def test_no_replacement_capacity_resets_across_multiple_batches():
+    subj, labels = _dataset([("A", 0, 3), ("B", 0, 30)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=8, seed=0, batches_per_epoch=6,
+        replacement=False, cells_per_subject_cap=5,
+    )
+    for batch in sampler:
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        # A can hit its 3-cell effective capacity again in EVERY batch —
+        # proves capacity resets rather than being an epoch-wide budget.
+        assert per_subject.get("A", 0) <= 3
+
+
+def test_no_replacement_one_class_exhausted_mid_batch_with_multiple_classes():
+    subj, labels = _dataset(
+        [("A", 0, 3)] + [(f"C{i}", 1, 30) for i in range(5)], num_classes=2,
+    )
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=20, seed=0, batches_per_epoch=5,
+        replacement=False, cells_per_subject_cap=4,
+    )
+    for batch in sampler:
+        assert len(batch) == 20
+        assert len(batch) == len(set(batch))
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert per_subject.get("A", 0) <= 3  # class 0's only subject, capped by its own 3 cells
+
+
+def test_no_replacement_impossible_configuration_fails_fast_not_hang():
+    subj, labels = _dataset([("A", 0, 2), ("B", 1, 2)], num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    with pytest.raises(SamplingImpossibleError):
+        SubjectBalancedBatchSampler(
+            idx, batch_size=100, seed=0, batches_per_epoch=1,
+            replacement=False, cells_per_subject_cap=3,
+        )
+
+
+def test_replacement_true_behavior_unchanged_by_effective_capacity_fix():
+    """With replacement=True, a subject's effective capacity is always the
+    raw cap regardless of its own cell count — unaffected by this fix."""
+    subj, labels = _dataset([("A", 0, 2), ("B", 0, 2)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=10, seed=0, batches_per_epoch=5,
+        replacement=True, cells_per_subject_cap=5,
+    )
+    for batch in sampler:
+        assert len(batch) == 10
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert all(v <= 5 for v in per_subject.values())
 
 
 # ─── 13. Placeholder subject IDs are rejected ──────────────────────────────────
@@ -498,6 +692,163 @@ def test_realized_diagnostics_populated_after_one_epoch():
     assert diag is not None
     assert sum(diag.realized_cells_per_class.values()) == 16 * 10
     assert diag.realized_unique_subjects <= 22
+
+
+# ─── Realized per-batch provenance diagnostics ─────────────────────────────────
+
+def test_realized_diagnostics_exact_total_and_batch_sizes_for_samples_per_epoch():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=95)
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    assert diag.realized_total_samples == 95
+    assert diag.realized_batch_sizes == [10] * 9 + [5]
+
+
+def test_realized_batch_sizes_sum_equals_realized_total_samples():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=95)
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    assert sum(diag.realized_batch_sizes) == diag.realized_total_samples
+
+
+def test_realized_cells_per_subject_sums_to_realized_total_samples():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=95, cells_per_subject_cap=4)
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    assert sum(diag.realized_cells_per_subject.values()) == diag.realized_total_samples
+
+
+def test_realized_subject_counts_per_batch_never_exceeds_cap():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=32, seed=0, batches_per_epoch=10, cells_per_subject_cap=4,
+    )
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    for subject_counts in diag.realized_subject_counts_per_batch:
+        assert max(subject_counts.values()) <= 4
+
+
+def test_realized_max_subject_cells_per_batch_matches_actual_batch_content():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=32, seed=0, batches_per_epoch=10, cells_per_subject_cap=4,
+    )
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    for subject_counts, reported_max in zip(
+        diag.realized_subject_counts_per_batch, diag.realized_max_subject_cells_per_batch,
+    ):
+        assert reported_max == max(subject_counts.values())
+
+
+def test_realized_repeated_cell_draws_zero_for_every_batch_without_replacement():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=32, seed=0, batches_per_epoch=10,
+        replacement=False, cells_per_subject_cap=4,
+    )
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    assert diag.realized_repeated_cell_draws_per_batch == [0] * 10
+    assert diag.realized_repeated_cell_draws_total == 0
+
+
+def test_realized_repeated_cell_draws_detected_with_replacement_and_tiny_pool():
+    subj, labels = _dataset([("A", 0, 2)], num_classes=1)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=1)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=10, seed=0, batches_per_epoch=3, replacement=True,
+    )
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    # Only 2 distinct cells exist -> a 10-cell batch must repeat at least once.
+    assert all(v > 0 for v in diag.realized_repeated_cell_draws_per_batch)
+    assert diag.realized_repeated_cell_draws_total > 0
+
+
+def test_realized_diagnostics_represent_final_partial_batch_correctly():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=25, cells_per_subject_cap=3)
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    assert diag.realized_batch_sizes == [10, 10, 5]
+    assert len(diag.realized_subject_counts_per_batch) == 3
+    assert sum(diag.realized_subject_counts_per_batch[2].values()) == 5
+
+
+def test_realized_diagnostics_reset_between_epochs_describe_only_latest():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=16, seed=0, batches_per_epoch=5)
+    for _ in sampler:
+        pass
+    diag_epoch0 = sampler.last_realized_diagnostics
+    assert diag_epoch0.epoch_index == 0
+    for _ in sampler:
+        pass
+    diag_epoch1 = sampler.last_realized_diagnostics
+    assert diag_epoch1.epoch_index == 1
+    assert diag_epoch1 is not diag_epoch0
+
+
+def test_interrupted_iteration_does_not_mark_diagnostics_complete():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=16, seed=0, batches_per_epoch=5)
+    it = iter(sampler)
+    next(it)  # consume only the first batch, never finish the epoch
+    assert sampler.last_realized_diagnostics is None
+
+
+def test_interrupted_iteration_after_a_prior_complete_epoch_leaves_it_unchanged():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=16, seed=0, batches_per_epoch=5)
+    for _ in sampler:
+        pass
+    completed = sampler.last_realized_diagnostics
+    assert completed is not None and completed.complete is True
+
+    it = iter(sampler)
+    next(it)  # start but do not finish a second epoch
+    assert sampler.last_realized_diagnostics is completed  # unchanged, not partially overwritten
+
+
+def test_sampling_diagnostics_to_dict_is_json_serializable():
+    import json
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=10, seed=0, samples_per_epoch=25, cells_per_subject_cap=3,
+    )
+    for _ in sampler:
+        pass
+    d = sampler.last_realized_diagnostics.to_dict()
+    serialized = json.dumps(d)
+    assert isinstance(serialized, str)
+    # every key must be a native str (json.dumps would coerce but we want
+    # confirmation the dict itself is already clean, not relying on that).
+    round_tripped = json.loads(serialized)
+    assert round_tripped["realized_total_samples"] == 25
 
 
 # ─── Config resolution ──────────────────────────────────────────────────────────
