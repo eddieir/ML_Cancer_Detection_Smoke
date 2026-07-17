@@ -71,7 +71,42 @@ def test_convert_microarray_infers_per_sample_smoke_type(tmp_paths):
 
     meta = pd.read_csv(converted / "GSE994_samples_meta.csv").set_index("sample_id")
     assert meta.loc["GSM1", "smoke_type"] == "cigarette"
+    assert meta.loc["GSM1", "smoke_type_known"] == True  # noqa: E712
     assert meta.loc["GSM2", "smoke_type"] == "unexposed"
+    assert meta.loc["GSM2", "smoke_type_known"] == True  # noqa: E712
+
+
+def test_convert_microarray_unmatched_status_value_stays_unknown_not_blanket_default(tmp_paths):
+    """A sample whose 'smoking status' text doesn't match either documented
+    pattern must not silently inherit the accession-level default
+    ('cigarette') — it stays unknown."""
+    tmp, converted = tmp_paths
+    gz = tmp / "GSE994_series_matrix.txt.gz"
+    _write_series_matrix(
+        gz,
+        sample_ids=["GSM1"],
+        characteristics={"smoking status": ["unspecified"]},
+        expr={"G1": [1.0]},
+    )
+    converters.convert_microarray("GSE994", gz, "cigarette")
+    meta = pd.read_csv(converted / "GSE994_samples_meta.csv").set_index("sample_id")
+    assert meta.loc["GSM1", "smoke_type"] == "unknown"
+    assert meta.loc["GSM1", "smoke_type_known"] == False  # noqa: E712
+
+
+def test_convert_microarray_no_status_column_stays_unknown_not_blanket_default(tmp_paths):
+    tmp, converted = tmp_paths
+    gz = tmp / "GSE994_series_matrix.txt.gz"
+    _write_series_matrix(
+        gz,
+        sample_ids=["GSM1"],
+        characteristics={"tissue": ["lung"]},   # no smoking/status-named field at all
+        expr={"G1": [1.0]},
+    )
+    converters.convert_microarray("GSE994", gz, "cigarette")
+    meta = pd.read_csv(converted / "GSE994_samples_meta.csv").set_index("sample_id")
+    assert meta.loc["GSM1", "smoke_type"] == "unknown"
+    assert meta.loc["GSM1", "smoke_type_known"] == False  # noqa: E712
 
 
 def _write_gpl_annot(path, probe_to_symbol):
@@ -163,6 +198,29 @@ def test_convert_canuck_classifies_smoke_type_from_three_fields(tmp_paths):
     assert meta.loc["GSM2", "smoke_type"] == "cannabis"
     assert meta.loc["GSM3", "smoke_type"] == "cigarette"  # former cigarette, no cannabis
     assert meta.loc["GSM4", "smoke_type"] == "unexposed"
+    # A genuinely documented three-field negative (Non-Cannabis/never/No) IS
+    # a verified classification for this accession's complete codebook —
+    # not a missing-value default — so it counts as known.
+    assert meta["smoke_type_known"].all()
+
+
+def test_convert_canuck_missing_metadata_entirely_stays_unknown_not_blanket_unexposed(tmp_paths):
+    """If the series matrix carries no characteristics rows at all (total
+    metadata-parse failure), every sample must stay unknown — never a
+    blanket 'unexposed' for the whole accession."""
+    tmp, converted = tmp_paths
+    gz = tmp / "GSE307690_series_matrix.txt.gz"
+    _write_series_matrix(gz, sample_ids=["GSM1", "GSM2"], characteristics={},
+                          expr={"G1": [1.0, 2.0]})
+    processed = tmp / "GSE307690_processed_data.txt.gz"
+    with gzip.open(processed, "wt") as f:
+        f.write("sample1 sample2\n")
+        f.write("ENSG00000000003.16_9 1.0 2.0\n")
+
+    converters.convert_canuck("GSE307690", gz, processed)
+    meta = pd.read_csv(converted / "GSE307690_samples_meta.csv").set_index("sample_id")
+    assert (meta["smoke_type"] == "unknown").all()
+    assert not meta["smoke_type_known"].any()
 
 
 def test_convert_scrna_10x_without_donor_map_defaults_unknown(tmp_paths, capsys):

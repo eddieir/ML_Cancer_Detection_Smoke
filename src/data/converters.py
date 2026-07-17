@@ -100,22 +100,42 @@ _SMOKE_STATUS_PATTERNS = {
 }
 
 
-def _infer_smoke_column(meta: pd.DataFrame, default: str) -> pd.Series:
-    """Best-effort per-sample smoke type from GEO characteristic fields."""
+def _infer_smoke_column(meta: pd.DataFrame, default: str) -> "tuple[pd.Series, pd.Series]":
+    """
+    Per-sample smoke type from GEO characteristic fields, where available.
+
+    Returns (smoke_type_name, smoke_type_known) — a sample's smoke type is
+    "known" ONLY when its own characteristics text actually matched one of
+    the documented patterns (current/former/ever smoker -> cigarette;
+    never/non-smoker/control -> unexposed). This repository's `default`
+    parameter (the accession-level smoke_type declared in
+    configs/default.yaml's microarray_sources) is a fallback LABEL for
+    display purposes only now — it is never used to fill a genuinely
+    missing or unmatched per-sample value, since accessions like GSE994
+    are documented to contain a mix of smokers and never-smokers (see
+    README.md), not a single uniform condition. A sample with no
+    "smok"/"status"-named characteristics column at all, or whose value
+    doesn't match either documented pattern, gets smoke_type="unknown" and
+    smoke_type_known=False instead of silently inheriting the accession
+    blanket.
+    """
     status_col = next(
         (c for c in meta.columns if "smok" in c or "status" in c), None
     )
     if status_col is None:
-        return pd.Series(default, index=meta.index)
+        return (pd.Series("unknown", index=meta.index),
+                pd.Series(False, index=meta.index))
 
     def _classify(v: str) -> str:
         if _SMOKE_STATUS_PATTERNS["unexposed"].search(str(v)):
             return "unexposed"
         if _SMOKE_STATUS_PATTERNS["cigarette"].search(str(v)):
             return "cigarette"
-        return default
+        return "unknown"
 
-    return meta[status_col].map(_classify)
+    smoke_type = meta[status_col].map(_classify)
+    known = smoke_type != "unknown"
+    return smoke_type, known
 
 
 def _load_probe_to_symbol_map(annot_path: Path) -> dict[str, str]:
@@ -183,13 +203,32 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
 
     expr.to_csv(csv_path)
 
-    smoke = _infer_smoke_column(meta, default_smoke_type)
-    pd.DataFrame({"sample_id": expr.columns, "smoke_type": smoke.reindex(expr.columns).values}
-                 ).to_csv(meta_path, index=False)
+    smoke, known = _infer_smoke_column(meta, default_smoke_type)
+    smoke = smoke.reindex(expr.columns)
+    known = known.reindex(expr.columns).fillna(False)
+    limitation = pd.Series(
+        np.where(
+            known,
+            "Per-sample smoking status parsed from this accession's own GEO characteristics field.",
+            "No 'smok'/'status'-named GEO characteristics field matched a documented current/former/"
+            "ever-smoker or never/non-smoker/control pattern for this sample — left unknown rather "
+            "than defaulted to the accession-level label.",
+        ),
+        index=expr.columns,
+    )
+    pd.DataFrame({
+        "sample_id": expr.columns,
+        "smoke_type": smoke.values,
+        "smoke_type_known": known.values,
+        "smoke_type_source": f"GEO {accession} series matrix characteristics",
+        "smoke_type_method": "regex_pattern_match",
+        "smoke_type_limitation": limitation.values,
+    }).to_csv(meta_path, index=False)
 
-    n_over = (smoke.reindex(expr.columns) != default_smoke_type).sum()
+    n_unknown = int((~known).sum())
     print(f"[convert] {accession}  {expr.shape[1]} samples x {expr.shape[0]} genes "
-          f"→ {csv_path.name}  ({n_over} samples relabelled from GEO metadata)")
+          f"→ {csv_path.name}  ({int(known.sum())} known from GEO metadata, "
+          f"{n_unknown} unknown — never defaulted to '{default_smoke_type}')")
     return csv_path
 
 
@@ -237,17 +276,47 @@ def convert_canuck(accession: str, gz_path: Path, processed_data_path: Path) -> 
             return "vape"
         return "unexposed"
 
-    smoke = meta.apply(_classify, axis=1) if not meta.empty else pd.Series("unexposed", index=sample_ids)
+    # meta.empty means the series matrix carried NO characteristics rows at
+    # all (a total metadata-parsing failure, not "every sample is
+    # documented never-smoker/control") — that must stay unknown, not
+    # silently become a blanket "unexposed" for the whole accession. When
+    # meta IS populated, _classify's three-field logic runs per real,
+    # documented sample characteristics (this accession's own published
+    # design accounts for every sample: 139 cannabis smokers + 57
+    # never-smokers — see this function's docstring), so "unexposed" from
+    # _classify itself is a genuine parsed negative, not a missing-value
+    # default.
+    if meta.empty:
+        smoke = pd.Series("unknown", index=sample_ids)
+        known = pd.Series(False, index=sample_ids)
+    else:
+        smoke = meta.apply(_classify, axis=1)
+        known = pd.Series(True, index=meta.index)
 
     csv_path  = out_dir / f"{accession}.csv"
     meta_path = out_dir / f"{accession}_samples_meta.csv"
     expr.to_csv(csv_path)
-    pd.DataFrame({"sample_id": expr.columns, "smoke_type": smoke.reindex(expr.columns).values}
-                 ).to_csv(meta_path, index=False)
+    smoke = smoke.reindex(expr.columns)
+    known = known.reindex(expr.columns).fillna(False)
+    pd.DataFrame({
+        "sample_id": expr.columns,
+        "smoke_type": smoke.values,
+        "smoke_type_known": known.values,
+        "smoke_type_source": f"GEO {accession} series matrix characteristics "
+                              "(cannabis group / cigarette / vape fields)",
+        "smoke_type_method": "documented_three_field_classification",
+        "smoke_type_limitation": np.where(
+            known.values,
+            "Derived from this accession's own published cannabis group/cigarette/vape "
+            "characteristics fields.",
+            "Series matrix carried no characteristics rows for this accession — "
+            "smoking status could not be determined and was not defaulted.",
+        ),
+    }).to_csv(meta_path, index=False)
 
     counts = smoke.value_counts().to_dict()
     print(f"[convert] {accession}  {expr.shape[1]} samples x {expr.shape[0]} genes "
-          f"→ {csv_path.name}  {counts}")
+          f"→ {csv_path.name}  {counts}  (known={int(known.sum())}, unknown={int((~known).sum())})")
     return csv_path
 
 

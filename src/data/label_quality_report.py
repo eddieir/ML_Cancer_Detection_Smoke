@@ -102,6 +102,8 @@ def build_label_quality_report(
             "smoke_weak_proxy_cells": prov.get("smoke_weak_proxy_cells") if split_name == "all" else None,
             "smoke_unknown_cells": prov.get("smoke_unknown_cells") if split_name == "all" else None,
             "weak_labels_enabled": prov.get("weak_labels_enabled") if split_name == "all" else None,
+            "nlst_cells_verified_smoke_label": prov.get("nlst_cells_verified_smoke_label") if split_name == "all" else None,
+            "nlst_cells_unknown_smoke_label": prov.get("nlst_cells_unknown_smoke_label") if split_name == "all" else None,
         }
     per_split["all"] = {
         "n_subjects": sum(s.get("n_subjects", 0) for s in split_report.values()),
@@ -114,6 +116,8 @@ def build_label_quality_report(
         "smoke_weak_proxy_cells": prov.get("smoke_weak_proxy_cells"),
         "smoke_unknown_cells": prov.get("smoke_unknown_cells"),
         "weak_labels_enabled": prov.get("weak_labels_enabled"),
+        "nlst_cells_verified_smoke_label": prov.get("nlst_cells_verified_smoke_label"),
+        "nlst_cells_unknown_smoke_label": prov.get("nlst_cells_unknown_smoke_label"),
     }
 
     flags: List[str] = []
@@ -136,6 +140,14 @@ def build_label_quality_report(
             "documented weak smoke-type proxy (e.g. GSE136831's COPD-diagnosis proxy) that "
             "is excluded from smoke supervision under the default verified_only policy — "
             "set data.weak_labels.enabled=true to opt in."
+        )
+    n_nlst_unknown = prov.get("nlst_cells_unknown_smoke_label") or 0
+    if n_nlst_unknown:
+        flags.append(
+            f"nlst_matched_but_unknown_smoke_label: {n_nlst_unknown} cell(s) matched an NLST "
+            "subject_id but CIGSMOK/CIGAR did not parse to a documented positive code (see "
+            "data/nlst_smoking.py) — excluded from smoke supervision as unknown, not defaulted "
+            "to cigarette/cigar/unexposed."
         )
 
     return LabelQualityReport(

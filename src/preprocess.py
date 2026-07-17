@@ -313,9 +313,27 @@ def _nlst_join_report(cfg: dict, merged) -> dict:
     nlst_subjects = set(nlst["pid"].astype(str)) if "pid" in nlst.columns else set()
     data_subjects = set(merged.obs["subject_id"].astype(str))
     matched = nlst_subjects & data_subjects
+
+    # Per-cell known/unknown breakdown among cells transfer_nlst_labels
+    # actually touched (identified by smoke_type_source, stamped only by
+    # that function — see data/nlst_smoking.py) — a matched subject whose
+    # CIGSMOK/CIGAR didn't parse to a documented positive code counts as
+    # "matched but unknown", not silently folded into n_subjects_matched
+    # as if a label was produced.
+    n_cells_verified = n_cells_unknown = 0
+    if "smoke_type_source" in merged.obs.columns:
+        from data.nlst_smoking import SOURCE_NLST_CIGSMOK_CIGAR
+        nlst_touched = merged.obs["smoke_type_source"] == SOURCE_NLST_CIGSMOK_CIGAR
+        if nlst_touched.any():
+            known = merged.obs.loc[nlst_touched, "smoke_type_known"].astype(bool)
+            n_cells_verified = int(known.sum())
+            n_cells_unknown = int((~known).sum())
+
     return {
         "nlst_csv_used": True,
         "n_subjects_matched": len(matched),
+        "nlst_cells_verified_smoke_label": n_cells_verified,
+        "nlst_cells_unknown_smoke_label": n_cells_unknown,
         "note": (
             None if matched else
             "NLST CSV present but ZERO subject ID overlap with this dataset — no "

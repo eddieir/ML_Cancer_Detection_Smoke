@@ -1161,6 +1161,24 @@ labeled proxy. `data/labellers.py::apply_weak_smoke_proxies` is the only
 path that ever promotes a weak proxy into the primary smoke label, gated
 by `data.weak_labels.enabled` (default `false`).
 
+`data/nlst_smoking.py::parse_nlst_smoking_row` is the explicit parser for
+NLST's `CIGSMOK`/`CIGAR` fields: it only recognizes the codes documented in
+`src/data/downloaders.py::print_nlst_instructions` (`CIGSMOK` 1/2,
+`CIGAR` 1) as verified evidence, and treats every other value — missing,
+blank, null, an undocumented code, or malformed input — as unknown, never
+raising and never guessing at an unconfirmed codebook meaning.
+`data/labellers.py::transfer_nlst_labels` calls it per matched subject and
+writes `smoke_type_known` plus `smoke_type_source`/`smoke_type_method`/
+`smoke_type_limitation` provenance columns (default `None` for every cell
+this function doesn't touch); it can overwrite an upstream
+`smoke_type_known=True` back to `False` when NLST linkage itself finds no
+usable evidence, since NLST is this project's intended source of truth for
+a scRNA-seq subject's smoking status. The same pattern (a per-sample value
+that doesn't parse to a documented code stays unknown rather than
+inheriting the accession-level default) applies to GSE994/GSE123352
+(`data/converters.py::_infer_smoke_column`) and GSE307690/CANUCK
+(`convert_canuck`'s empty-metadata case).
+
 ### 14.3 Subject-split boundary and fit/transform preprocessing interface
 
 Unchanged from §11: `run_pipeline_split_aware` computes the subject-level

@@ -23,6 +23,11 @@ def _adata_with_subjects(subject_ids):
 
 
 def test_transfer_nlst_labels_assigns_cigar_and_dual_use():
+    """p4 has CIGSMOK=0/CIGAR=0 — neither is a documented positive code
+    (see data/nlst_smoking.py), so p4 must remain UNKNOWN, never a
+    verified 'unexposed' class. See
+    test_transfer_nlst_labels_unsupported_codes_stay_unknown below for the
+    dedicated known/unknown assertions this predates."""
     from data.labellers import transfer_nlst_labels
     adata = _adata_with_subjects(["p1", "p2", "p3", "p4"])
     with tempfile.TemporaryDirectory() as tmp:
@@ -35,10 +40,11 @@ def test_transfer_nlst_labels_assigns_cigar_and_dual_use():
 
         out = transfer_nlst_labels(adata, str(nlst_csv))
         labels = out.obs.set_index("subject_id")["smoke_type"].groupby(level=0).first()
-        assert labels["p1"] == 0   # cigarette only
-        assert labels["p2"] == 2   # cigar only
-        assert labels["p3"] == 4   # dual-use (cigarette + cigar)
-        assert labels["p4"] == 5   # unexposed
+        known = out.obs.set_index("subject_id")["smoke_type_known"].groupby(level=0).first()
+        assert labels["p1"] == 0 and known["p1"]   # cigarette only, verified
+        assert labels["p2"] == 2 and known["p2"]   # cigar only, verified
+        assert labels["p3"] == 4 and known["p3"]   # dual-use, verified
+        assert not known["p4"]                     # CIGSMOK=0/CIGAR=0 — undocumented codes, unknown
 
 
 def test_transfer_nlst_labels_skips_when_file_missing():

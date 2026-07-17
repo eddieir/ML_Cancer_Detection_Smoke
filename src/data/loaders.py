@@ -90,6 +90,12 @@ def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
         ("weak_smoke_proxy_value", None),
         ("weak_smoke_proxy_source", None),
         ("weak_smoke_proxy_limitation", None),
+        # Per-cell smoke-label provenance — populated for NLST-linked cells
+        # by data/labellers.py::transfer_nlst_labels; every other source
+        # gets these as explicit None defaults so the columns always exist.
+        ("smoke_type_source", None),
+        ("smoke_type_method", None),
+        ("smoke_type_limitation", None),
     ):
         if col not in adata.obs.columns:
             adata.obs[col] = default

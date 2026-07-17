@@ -74,8 +74,8 @@ the policies that keep label handling and preprocessing honest.
 
 | Dataset | Status | Notes |
 |---|---|---|
-| GSE994 | Implemented, verified public download | Bulk microarray, cigarette smoking status from series metadata. |
-| GSE123352 | Implemented, verified public download | Bulk RNA-seq, ever/never-smoker status from series metadata (not independently re-verified against GEO in this change — no network access in this environment; see `configs/datasets.yaml`). |
+| GSE994 | Implemented, verified public download | Bulk microarray; per-sample smoking status parsed from series metadata where it matches a documented pattern, otherwise `smoke_type_known=False` rather than the accession-level default. |
+| GSE123352 | Implemented, verified public download | Bulk RNA-seq, ever/never-smoker status from series metadata under the same known/unknown parsing as GSE994 (not independently re-verified against GEO in this change — no network access in this environment; see `configs/datasets.yaml`). |
 | GSE136831 | Implemented, verified-label default with an explicit opt-in weak proxy | Real per-cell donor IDs and disease status (COPD/IPF/Control). Every cell's smoke label defaults to unknown (`smoke_type_known=False`); COPD status is recorded as a separate, documented weak proxy (`weak_smoke_proxy_*` fields) that only feeds smoke-classification supervision when `data.weak_labels.enabled=true` — see the caveat below. |
 | GSE288003 (mouse) | Implemented, species-separated | Real per-sample e-cig/control condition; excluded from the pipeline entirely unless `data.experiment_mode` is set away from the default `human_only` (see `src/data/species_policy.py`). Ortholog mapping is now a versioned, cacheable artifact (`src/data/ortholog.py`) instead of an uncached live BioMart query. |
 | GSE307690 (CANUCK) | Adapter implemented; sample completeness not independently re-verified in this environment | See `configs/datasets.yaml`'s `known_limitations` for this entry. |
@@ -180,20 +180,28 @@ checksums only for files actually present locally — an entry for a dataset
 with no local files yet still validates, with `files_present=false` and
 every checksum explicitly `null`, never a fabricated placeholder.
 
-### Remaining label-integrity limitations
+### NLST smoking-history and cancer-outcome handling
 
-- `data/converters.py::convert_nlst_outcomes` now excludes any subject with
-  a missing `candx` value from the outcomes CSV instead of writing
-  `cancer_label=0` for them — a NaN diagnosis field is an unknown outcome,
-  not a verified negative. Subjects with no `candx` value are treated as
-  absent from the outcomes source (unknown), the same as before this file
-  existed.
-- `data/labellers.py::transfer_nlst_labels` (NLST `CIGSMOK`/`CIGAR` ->
-  smoke_type) still falls back to a numeric default when either field is
-  missing for a matched subject, rather than leaving that subject's smoke
-  label unknown. This is a real, disclosed gap, not yet fixed — the
-  smoke_type_known infrastructure that GSE136831 now uses could be
-  extended to this path as follow-up work.
+`data/nlst_smoking.py` parses NLST's `CIGSMOK`/`CIGAR` fields against only
+the codes this repository's own reviewed access instructions document
+(`CIGSMOK` 1=current/2=former smoker, `CIGAR` 1=yes) — any other value
+(missing, blank, null, an undocumented code such as `0`, or a malformed
+entry) stays an unknown smoking history rather than being coerced into
+cigarette, cigar, or "unexposed". `data/labellers.py::transfer_nlst_labels`
+uses this parser for every matched subject, so NLST participation alone is
+never treated as cigarette exposure — the subject's own CIGSMOK/CIGAR
+values have to actually parse to a documented code. `smoke_type_known`
+gates loss/class-weighting/sampling/stratification/metrics the same way it
+does everywhere else in this pipeline. `data/converters.py::
+convert_nlst_outcomes` similarly excludes a subject with a missing `candx`
+value from the outcomes CSV rather than writing `cancer_label=0` for them.
+
+The same missing-value-must-not-become-a-verified-label rule applies to
+GSE994/GSE123352 (`data/converters.py::_infer_smoke_column`) and GSE307690/
+CANUCK (`convert_canuck`): a sample whose GEO characteristics don't parse
+to a documented smoking-status pattern is written as
+`smoke_type_known=False`, never silently defaulted to the accession-level
+label declared in `configs/default.yaml`.
 
 ## Current results (real data)
 

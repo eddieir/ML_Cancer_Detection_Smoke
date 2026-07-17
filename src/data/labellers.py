@@ -18,45 +18,94 @@ def transfer_nlst_labels(
     subject_col: str = "subject_id",
 ) -> ad.AnnData:
     """
-    Transfer cigar and dual-use labels from NLST clinical metadata
-    to cells matched by subject_id.
+    Transfer cigarette/cigar/dual-use smoke-type evidence from NLST
+    clinical metadata to cells matched by subject_id, via the explicit
+    field parser in data/nlst_smoking.py.
 
     Novel: first linkage of NLST clinical smoking categories to
     single-cell gene expression data.
 
-    NLST fields: CIGSMOK (cigarette), CIGAR (cigar use flag).
+    NLST fields: CIGSMOK (cigarette), CIGAR (cigar use flag) — see
+    data/nlst_smoking.py's module docstring for exactly which codes this
+    repository trusts as verified evidence, and why every other value
+    (missing, blank, null, an undocumented code, or a malformed value)
+    stays unknown rather than being coerced into cigarette, cigar, or
+    "unexposed". Matching NLST participation alone is never treated as
+    cigarette exposure — only a documented positive CIGSMOK/CIGAR code is.
+
+    A matched subject whose CIGSMOK/CIGAR fields don't parse to a
+    documented positive code gets smoke_type_known=False,
+    smoke_type_name="unknown", and explicit
+    smoke_type_source/smoke_type_method/smoke_type_limitation provenance —
+    this OVERWRITES whatever smoke_type_known state the cell had before
+    (e.g. an upstream accession-level default), because NLST linkage is
+    this project's intended source of truth for a scRNA-seq subject's
+    smoking status (see data/assembly.py's module docstring) and a failed
+    linkage must not silently leave a fabricated upstream label standing
+    unlabelled as such. A subject with NO row in the NLST CSV at all is
+    entirely untouched — this function only acts on subjects it actually
+    matched.
+
+    Raw CIGSMOK/CIGAR values are never written into adata.obs or printed
+    per-subject — only aggregate counts are reported, consistent with not
+    exposing restricted participant-level fields in downstream artifacts.
     """
     if not Path(nlst_csv).exists():
         print("[label] NLST CSV not found — skipping label transfer")
         return adata
 
+    from data.nlst_smoking import parse_nlst_smoking_row
+
     nlst = pd.read_csv(nlst_csv, low_memory=False)
     nlst["subject_id"] = nlst["pid"].astype(str)
 
-    def _assign(row) -> int:
-        cigar = row.get("CIGAR",   0) == 1
-        cig   = row.get("CIGSMOK", 0) in [1, 2]
-        if cigar and cig: return 4   # dual-use
-        if cigar:         return 2   # cigar only
-        if cig:           return 0   # cigarette only
-        return 5                     # unexposed
+    records = {}
+    for _, row in nlst.iterrows():
+        records[row["subject_id"]] = parse_nlst_smoking_row(
+            row["CIGSMOK"] if "CIGSMOK" in nlst.columns else None,
+            row["CIGAR"] if "CIGAR" in nlst.columns else None,
+        )
 
-    nlst_map = dict(zip(nlst["subject_id"], nlst.apply(_assign, axis=1)))
-    matched  = adata.obs[subject_col].map(nlst_map)
-    n        = matched.notna().sum()
+    matched_subject = adata.obs[subject_col].astype(str).map(lambda s: records.get(s))
+    matched_mask = matched_subject.notna()
+    n_matched = int(matched_mask.sum())
 
-    if "smoke_type_known" not in adata.obs.columns:
-        adata.obs["smoke_type_known"] = True  # legacy default — see loaders.py::_attach_standard_obs
+    for col, default in (
+        ("smoke_type_known", True),   # legacy default for cells NLST never touches — see loaders.py
+        ("smoke_type_source", None),
+        ("smoke_type_method", None),
+        ("smoke_type_limitation", None),
+    ):
+        if col not in adata.obs.columns:
+            adata.obs[col] = default
 
-    if n > 0:
-        adata.obs.loc[matched.notna(), "smoke_type"] = matched.dropna().astype(int)
-        # NLST CIGSMOK/CIGAR are verified clinical fields for the matched
-        # subject — a real measurement, not a proxy — so these cells are
-        # marked known.
-        adata.obs.loc[matched.notna(), "smoke_type_known"] = True
-        print(f"[label] NLST  {n:,} cells relabelled ({n/adata.n_obs:.1%})")
-    else:
+    if n_matched == 0:
         print("[label] NLST  no subject ID overlap — labels unchanged")
+        return adata
+
+    matched_idx = adata.obs.index[matched_mask.values]
+    recs = [matched_subject.loc[i] for i in matched_idx]
+    known_flags = [bool(r.smoke_type_known) for r in recs]
+    # No verified label -> smoke_type_name is stamped "unknown" explicitly
+    # (never left as a stale numeric-looking name next to
+    # smoke_type_known=False) and smoke_type falls back to the same inert
+    # placeholder id used elsewhere for unknown cells (see
+    # data/converters.py::_load_gse136831_cell_metadata) — smoke_type_known
+    # is what every downstream consumer must gate on, not this value.
+    names = [r.effective_smoke_type if r.smoke_type_known else "unknown" for r in recs]
+
+    adata.obs.loc[matched_idx, "smoke_type_known"] = known_flags
+    adata.obs.loc[matched_idx, "smoke_type_source"] = [r.source for r in recs]
+    adata.obs.loc[matched_idx, "smoke_type_method"] = [r.method for r in recs]
+    adata.obs.loc[matched_idx, "smoke_type_limitation"] = [r.limitation for r in recs]
+    adata.obs.loc[matched_idx, "smoke_type_name"] = names
+    adata.obs.loc[matched_idx, "smoke_type"] = [SMOKE_TYPE_MAP.get(n, 5) for n in names]
+
+    n_known = sum(known_flags)
+    n_unknown = len(known_flags) - n_known
+    print(f"[label] NLST  {n_matched:,} cells matched  "
+          f"(verified={n_known:,}  unknown={n_unknown:,}, "
+          f"{n_matched/adata.n_obs:.1%} of {adata.n_obs:,} total cells)")
     return adata
 
 
