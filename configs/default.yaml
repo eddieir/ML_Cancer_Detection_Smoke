@@ -1,4 +1,37 @@
 data:
+  # Governs cross-species (human/mouse) and bulk/single-cell mode gating —
+  # see src/data/species_policy.py, src/constants.py. Default is human_only:
+  # the mouse source below (gse288003_path) is NOT loaded unless this is
+  # changed explicitly. One of: human_only | mouse_only |
+  # cross_species_pretraining | cross_species_domain_adaptation.
+  experiment_mode: human_only
+  # Machine-readable dataset provenance/checksum manifest — see
+  # src/data/manifest.py and README.md's dataset-status table.
+  dataset_manifest: configs/datasets.yaml
+  # verified_only (default): only smoke_label rows with a verified,
+  # non-weak-proxy source contribute to smoke-type supervision/metrics.
+  # weak_labels.enabled must be explicitly set true to opt a documented
+  # weak proxy (e.g. GSE136831's COPD-diagnosis proxy) into training — see
+  # README.md's COPD-proxy policy section.
+  label_policy: verified_only
+  weak_labels:
+    enabled: false
+  species:
+    evaluation_species: human
+    mouse_usage: disabled
+    ortholog_mapping:
+      source: ensembl
+      policy: one_to_one_only
+      artifact: null
+  tcga:
+    enabled: false
+    mode: bulk
+    projects: []
+    manifest_path: null
+  nlst:
+    enabled: false
+    local_root_env: NLST_DATA_ROOT
+    manifest_path: null
   # Populated by:
   #   python3 src/data/downloaders.py --all
   #   python3 src/data/converters.py --all
@@ -49,14 +82,37 @@ rare_class:
   target_classes: [cigar]
 
 preprocessing:
+  # Enforced structurally by preprocess.py::run_pipeline_split_aware (split
+  # happens before fit_preprocessing is ever called) — this flag documents
+  # the invariant rather than switching behavior; see data/preprocessing.py.
+  split_before_fit: true
+  hvg:
+    fit_partition: train
+    n_top_genes: 2000
+  scaling:
+    fit_partition: train
+    zero_variance_policy: unit_scale
+  missing_gene_policy: error
   batch_correction:
     method: harmony
-    # Harmony has no train-only-fit / apply-to-new-data mode, so running it
-    # uses held-out (val/test) expression values to compute the batch
-    # correction embedding — a transductive, NOT leakage-free, step. Default
-    # is strict: batch correction is SKIPPED in run_pipeline_split_aware.
-    # Set true only as a deliberate, documented opt-in — the resulting
-    # experiment must not be described as fully leakage-free.
+    # mode: none (default) | train_fitted_inductive | transductive_diagnostic_only
+    # Harmony (this project's only implemented method) has no train-only-fit
+    # / apply-to-new-data mode, so "train_fitted_inductive" is not currently
+    # available — requesting it fails clearly rather than silently running
+    # the transductive path. "transductive_diagnostic_only" is the
+    # explicitly-named opt-in for the legacy allow_transductive_harmony
+    # behavior below; it must never be used for frozen-test evaluation (see
+    # src/benchmarks/test_guard.py) and results produced under it must not
+    # be described as leakage-free.
+    mode: none
+    # Legacy flag, kept for backward compatibility: true is equivalent to
+    # mode: transductive_diagnostic_only. Harmony has no train-only-fit /
+    # apply-to-new-data mode, so running it uses held-out (val/test)
+    # expression values to compute the batch correction embedding — a
+    # transductive, NOT leakage-free, step. Default is strict: batch
+    # correction is SKIPPED in run_pipeline_split_aware. Set true only as a
+    # deliberate, documented opt-in — the resulting experiment must not be
+    # described as fully leakage-free.
     allow_transductive_harmony: false
 
 model:

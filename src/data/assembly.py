@@ -10,10 +10,11 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 
-from constants import DOSE_UNKNOWN
+from constants import DOSE_UNKNOWN, SPECIES_HUMAN, DEFAULT_EXPERIMENT_MODE
 
 
-def merge_sources(*adatas: ad.AnnData, scale: bool = True) -> ad.AnnData:
+def merge_sources(*adatas: ad.AnnData, scale: bool = True,
+                   experiment_mode: str = DEFAULT_EXPERIMENT_MODE) -> ad.AnnData:
     """
     Concatenate heterogeneous sources on common gene intersection.
     Assigns batch column for downstream Harmony correction.
@@ -26,7 +27,24 @@ def merge_sources(*adatas: ad.AnnData, scale: bool = True) -> ad.AnnData:
     path (preprocess.py::run_pipeline_split_aware, data/preprocessing.py)
     calls merge_sources(*adatas, scale=False) and fits scaling on the
     train split only via PreprocessingArtifact.
+
+    Species safety (see data/species_policy.py): every source's
+    obs["species"] (defaulting to "human" for sources that predate this
+    field) is checked against `experiment_mode` before concatenating.
+    human_only (the default) refuses to merge anything but human cells;
+    mixing species requires experiment_mode='cross_species_pretraining' or
+    'cross_species_domain_adaptation'. This is the single enforcement point
+    for the rule that ortholog-mapped mouse expression must never be
+    silently treated as the same domain as measured human expression.
     """
+    from data.species_policy import assert_single_species_or_explicit
+
+    species_values = [
+        (a.obs["species"].iloc[0] if "species" in a.obs.columns and a.n_obs else SPECIES_HUMAN)
+        for a in adatas
+    ]
+    assert_single_species_or_explicit(species_values, experiment_mode)
+
     genes = adatas[0].var_names
     for a in adatas[1:]:
         genes = genes.intersection(a.var_names)

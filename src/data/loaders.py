@@ -10,7 +10,7 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 
-from constants import SMOKE_TYPE_MAP, DOSE_UNKNOWN
+from constants import SMOKE_TYPE_MAP, DOSE_UNKNOWN, SPECIES_HUMAN, SPECIES_MOUSE
 
 
 def _try_auto_download(path: Path) -> None:
@@ -33,7 +33,8 @@ def _try_auto_download(path: Path) -> None:
 
 def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
                           subject_id_series: pd.Series,
-                          modality: str, is_pseudo_bulk: bool) -> ad.AnnData:
+                          modality: str, is_pseudo_bulk: bool,
+                          species: str = SPECIES_HUMAN) -> ad.AnnData:
     """
     DRY helper: stamps required obs columns onto any AnnData.
 
@@ -61,6 +62,7 @@ def _attach_standard_obs(adata: ad.AnnData, smoke_type: str,
         adata.obs["smoke_type_name"] = smoke_type.lower()
     adata.obs["data_modality"]   = modality
     adata.obs["is_pseudo_bulk"]  = is_pseudo_bulk
+    adata.obs["species"]         = species
     adata.obs["subject_id"]      = subject_id_series.values
     adata.obs["malignancy"]      = 0.0          # overwritten by labellers.py
     adata.obs["malignancy_known"] = False       # True only where a real label exists (see labellers.py)
@@ -139,11 +141,22 @@ def load_mouse_scrna(h5ad_path: str) -> ad.AnnData:
     """
     Load GSE288003 (mouse lung cells, e-cig aerosol).
     Ortholog mapping happens in transforms.py, not here.
+
+    obs["species"] is stamped "mouse" and every subject/animal id is
+    namespaced ("mouse::<id>") so it can never collide with a human
+    subject_id sharing the same raw string once this source is merged
+    with anything else — see data/species_policy.py. This is the ONLY
+    loader that produces non-human cells; every other loader in this
+    module defaults to species="human" via _attach_standard_obs.
     """
+    from data.species_policy import namespace_subject_id
+
     adata = sc.read_h5ad(h5ad_path)
     sid   = (adata.obs["donor_id"].astype(str)
              if "donor_id" in adata.obs.columns
              else pd.Series(["mouse_unknown"] * adata.n_obs, index=adata.obs_names))
-    adata = _attach_standard_obs(adata, "vape", sid, "mouse_scrna", False)
-    print(f"[loader] mouse scrna {adata.n_obs:>6,} cells    vape  {Path(h5ad_path).name}")
+    sid   = sid.map(lambda s: namespace_subject_id(s, SPECIES_MOUSE))
+    adata = _attach_standard_obs(adata, "vape", sid, "mouse_scrna", False, species=SPECIES_MOUSE)
+    print(f"[loader] mouse scrna {adata.n_obs:>6,} cells    vape  {Path(h5ad_path).name}  "
+          f"(species=mouse, subjects namespaced)")
     return adata

@@ -76,31 +76,60 @@ def harmonize_gene_ids(adata: ad.AnnData, mapping: Optional[dict] = None) -> ad.
     return adata
 
 
-def map_mouse_to_human(adata: ad.AnnData) -> ad.AnnData:
+def map_mouse_to_human(
+    adata: ad.AnnData,
+    artifact: Optional[object] = None,
+    artifact_path: Optional[str] = None,
+) -> ad.AnnData:
     """
-    Convert mouse gene symbols → human 1:1 orthologs via PyBiomart.
+    Convert mouse gene symbols → human orthologs using a versioned
+    OrthologMappingArtifact (data/ortholog.py) — never a silent "pick the
+    first match" for a mouse gene with multiple candidate human orthologs.
+
+    Resolution order:
+      1. `artifact` (an OrthologMappingArtifact instance) if passed directly
+         — the way tests/fixtures inject a small fixed mapping without any
+         network access.
+      2. `artifact_path` — a cached artifact previously saved via
+         OrthologMappingArtifact.save().
+      3. A live PyBiomart query (data/ortholog.py::fetch_live_biomart_pairs),
+         resolved through the same one_to_one_only policy and NOT cached to
+         disk automatically (callers building a reusable artifact should do
+         that once via ortholog.py's CLI/build_ortholog_artifact and pass
+         artifact_path from then on).
+
+    Failure (no network, PyBiomart unavailable, and neither artifact nor
+    artifact_path given) prints and returns `adata` unchanged, matching
+    this function's previous best-effort behaviour — a caller in a
+    network-isolated environment should pass a cached artifact_path
+    instead of relying on this fallback.
+
     Novel: enables GSE288003 (only vape scRNA-seq) to train in human gene space.
     """
-    try:
-        from pybiomart import Dataset
-        ds    = Dataset(name="mmusculus_gene_ensembl", host="http://www.ensembl.org")
-        ortho = ds.query(
-            attributes=["external_gene_name", "hsapiens_homolog_associated_gene_name"],
-            only_unique=False,
-        )
-        ortho.columns = ["mouse_gene", "human_gene"]
-        ortho = ortho.dropna().drop_duplicates("mouse_gene")
-        omap  = dict(zip(ortho["mouse_gene"], ortho["human_gene"]))
-    except Exception as e:
-        print(f"[transform] ortholog mapping unavailable ({e}) — skipping")
-        return adata
+    from data.ortholog import OrthologMappingArtifact, build_ortholog_artifact, fetch_live_biomart_pairs
 
+    if artifact is None and artifact_path:
+        artifact = OrthologMappingArtifact.load(artifact_path)
+
+    if artifact is None:
+        try:
+            pairs = fetch_live_biomart_pairs()
+            artifact = build_ortholog_artifact(pairs, source="ensembl_biomart_live")
+        except Exception as e:
+            print(f"[transform] ortholog mapping unavailable ({e}) — skipping")
+            return adata
+
+    omap = artifact.mapping
     new_names = [omap.get(g, "") for g in adata.var_names]
     valid     = [i for i, n in enumerate(new_names) if n]
     adata     = adata[:, valid].copy()
     adata.var_names = [new_names[i] for i in valid]
     adata.var_names_make_unique()
-    print(f"[transform] {len(valid):,} mouse genes → human orthologs retained")
+    adata.uns["ortholog_mapping_fingerprint"] = artifact.fingerprint()
+    adata.uns["ortholog_mapping_policy"] = artifact.policy
+    print(f"[transform] {len(valid):,}/{len(new_names):,} "
+          f"mouse genes → human orthologs retained (policy={artifact.policy}, "
+          f"fingerprint {artifact.fingerprint()[:12]}...)")
     return adata
 
 

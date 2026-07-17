@@ -27,7 +27,24 @@ def load_config(config: Union[dict, str, Path]) -> dict:
 
 
 def _load_all_sources(cfg: dict) -> list:
-    """Shared source-loading step for run_pipeline() and run_pipeline_split_aware()."""
+    """
+    Shared source-loading step for run_pipeline() and run_pipeline_split_aware().
+
+    data.experiment_mode (default "human_only" — see constants.py,
+    data/species_policy.py) gates whether the mouse source (GSE288003,
+    gse288003_path) is loaded at all. human_only (the default) never loads
+    it, regardless of whether gse288003_path is configured — a config
+    written before species separation existed must not silently start
+    mixing mouse cells into a human run just because the path is still
+    present in configs/default.yaml. Loading it requires explicitly setting
+    experiment_mode to "mouse_only", "cross_species_pretraining", or
+    "cross_species_domain_adaptation".
+    """
+    from constants import EXPERIMENT_MODE_HUMAN_ONLY
+    from data.species_policy import species_allowed, validate_experiment_mode
+    from constants import SPECIES_HUMAN, SPECIES_MOUSE
+
+    experiment_mode = validate_experiment_mode(cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY))
     adatas = []
 
     def _exists(path: str) -> bool:
@@ -36,17 +53,24 @@ def _load_all_sources(cfg: dict) -> list:
             print(f"[preprocess] skip  {path}  (not found — run downloaders.py / converters.py)")
         return ok
 
-    for path, stype, scol in cfg.get("scrna_sources", []):
-        if _exists(path):
-            adatas.append(normalize(qc_filter(harmonize_gene_ids(load_scrna(path, stype, scol)))))
+    if species_allowed(experiment_mode, SPECIES_HUMAN):
+        for path, stype, scol in cfg.get("scrna_sources", []):
+            if _exists(path):
+                adatas.append(normalize(qc_filter(harmonize_gene_ids(load_scrna(path, stype, scol)))))
 
-    for path, stype in cfg.get("microarray_sources", []):
-        if _exists(path):
-            adatas.append(normalize(harmonize_gene_ids(load_microarray(path, stype))))
+        for path, stype in cfg.get("microarray_sources", []):
+            if _exists(path):
+                adatas.append(normalize(harmonize_gene_ids(load_microarray(path, stype))))
 
-    if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
-        a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
-        adatas.append(normalize(qc_filter(a)))
+    if species_allowed(experiment_mode, SPECIES_MOUSE):
+        if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
+            a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
+            adatas.append(normalize(qc_filter(a)))
+    elif cfg.get("gse288003_path"):
+        print(f"[preprocess] skip  {cfg['gse288003_path']}  (mouse source — "
+              f"experiment_mode={experiment_mode!r} does not include species=mouse; "
+              "set data.experiment_mode to mouse_only/cross_species_pretraining/"
+              "cross_species_domain_adaptation to include it)")
 
     if not adatas:
         raise ValueError(
@@ -117,35 +141,10 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     """
     cfg    = load_config(config)
     cfg    = cfg.get("data", cfg)  # configs/default.yaml nests these under "data:"
-    adatas = []
+    adatas = _load_all_sources(cfg)
 
-    def _exists(path: str) -> bool:
-        ok = Path(path).exists()
-        if not ok:
-            print(f"[preprocess] skip  {path}  (not found — run downloaders.py / converters.py)")
-        return ok
-
-    for path, stype, scol in cfg.get("scrna_sources", []):
-        if _exists(path):
-            adatas.append(normalize(qc_filter(harmonize_gene_ids(load_scrna(path, stype, scol)))))
-
-    for path, stype in cfg.get("microarray_sources", []):
-        if _exists(path):
-            adatas.append(normalize(harmonize_gene_ids(load_microarray(path, stype))))
-
-    if cfg.get("gse288003_path") and _exists(cfg["gse288003_path"]):
-        a = map_mouse_to_human(load_mouse_scrna(cfg["gse288003_path"]))
-        adatas.append(normalize(qc_filter(a)))
-
-    if not adatas:
-        raise ValueError(
-            "No data sources found. Run:\n"
-            "  python3 src/data/downloaders.py --all\n"
-            "  python3 src/data/converters.py --all\n"
-            "or pass a config with paths to already-converted files."
-        )
-
-    merged = merge_sources(*adatas)
+    from constants import EXPERIMENT_MODE_HUMAN_ONLY
+    merged = merge_sources(*adatas, experiment_mode=cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY))
     merged = smoke_aware_hvg(merged, n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT))
     merged = batch_correct(merged)
     # cell_type_allow_diagnostic_fallback defaults to False (fail-closed on
@@ -279,8 +278,10 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     from data.splitting import load_or_create_split, subject_train_val_test_split
     from train import CellLevelDataset
 
+    from constants import EXPERIMENT_MODE_HUMAN_ONLY
+    experiment_mode = cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY)
     adatas = _load_all_sources(cfg)
-    merged = merge_sources(*adatas, scale=False)   # gene intersection + concat only, NOT scaled
+    merged = merge_sources(*adatas, scale=False, experiment_mode=experiment_mode)   # gene intersection + concat only, NOT scaled
 
     # ── 2. Final labels BEFORE anything that depends on them ────────────────
     if cfg.get("nlst_csv"):
@@ -389,7 +390,27 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     merged = apply_preprocessing(merged, artifact)
 
     # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────
-    allow_transductive = pp_cfg.get("batch_correction", {}).get("allow_transductive_harmony", False)
+    bc_cfg = pp_cfg.get("batch_correction", {})
+    bc_mode = bc_cfg.get("mode", "none")
+    valid_bc_modes = {"none", "train_fitted_inductive", "transductive_diagnostic_only"}
+    if bc_mode not in valid_bc_modes:
+        raise ValueError(
+            f"preprocessing.batch_correction.mode={bc_mode!r} is not one of {sorted(valid_bc_modes)}."
+        )
+    if bc_mode == "train_fitted_inductive":
+        raise ValueError(
+            "preprocessing.batch_correction.mode='train_fitted_inductive' was requested, but "
+            "Harmony (this project's only implemented batch-correction method) has no "
+            "train-only-fit / apply-to-new-data transform — there is no inductive "
+            "implementation to run. Use mode='none' (default, leakage-free) or explicitly "
+            "opt into mode='transductive_diagnostic_only' for a disclosed non-leakage-free "
+            "diagnostic run outside frozen-test evaluation."
+        )
+    # Legacy boolean is equivalent to mode='transductive_diagnostic_only'.
+    allow_transductive = (
+        bc_mode == "transductive_diagnostic_only"
+        or bc_cfg.get("allow_transductive_harmony", False)
+    )
     if allow_transductive:
         print("[preprocess] preprocessing.batch_correction.allow_transductive_harmony=True — "
               "running Harmony across the FULL merged dataset (train+val+test). This step is "
