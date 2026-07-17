@@ -1,0 +1,212 @@
+# configs/datasets.yaml — dataset manifest seed.
+#
+# Facts that don't depend on which files happen to be present in a given
+# environment: accession, official record URL, species, assay type,
+# identifier fields, and documented label limitations. src/data/manifest.py
+# reads this file and fills in the parts that DO depend on the local
+# filesystem (raw_file_checksums, files_present) to produce the full
+# manifest at data/processed/dataset_manifest.json.
+#
+# raw_subdir mirrors src/data/downloaders.py's GEO_DATASETS/TCGA_DATASETS
+# registry subdirectories exactly — this file does not duplicate download
+# logic, only the provenance facts a manifest needs to describe a dataset
+# whether or not it has actually been downloaded in this environment.
+#
+# Every fact below that could not be independently re-verified via network
+# access in this environment is carried over from this repository's
+# existing, already-reviewed provenance documentation (converters.py /
+# downloaders.py docstrings, README.md's "Where the data comes from"
+# section) — see README.md's dataset-status table for the explicit
+# implemented / adapter-only / controlled-access-blocked breakdown.
+
+datasets:
+  - dataset_id: gse136831
+    accession: GSE136831
+    raw_subdir: cigarette/GSE136831
+    source_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE136nnn/GSE136831/
+    official_record_url: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136831
+    publication_reference: "Habermann et al., Sci Adv 2020 (Vanderbilt/interstitial lung disease atlas)"
+    species: human
+    genome_build: GRCh38
+    gene_identifier_type: gene_symbol
+    assay_type: single_cell_rna_seq
+    matrix_representation: sparse_mtx_triplet
+    subject_identifier_field: Subject_Identity
+    sample_identifier_field: Sample_Identity
+    cell_identifier_field: CellBarcode_Identity
+    smoke_metadata_fields: []
+    cancer_metadata_fields: []
+    malignancy_metadata_fields: []
+    label_policy_version: "1"
+    license_or_access_level: public_geo
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names:
+      - GSE136831_RawCounts_Sparse.mtx.gz
+      - GSE136831_AllCells.GeneIDs.txt.gz
+      - GSE136831_AllCells.cellBarcodes.txt.gz
+      - GSE136831_AllCells.Samples.CellType.MetadataTable.txt.gz
+    known_limitations:
+      - "This accession is the Vanderbilt/Habermann interstitial lung disease atlas (COPD/IPF/Control), not a dedicated smoking cohort — it has no verified per-subject cigarette-exposure field."
+      - "Disease_Identity=COPD is used only as a documented weak proxy for cigarette exposure (smoke_label_method=weak_proxy, confidence=low) when data.weak_labels.enabled=true; it is never the default verified smoke_type source."
+
+  - dataset_id: gse288003
+    accession: GSE288003
+    raw_subdir: vape/GSE288003
+    source_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE288nnn/GSE288003/
+    official_record_url: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE288003
+    publication_reference: null
+    species: mouse
+    genome_build: GRCm39
+    gene_identifier_type: gene_symbol
+    assay_type: single_cell_rna_seq
+    matrix_representation: sparse_mtx_10x_triplet
+    subject_identifier_field: donor_id
+    sample_identifier_field: GSM_id
+    cell_identifier_field: barcode
+    smoke_metadata_fields: [condition]
+    cancer_metadata_fields: []
+    malignancy_metadata_fields: []
+    label_policy_version: "1"
+    license_or_access_level: public_geo
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names: []  # per-GSM 10x triples extracted from *_RAW.tar; filenames vary per sample, see downloaders.py::_extract_tar
+    known_limitations:
+      - "Mouse data — never merged with human sources except under an explicit cross-species experiment_mode (see src/data/species_policy.py); default experiment_mode=human_only excludes it entirely."
+      - "smoke_type per cell comes from the real per-GSM condition (Con/E-cigs) recorded in the sample filename, not an accession-level blanket default."
+      - "Ortholog mapping to human gene symbols is lossy (unmapped/ambiguous genes are dropped) — see src/data/ortholog.py."
+
+  - dataset_id: gse123352
+    accession: GSE123352
+    raw_subdir: cigarette/GSE123352
+    source_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE123nnn/GSE123352/
+    official_record_url: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE123352
+    publication_reference: null
+    species: human
+    genome_build: null
+    gene_identifier_type: illumina_probe_id_ILMN
+    assay_type: bulk_microarray
+    matrix_representation: pseudo_bulk_samples_x_genes
+    subject_identifier_field: sample_id
+    sample_identifier_field: sample_id
+    cell_identifier_field: null
+    smoke_metadata_fields: [ever_never_smoker]
+    cancer_metadata_fields: []
+    malignancy_metadata_fields: []
+    label_policy_version: "1"
+    license_or_access_level: public_geo
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names:
+      - GSE123352_series_matrix.txt.gz
+      - GPL10558.annot.gz
+    known_limitations:
+      - "176 subjects, ever/never-smoker status per series metadata — treated as accession-provided sample-level metadata, not independently re-verified in this environment (no network access to GEO during this change)."
+
+  - dataset_id: gse307690_canuck
+    accession: GSE307690
+    raw_subdir: cannabis/GSE307690
+    source_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE307nnn/GSE307690/
+    official_record_url: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE307690
+    publication_reference: "CANUCK study (Halayko/Tam et al.) — human airway epithelium, cannabis exposure"
+    species: human
+    genome_build: null
+    gene_identifier_type: gene_symbol
+    assay_type: bulk_microarray_or_rnaseq
+    matrix_representation: pseudo_bulk_samples_x_genes
+    subject_identifier_field: sample_id
+    sample_identifier_field: sample_id
+    cell_identifier_field: null
+    smoke_metadata_fields: [cannabis_never_smoker]
+    cancer_metadata_fields: []
+    malignancy_metadata_fields: []
+    label_policy_version: "1"
+    license_or_access_level: public_geo
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names:
+      - GSE307690_series_matrix.txt.gz
+      - GSE307690_processed_data.txt.gz
+    known_limitations:
+      - "139 cannabis smokers + 57 never-smokers per accession description (existing repository documentation) — not independently re-verified in this environment; sample-level completeness must be confirmed by the deterministic completeness report (src/data/completeness.py) at conversion time, not assumed from the accession description."
+
+  - dataset_id: tcga_luad
+    accession: TCGA-LUAD
+    raw_subdir: malignancy/TCGA-LUAD
+    source_url: https://api.gdc.cancer.gov/
+    official_record_url: https://portal.gdc.cancer.gov/projects/TCGA-LUAD
+    publication_reference: "TCGA Research Network — LUAD"
+    species: human
+    genome_build: GRCh38
+    gene_identifier_type: ensembl_gene_id
+    assay_type: bulk_rna_seq
+    matrix_representation: bulk_samples_x_genes
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    smoke_metadata_fields: []
+    cancer_metadata_fields: [sample_type, primary_diagnosis]
+    malignancy_metadata_fields: [sample_type]
+    label_policy_version: "1"
+    license_or_access_level: public_open_gdc
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names: []  # per-case HTSeq/STAR count files, one per GDC file_id — see downloaders.py::download_tcga
+    known_limitations:
+      - "TCGA does not carry verified per-patient smoking history in this pipeline — smoke_type is never defaulted to cigarette for TCGA samples; see data.tcga.mode=bulk gate (assay_mode=bulk_tcga) that keeps this out of the single-cell training loader."
+      - "sample_type (tumor vs. solid-tissue-normal) supports a bulk tumor/normal label only within the explicit bulk_tcga experiment mode; it does not provide per-cell malignancy labels for unrelated single-cell datasets."
+      - "Primarily bulk RNA-seq, not single-cell — never combined with single-cell sources except through the explicit bulk_tcga assay mode."
+
+  - dataset_id: tcga_lusc
+    accession: TCGA-LUSC
+    raw_subdir: malignancy/TCGA-LUSC
+    source_url: https://api.gdc.cancer.gov/
+    official_record_url: https://portal.gdc.cancer.gov/projects/TCGA-LUSC
+    publication_reference: "TCGA Research Network — LUSC"
+    species: human
+    genome_build: GRCh38
+    gene_identifier_type: ensembl_gene_id
+    assay_type: bulk_rna_seq
+    matrix_representation: bulk_samples_x_genes
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    smoke_metadata_fields: []
+    cancer_metadata_fields: [sample_type, primary_diagnosis]
+    malignancy_metadata_fields: [sample_type]
+    label_policy_version: "1"
+    license_or_access_level: public_open_gdc
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names: []
+    known_limitations:
+      - "Same TCGA bulk/smoking limitations as TCGA-LUAD above."
+
+  - dataset_id: nlst
+    accession: NLST
+    raw_subdir: subjects/NLST
+    source_url: https://cdas.cancer.gov/nlst/
+    official_record_url: https://cdas.cancer.gov/nlst/
+    publication_reference: "National Lung Screening Trial Research Team, NEJM 2011"
+    species: human
+    genome_build: null
+    gene_identifier_type: null
+    assay_type: clinical_tabular
+    matrix_representation: subject_level_csv
+    subject_identifier_field: pid
+    sample_identifier_field: null
+    cell_identifier_field: null
+    smoke_metadata_fields: [CIGSMOK, CIGAR]
+    cancer_metadata_fields: [candx]
+    malignancy_metadata_fields: []
+    label_policy_version: "1"
+    license_or_access_level: controlled_access_dua_required
+    controlled_access: true
+    synthetic_or_real: real
+    raw_file_names:
+      - screen.csv
+      - prsn.csv
+    known_limitations:
+      - "Controlled access — requires an approved NCI Data Use Agreement. Not accessed in this environment; see src/data/downloaders.py::print_nlst_instructions for the exact authorized-access steps."
+      - "No participant-level NLST data is committed to this repository under any circumstance; only a schema-compatible synthetic fixture is used for CI."
