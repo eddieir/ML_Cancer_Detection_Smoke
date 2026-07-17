@@ -372,3 +372,17 @@ def test_mil_final_fit_trains_on_every_eligible_development_subject(monkeypatch)
 
     assert seen["phase2_subjects"] == set(fitted.dev_subject_ids)
     assert seen["phase1_subjects"] >= seen["phase2_subjects"]
+
+
+def test_final_dev_fit_artifact_fingerprint_matches_canonical_scientific_fingerprint():
+    """FittedFinalCandidate.preprocessing_artifact_fingerprint must be the
+    SAME identity data/preprocessing.py::PreprocessingArtifact.
+    scientific_fingerprint() would compute directly — one fingerprint
+    hierarchy, not two that could silently disagree."""
+    ctx = build_synthetic_context(seed=5, fast=True)
+    outcomes, dev_subjects, num_cell_types, min_cells, n_hvgs = _dev_pool(ctx)
+
+    fitted = fit_final_candidate_on_dev_pool(
+        ctx, "logistic", dev_subjects, outcomes, {}, num_cell_types, min_cells, n_hvgs, device="cpu", seed=42,
+    )
+    assert fitted.preprocessing_artifact_fingerprint == fitted.preprocessing_artifact.scientific_fingerprint()

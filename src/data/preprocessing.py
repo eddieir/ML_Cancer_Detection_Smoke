@@ -83,7 +83,10 @@ _FINGERPRINT_FIELDS = (
     "cell_type_annotation_mode", "cell_type_annotation_degraded",
     "cell_type_annotation_compatibility", "missing_gene_policy",
     "duplicate_gene_policy", "unexpected_gene_policy", "minimum_gene_coverage",
+    "batch_correction_status",
 )
+
+_VALID_BATCH_CORRECTION_STATUSES = frozenset({"disabled", "transductive_diagnostic_only"})
 
 # The only input stages apply_preprocessing()/predict_h5ad() know how to
 # handle — see inference.py. "normalized_expression" is what this artifact's
@@ -156,6 +159,21 @@ class PreprocessingArtifact:
     duplicate_gene_policy:      str = DEFAULT_DUPLICATE_GENE_POLICY
     unexpected_gene_policy:     str = DEFAULT_UNEXPECTED_GENE_POLICY
     minimum_gene_coverage:      float = DEFAULT_MINIMUM_GENE_COVERAGE
+    # Whether the RUN that produced this artifact also opted into batch
+    # correction — see data/transforms.py's UnsafeBatchCorrectionError
+    # module docstring for why "train_fitted_inductive" is not a value that
+    # can occur here (no inductive implementation exists). Note this
+    # artifact's OWN fitted state (gene selection, scaling means/stds) never
+    # includes Harmony's output either way — preprocess.py runs Harmony
+    # AFTER apply_preprocessing, on the already gene-selected/scaled
+    # output, never before or during this artifact's own fit. "disabled"
+    # (default) means the run never opted into batch correction at all;
+    # "transductive_diagnostic_only" means Harmony ran, across the full
+    # train+val+test dataset, as a disclosed, non-leakage-free diagnostic
+    # step downstream of this artifact — assert_batch_correction_safe()
+    # (data/transforms.py) refuses to let a run in this state reach
+    # CV/OOF/final-dev-pool/frozen-test evaluation.
+    batch_correction_status:    str = "disabled"
     # Wall-clock creation time (time.time()) — informational only, excluded
     # from scientific_fingerprint() (see _FINGERPRINT_FIELDS above). None
     # for artifacts fit before this field existed.
@@ -202,6 +220,12 @@ class PreprocessingArtifact:
                 f"PreprocessingArtifact: minimum_gene_coverage={self.minimum_gene_coverage!r} "
                 "must be in (0.0, 1.0]."
             )
+        if self.batch_correction_status not in _VALID_BATCH_CORRECTION_STATUSES:
+            raise GeneContractError(
+                f"PreprocessingArtifact: batch_correction_status="
+                f"{self.batch_correction_status!r} is not one of "
+                f"{sorted(_VALID_BATCH_CORRECTION_STATUSES)}."
+            )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -236,6 +260,7 @@ class PreprocessingArtifact:
             "duplicate_gene_policy": self.duplicate_gene_policy,
             "unexpected_gene_policy": self.unexpected_gene_policy,
             "minimum_gene_coverage": self.minimum_gene_coverage,
+            "batch_correction_status": self.batch_correction_status,
             "cell_type_annotation_mode": self.cell_type_annotation_mode,
             "cell_type_annotation_degraded": self.cell_type_annotation_degraded,
             "cell_type_map_fingerprint": self.cell_type_map_fingerprint,
@@ -301,6 +326,7 @@ def fit_preprocessing(
     duplicate_gene_policy:  str = DEFAULT_DUPLICATE_GENE_POLICY,
     unexpected_gene_policy: str = DEFAULT_UNEXPECTED_GENE_POLICY,
     minimum_gene_coverage:  float = DEFAULT_MINIMUM_GENE_COVERAGE,
+    batch_correction_status: str = "disabled",
 ) -> PreprocessingArtifact:
     """
     Fit gene mean/std scaling + smoke-aware HVG selection using ONLY cells
@@ -389,6 +415,7 @@ def fit_preprocessing(
         duplicate_gene_policy=duplicate_gene_policy,
         unexpected_gene_policy=unexpected_gene_policy,
         minimum_gene_coverage=minimum_gene_coverage,
+        batch_correction_status=batch_correction_status,
         notes=[
             "Batch correction (Harmony) is NOT part of this artifact: Harmony has "
             "no native train-only-fit / apply-to-new-data transform, so it cannot "

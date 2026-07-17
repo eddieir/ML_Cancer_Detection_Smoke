@@ -214,12 +214,30 @@ fit/apply split was already correct: previously, `missing_gene_policy` was
 declared in config but never actually read by `apply_preprocessing`, and a
 checkpoint recorded only a (never-populated) artifact *path*, not the
 artifact's actual fitted content — so a checkpoint could silently be paired
-with any file that happened to sit at that path. Per-fold artifacts
-(`src/benchmarks/fold_preprocessing.py`, already fit independently per
-fold before this change) and the frozen-test guard
+with any file that happened to sit at that path. The frozen-test guard
 (`src/benchmarks/test_guard.py`, already a durable, atomically-acquired
-one-time lock) were audited and are unchanged — both already met the bar
-this section describes.
+one-time lock) was audited and is unchanged — it already met the bar this
+section describes.
+
+### Per-fold preprocessing artifacts
+
+Every CV fold already refit its own `PreprocessingArtifact` from only that
+fold's training subjects (`src/benchmarks/fold_preprocessing.py`,
+`refit_artifact_for_fold`) — that part predates this change. What was
+missing was persistence: a fold's artifact lived only in memory for the
+duration of the run. `save_fold_artifact()`/`load_fold_artifact()` now
+persist each fold's artifact to
+`<output_root>/preprocessing/fold_XX/{artifact.json,manifest.json}`
+(`run_smoke_cv`/`run_cancer_cv`'s optional `artifact_output_root` parameter
+wires this in; `runner.py`'s benchmark CLI always passes the run's own
+output directory). `manifest.json` is written last, after `artifact.json`
+is fully and atomically on disk, and records the fold's train/val-subject
+fingerprints and its own artifact fingerprint — `load_fold_artifact()`
+verifies all of this before returning anything, rejects an
+incomplete/interrupted persist (`IncompleteFoldArtifactError`), and rejects
+a resume attempt whose expected subjects don't match what was actually
+persisted (`FoldArtifactMismatchError`) — so one fold's persisted artifact
+can never be silently reused for a different fold.
 
 ### Batch correction
 
@@ -231,6 +249,85 @@ frozen-test evaluation. `train_fitted_inductive` is accepted as a config
 value but currently always raises: Harmony has no train-only-fit /
 apply-to-new-data transform, so there is no inductive implementation behind
 that name yet.
+
+A run that opted into `transductive_diagnostic_only` now carries that fact
+on `ExperimentContext.transductive_batch_correction` all the way through:
+`assert_batch_correction_safe()` (`src/data/transforms.py`) is called at
+the entry point of every leakage-free protocol — grouped CV/OOF fold
+refitting, the final development-pool fit, and immediately before the
+frozen-test guard is acquired — and raises `UnsafeBatchCorrectionError`
+if that flag is set, rather than letting a transductively-corrected run
+quietly reach any of them. `PreprocessingArtifact.batch_correction_status`
+(`"disabled"` or `"transductive_diagnostic_only"`) records which state a
+given artifact's run was in and is part of its scientific fingerprint.
+There remains no inductive (train-only-fit, apply-to-new-data) batch
+correction implementation in this project — Harmony is transductive by
+construction, and this change does not claim otherwise; it only makes the
+transductive state impossible to smuggle into a leakage-free protocol.
+
+### Model bundles
+
+A deployable bundle (`src/benchmarks/bundle.py`) is a directory containing
+a model checkpoint, a copy of the `PreprocessingArtifact` it was trained
+with, and one `bundle_manifest.json` recording: model configuration, class
+vocabulary, label policy, species policy, assay mode, dataset-manifest and
+split fingerprints, calibration state and decision threshold (when
+applicable), an environment snapshot, and a SHA-256 for every referenced
+file plus one `bundle_fingerprint` covering the whole manifest.
+`Trainer.write_bundle()` builds one from an already-saved checkpoint and
+whatever `PreprocessingArtifact` was wired in via
+`set_preprocessing_artifact()`. `load_and_validate_bundle()` re-hashes and
+re-derives every one of those fields on load and raises a specific error
+(`BundleCorruptionError` for a missing/unparsable/wrong-schema manifest,
+`BundleValidationError` for any hash/fingerprint/gene-count mismatch) the
+instant anything doesn't match — including another fold's artifact being
+substituted in, or the gene list being altered after the fact.
+`validate_bundle_for_model()` additionally checks a constructed model's
+`input_dim`/`num_smoke` against the bundle's own artifact/class vocabulary.
+A directory with a checkpoint but no `bundle_manifest.json` at all (a
+legacy, pre-Phase-4 checkpoint) raises `LegacyBundleError` unless the
+caller passes `allow_legacy=True` explicitly — and even then, no bundle
+validation runs at all, so a legacy checkpoint loaded this way is never
+described as bundle-verified.
+
+### Frozen-test access sentinels
+
+`src/benchmarks/sentinel.py`'s `FrozenAccessSentinel` is a stand-in object
+that raises `FrozenDataAccessError` on essentially any attempt to read it —
+attribute access, iteration, indexing, `len()`, array/DataFrame conversion,
+even `repr()`. It complements (does not replace) the durable
+`FrozenTestGuard`: the guard controls *when* the one sanctioned
+test-touching function may run at all; a sentinel lets a test wrap real
+test data and run the *entire* development pipeline (CV, OOF generation,
+the final development-pool fit) against it, turning "the dev pipeline never
+touches test data" from a code-review claim into something that fails
+loudly, with a traceback pointing at the exact call site, if it's ever
+violated.
+
+### Environment snapshot
+
+`benchmarks/reporting.py::write_environment_artifact` records Python
+version, platform, installed versions of every scientific dependency this
+project's behavior depends on (numpy, pandas, scikit-learn, torch, scanpy,
+anndata, scipy, ...), CUDA availability/version (when torch is installed),
+whether `torch.use_deterministic_algorithms` is enabled, the run's random
+seed, its config fingerprint, and the git commit SHA — written atomically
+as `environment.json`, referenced from `Trainer.write_bundle()`'s model
+bundles. It never records a username, hostname, environment-variable dump,
+or absolute local path, and recording a seed is not a claim of exact
+cross-machine numerical determinism (see Limitations).
+
+### Artifact and bundle CLI
+
+`python3 src/inference.py --inspect-artifact path/to/artifact.json` prints
+a read-only JSON summary of a `PreprocessingArtifact` (schema version,
+fingerprint, gene count, gene-contract policy, provenance) — no checkpoint
+or model needed. `--validate-artifact path/to/artifact.json` loads it,
+runs its own integrity checks, and prints `OK`/exits 0 on success or prints
+the error/exits 1 on failure. `--allow-legacy-checkpoint` is the explicit,
+never-default opt-in to load a checkpoint with no
+`preprocessing_artifact.json` next to it (maps to
+`Predictor.from_config`'s `unsafe_legacy_mode`).
 
 ### Dataset manifest
 

@@ -12,7 +12,10 @@ import pandas as pd
 import yaml
 
 from data.loaders    import load_scrna, load_microarray, load_mouse_scrna
-from data.transforms import map_mouse_to_human, harmonize_gene_ids, qc_filter, normalize, smoke_aware_hvg, batch_correct, annotate_cell_types
+from data.transforms import (
+    map_mouse_to_human, harmonize_gene_ids, qc_filter, normalize, smoke_aware_hvg, batch_correct,
+    annotate_cell_types, DEFAULT_BATCH_CORRECTION_MODE, DEFAULT_ALLOW_TRANSDUCTIVE_HARMONY,
+)
 from data.labellers  import transfer_nlst_labels, add_malignancy_labels, compute_smoke_class_weights, apply_weak_smoke_proxies
 from data.assembly   import merge_sources, assemble_subject_bags, export_cell_dataset
 from constants       import N_HVGS_DEFAULT
@@ -520,21 +523,15 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     # here are exactly what every fold and the outer split will see.
     normalized_adata_for_refit = merged
 
-    # ── 5/6. Fit preprocessing on train only, apply to everyone ─────────────
-    artifact = fit_preprocessing(
-        merged, set(manifest.train_subjects),
-        n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT),
-    )
-    artifact.label_mapping = label_mapping.to_dict()
-    # Cell-type annotation provenance (which fixed label-name -> ID table
-    # produced obs["cell_type_id"], set by annotate_cell_types above) is
-    # already copied onto `artifact` by fit_preprocessing() itself, straight
-    # from `merged.uns` — see data/preprocessing.py::fit_preprocessing.
-    merged = apply_preprocessing(merged, artifact)
-
-    # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────
+    # ── Resolve the batch-correction mode BEFORE fitting preprocessing, so
+    # the artifact's own batch_correction_status field records the actual
+    # resolved mode this run will use, rather than a value patched on after
+    # construction (data/preprocessing.py::PreprocessingArtifact is treated
+    # as immutable once built — see fit/apply contract notes there). Harmony
+    # itself still runs AFTER apply_preprocessing below (unchanged
+    # ordering); only the mode validation/lookup moved earlier.
     bc_cfg = pp_cfg.get("batch_correction", {})
-    bc_mode = bc_cfg.get("mode", "none")
+    bc_mode = bc_cfg.get("mode", DEFAULT_BATCH_CORRECTION_MODE)
     valid_bc_modes = {"none", "train_fitted_inductive", "transductive_diagnostic_only"}
     if bc_mode not in valid_bc_modes:
         raise ValueError(
@@ -552,8 +549,25 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     # Legacy boolean is equivalent to mode='transductive_diagnostic_only'.
     allow_transductive = (
         bc_mode == "transductive_diagnostic_only"
-        or bc_cfg.get("allow_transductive_harmony", False)
+        or bc_cfg.get("allow_transductive_harmony", DEFAULT_ALLOW_TRANSDUCTIVE_HARMONY)
     )
+
+    # ── 5/6. Fit preprocessing on train only, apply to everyone ─────────────
+    artifact = fit_preprocessing(
+        merged, set(manifest.train_subjects),
+        n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT),
+        batch_correction_status=(
+            "transductive_diagnostic_only" if allow_transductive else "disabled"
+        ),
+    )
+    artifact.label_mapping = label_mapping.to_dict()
+    # Cell-type annotation provenance (which fixed label-name -> ID table
+    # produced obs["cell_type_id"], set by annotate_cell_types above) is
+    # already copied onto `artifact` by fit_preprocessing() itself, straight
+    # from `merged.uns` — see data/preprocessing.py::fit_preprocessing.
+    merged = apply_preprocessing(merged, artifact)
+
+    # ── 7. Batch correction: strict (skipped) unless explicitly opted in ────
     if allow_transductive:
         print("[preprocess] preprocessing.batch_correction.allow_transductive_harmony=True — "
               "running Harmony across the FULL merged dataset (train+val+test). This step is "

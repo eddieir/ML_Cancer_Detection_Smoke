@@ -779,6 +779,54 @@ class Trainer:
         torch.save(payload, path)
         self._log(f"    ✓ checkpoint saved  ({metric_name}={metric:.4f})")
 
+    def write_bundle(
+        self,
+        phase: int,
+        bundle_dir: Optional[Union[str, Path]] = None,
+        dataset_manifest_fingerprint: Optional[str] = None,
+        split_fingerprint: Optional[str] = None,
+        calibration_state: Optional[Dict] = None,
+        decision_threshold: Optional[float] = None,
+        environment_snapshot: Optional[Dict] = None,
+    ) -> Path:
+        """
+        Write a full model-bundle manifest (benchmarks/bundle.py) for the
+        checkpoint already saved at ckpt_dir/phase{phase}_best.pt, bound to
+        self.preprocessing_artifact (see set_preprocessing_artifact). Raises
+        ValueError if no artifact is wired in — a bundle with no
+        preprocessing artifact reference is not a real Phase 4 bundle, and
+        this method never fabricates a placeholder one.
+        """
+        from benchmarks.bundle import write_model_bundle
+        from benchmarks.reporting import _environment_snapshot
+
+        if self.preprocessing_artifact is None:
+            raise ValueError(
+                "Trainer.write_bundle: no preprocessing artifact is wired in (see "
+                "set_preprocessing_artifact) — cannot build a model bundle without one."
+            )
+        if environment_snapshot is None:
+            environment_snapshot = _environment_snapshot(synthetic=False, seed=self.seed)
+        ckpt_path = self.ckpt_dir / f"phase{phase}_best.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Trainer.write_bundle: no checkpoint at {ckpt_path} — call _save()/train this "
+                "phase first."
+            )
+        bundle_dir = Path(bundle_dir) if bundle_dir is not None else self.ckpt_dir / f"bundle_phase{phase}"
+        class_vocabulary = self._class_names()
+        species_policy = self.full_cfg.get("data", {}).get("experiment_mode", "human_only")
+        assay_mode = self.full_cfg.get("data", {}).get("assay_mode", "human_single_cell")
+        label_policy = self.rare_class_policy or self.full_cfg.get("data", {}).get("label_policy", "verified_only")
+        return write_model_bundle(
+            bundle_dir, ckpt_path, self.preprocessing_artifact,
+            model_config=self.full_cfg.get("model", {}), class_vocabulary=class_vocabulary,
+            label_policy=label_policy, species_policy=species_policy, assay_mode=assay_mode,
+            dataset_manifest_fingerprint=dataset_manifest_fingerprint, split_fingerprint=split_fingerprint,
+            calibration_state=calibration_state, decision_threshold=decision_threshold,
+            environment_snapshot=environment_snapshot,
+        )
+
     def _load_best(self, phase: int, unsafe_legacy_mode: bool = False) -> Dict:
         """
         Load the best checkpoint for `phase`. Supports both the structured

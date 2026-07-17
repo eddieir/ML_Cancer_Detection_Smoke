@@ -199,8 +199,77 @@ def smoke_aware_hvg(
     return adata
 
 
+class UnsafeBatchCorrectionError(RuntimeError):
+    """Raised when a caller requests batch correction inside a code path
+    that must stay leakage-free (grouped CV/OOF fold refitting, the final
+    development-pool fit, or frozen-test evaluation) — see
+    assert_batch_correction_safe(). Harmony (BATCH_CORRECTION_METHOD below)
+    is the only batch-correction method this project implements, and it has
+    no train-only-fit / apply-to-new-data transform: run_harmony always
+    computes its embedding jointly over every cell it is given, so calling
+    it on anything but the full merged dataset in a deliberately disclosed,
+    non-leakage-free diagnostic run is unsafe by construction. This is not
+    raised by batch_correct() itself (a low-level, context-free function
+    that has no way to know which protocol is calling it) — it is raised by
+    assert_batch_correction_safe(), which every leakage-free entry point
+    (fold_preprocessing.py, final_evaluation.py, runner.py's frozen-test
+    call site) must invoke before doing any batch-correction-adjacent
+    work."""
+
+
+# The only batch-correction method this project implements. Recorded on
+# PreprocessingArtifact.batch_correction_status (see data/preprocessing.py)
+# so a reloaded artifact honestly states whether ANY batch correction
+# contributed to its fitted state — "disabled" for the (default) leakage-
+# free path, "transductive_diagnostic_only" for the explicit, disclosed,
+# non-leakage-free opt-in. There is no "train_fitted_inductive" value here
+# because no inductive implementation exists — see UnsafeBatchCorrectionError.
+BATCH_CORRECTION_METHOD = "harmony"
+BATCH_CORRECTION_IS_INDUCTIVE = False  # harmonypy has no fit-once/apply-later API
+
+# Safe defaults for preprocessing.batch_correction.* — must agree with
+# configs/default.yaml's preprocessing.batch_correction.mode/
+# allow_transductive_harmony keys (see tests/test_config_consistency.py,
+# which fails the build if they ever drift) and with preprocess.py's own
+# `bc_cfg.get("mode", DEFAULT_BATCH_CORRECTION_MODE)` /
+# `bc_cfg.get("allow_transductive_harmony", DEFAULT_ALLOW_TRANSDUCTIVE_HARMONY)`
+# lookups.
+DEFAULT_BATCH_CORRECTION_MODE = "none"
+DEFAULT_ALLOW_TRANSDUCTIVE_HARMONY = False
+
+
+def assert_batch_correction_safe(transductive_batch_correction: bool, context_name: str) -> None:
+    """
+    Call at the start of every code path that must stay leakage-free
+    (grouped CV/OOF fold refitting, the final development-pool fit, and
+    immediately before a frozen-test evaluation is allowed to proceed).
+    Raises UnsafeBatchCorrectionError if `transductive_batch_correction` is
+    True — Harmony's only implemented mode requires joint access to every
+    cell it corrects, so a run that opted into it is, by definition, not
+    safe to feed into a protocol that promises per-fold/per-split isolation
+    or a one-shot frozen-test guarantee. `context_name` is only used to
+    make the error message identify which call site rejected the run.
+    """
+    if transductive_batch_correction:
+        raise UnsafeBatchCorrectionError(
+            f"{context_name}: this run's ExperimentContext has "
+            "transductive_batch_correction=True (Harmony was run across the full "
+            "train+val+test dataset via preprocessing.batch_correction."
+            "allow_transductive_harmony / mode='transductive_diagnostic_only') — this is not "
+            "a leakage-free preprocessing state and must never be used for grouped CV/OOF "
+            "fold refitting, the final development-pool fit, or frozen-test evaluation. "
+            "Re-run with batch correction disabled (the default) for any of these protocols."
+        )
+
+
 def batch_correct(adata: ad.AnnData, batch_key: str = "batch") -> ad.AnnData:
-    """Harmony batch correction on PCA embeddings."""
+    """Harmony batch correction on PCA embeddings — TRANSDUCTIVE: computes
+    the correction embedding jointly over every cell in `adata`, with no
+    way to fit on a subset and apply the same fitted correction to new
+    cells later (harmonypy exposes no such API). Never call this from a
+    code path that promises leakage-free isolation without first calling
+    assert_batch_correction_safe() at that path's own entry point — this
+    function itself has no context to know whether its caller is safe."""
     if batch_key not in adata.obs.columns or adata.obs[batch_key].nunique() < 2:
         print("[transform] harmony skipped — fewer than 2 batches")
         return adata

@@ -96,3 +96,25 @@ def test_trainer_rejects_artifact_with_wrong_gene_count():
     trainer = Trainer(model, {"train": {}}, device="cpu", seed=0)
     with pytest.raises(ValueError):
         trainer.set_preprocessing_artifact(artifact)
+
+
+def test_trainer_write_bundle_end_to_end(tmp_path):
+    """Trainer.write_bundle() (train.py) must produce a bundle
+    load_and_validate_bundle() accepts and that validate_bundle_for_model
+    accepts against the SAME model architecture Trainer used."""
+    from benchmarks.bundle import load_and_validate_bundle, validate_bundle_for_model
+
+    artifact = _artifact(seed=9)
+    model = MultiSmokeCancerNet.from_config(
+        {"model": {"input_dim": len(artifact.gene_list), "num_smoke_types": 6,
+                    "embedding_dim": 16, "attention_dim": 8}},
+    )
+    trainer = Trainer(model, {"train": {"checkpoint_dir": str(tmp_path)}, "data": {}}, device="cpu", seed=0)
+    trainer.set_preprocessing_artifact(artifact)
+    trainer._save(phase=3, metric=0.5, metric_name="macro_f1")
+
+    bundle_dir = trainer.write_bundle(phase=3, dataset_manifest_fingerprint="dmfp", split_fingerprint="spfp")
+    manifest = load_and_validate_bundle(bundle_dir)
+    assert manifest["dataset_manifest_fingerprint"] == "dmfp"
+    assert manifest["split_fingerprint"] == "spfp"
+    validate_bundle_for_model(manifest, model)

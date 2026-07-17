@@ -82,3 +82,27 @@ def test_write_json_roundtrip():
         path = Path(tmp) / "x" / "y.json"
         write_json(path, {"a": 1})
         assert json.loads(path.read_text()) == {"a": 1}
+
+
+def test_environment_artifact_records_cuda_and_determinism_and_seed():
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = new_run_dir(tmp, run_id="env_test_cuda")
+        snapshot = write_environment_artifact(run_dir, synthetic=True, seed=1234, config_fingerprint="abc123")
+        assert "cuda" in snapshot
+        assert "available" in snapshot["cuda"]
+        assert "determinism" in snapshot
+        assert snapshot["determinism"]["seed"] == 1234
+        assert snapshot["config_fingerprint"] == "abc123"
+
+
+def test_environment_artifact_has_no_username_or_hostname_or_absolute_path():
+    import getpass
+    import socket
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = new_run_dir(tmp, run_id="env_test_privacy")
+        snapshot = write_environment_artifact(run_dir, synthetic=True)
+        blob = json.dumps(snapshot)
+        assert getpass.getuser() not in blob
+        assert socket.gethostname() not in blob
+        assert str(Path.home()) not in blob

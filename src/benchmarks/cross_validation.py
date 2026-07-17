@@ -42,6 +42,7 @@ from .fold_preprocessing import (
     bags_from_fold_cell_dataset,
     fold_train_val_datasets,
     require_normalized_adata,
+    save_fold_artifact,
 )
 from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
 from .metrics import (
@@ -196,7 +197,14 @@ def run_smoke_cv(
     context, model_names: Sequence[str], n_folds: int = 5,
     seeds: Sequence[int] = DEFAULT_SEEDS, device: str = "cpu",
     max_cells_per_subject: Optional[int] = None,
+    artifact_output_root: Optional[str] = None,
 ) -> Dict:
+    """
+    artifact_output_root, if given, persists every fold's refit
+    PreprocessingArtifact to <artifact_output_root>/preprocessing/
+    fold_s{seed}_f{fold_idx}/ (see fold_preprocessing.py::save_fold_artifact)
+    — None (default) preserves the prior in-memory-only behavior exactly.
+    """
     normalized_adata = require_normalized_adata(context)
     num_classes = context.num_smoke_classes
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
@@ -220,6 +228,9 @@ def run_smoke_cv(
             artifact, train_ds, val_ds = fold_train_val_datasets(context, fold["train"], fold["val"], n_hvgs=n_hvgs)
             assert_disjoint_subjects(train_ds, val_ds, names=["fold_train", "fold_val"])
             fp = artifact_fingerprint(artifact)
+            if artifact_output_root is not None:
+                save_fold_artifact(artifact, artifact_output_root, f"s{seed}_f{fold_idx}",
+                                    fold["train"], fold["val"], extra={"task": "smoke", "seed": seed})
 
             Xtr, ytr, _, feature_names = build_smoke_subject_summary_features(train_ds, num_cell_types, num_classes)
             Xva, yva, _, _ = build_smoke_subject_summary_features(val_ds, num_cell_types, num_classes)
@@ -326,7 +337,10 @@ def run_smoke_cv(
 def run_cancer_cv(
     context, model_names: Sequence[str], n_folds: int = 5,
     seeds: Sequence[int] = DEFAULT_SEEDS, device: str = "cpu", pooling: Optional[str] = None,
+    artifact_output_root: Optional[str] = None,
 ) -> Dict:
+    """artifact_output_root — see run_smoke_cv's docstring; same optional,
+    backward-compatible per-fold persistence behavior for Task B."""
     normalized_adata = require_normalized_adata(context)
     all_bags = list(context.train_bags) + list(context.val_bags)
     outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
@@ -356,6 +370,9 @@ def run_cancer_cv(
                 context, fold["train"], fold["val"], n_hvgs=n_hvgs,
             )
             fp = artifact_fingerprint(artifact)
+            if artifact_output_root is not None:
+                save_fold_artifact(artifact, artifact_output_root, f"s{seed}_f{fold_idx}",
+                                    fold["train"], fold["val"], extra={"task": "cancer", "seed": seed})
             train_bags_fold = bags_from_fold_cell_dataset(train_cell_ds, outcomes_by_subject, min_cells)
             val_bags_fold = bags_from_fold_cell_dataset(val_cell_ds, outcomes_by_subject, min_cells)
             if not train_bags_fold or not val_bags_fold:

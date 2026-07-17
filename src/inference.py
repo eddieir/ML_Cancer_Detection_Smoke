@@ -525,12 +525,53 @@ def _build_cli():
                    help="What state --h5ad's .X is already in (default: normalized_expression)")
     p.add_argument("--out",    type=str, default=None,          help="Output JSON path")
     p.add_argument("--device", type=str, default="cpu",         help="cpu or cuda")
+    p.add_argument("--allow-legacy-checkpoint", action="store_true", default=False,
+                   help="Explicitly permit loading a checkpoint with no preprocessing_artifact.json "
+                        "next to it (maps to Predictor.from_config's unsafe_legacy_mode). Never the "
+                        "default — a legacy checkpoint loaded this way is not reproducible in the "
+                        "way a Phase 4 bundle is, and predict_h5ad() still refuses raw/unlabelled "
+                        "input in this mode.")
+    # Standalone preprocessing-artifact commands (Phase 4) — none of these
+    # require a checkpoint or --h5ad; they inspect/validate the artifact
+    # file directly and exit without running inference.
+    p.add_argument("--inspect-artifact", type=str, default=None, metavar="PATH",
+                   help="Print a read-only JSON summary of a PreprocessingArtifact "
+                        "(schema version, fingerprint, gene count, gene-contract policy, "
+                        "provenance) and exit — no model/checkpoint needed.")
+    p.add_argument("--validate-artifact", type=str, default=None, metavar="PATH",
+                   help="Load a PreprocessingArtifact and confirm it passes its own integrity "
+                        "checks (schema version, corruption, gene-contract consistency), then "
+                        "exit — no model/checkpoint needed. Prints 'OK' and exits 0 on success, "
+                        "prints the error and exits 1 on failure.")
     return p
 
 
 def _cli_main():
+    import json as _json
+    import sys as _sys
+
     args = _build_cli().parse_args()
-    predictor = Predictor.from_config(args.config, phase=args.phase, device=args.device)
+
+    if args.inspect_artifact:
+        from data.preprocessing import PreprocessingArtifact
+        artifact = PreprocessingArtifact.load(args.inspect_artifact)
+        print(_json.dumps(artifact.inspect(), indent=2, default=str))
+        return
+
+    if args.validate_artifact:
+        from data.preprocessing import PreprocessingArtifact, PreprocessingArtifactError
+        try:
+            PreprocessingArtifact.load(args.validate_artifact)
+        except PreprocessingArtifactError as exc:
+            print(f"INVALID: {exc}")
+            _sys.exit(1)
+        print("OK")
+        return
+
+    predictor = Predictor.from_config(
+        args.config, phase=args.phase, device=args.device,
+        unsafe_legacy_mode=args.allow_legacy_checkpoint,
+    )
 
     if args.h5ad:
         results = predictor.predict_h5ad(args.h5ad, input_stage=args.input_stage)

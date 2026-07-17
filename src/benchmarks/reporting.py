@@ -143,16 +143,56 @@ def new_run_dir(base_dir: str = "artifacts/benchmarks", run_id: Optional[str] = 
     return path
 
 
-def _environment_snapshot(synthetic: bool) -> dict:
+def _cuda_snapshot() -> dict:
+    """Best-effort CUDA availability/version — never claims exact
+    cross-machine numerical determinism just because this is recorded (see
+    README's honest-limitations section). `available=False` and
+    `version=None` when torch isn't installed or reports no CUDA device,
+    never guessed."""
+    try:
+        import torch
+        available = bool(torch.cuda.is_available())
+        return {
+            "available": available,
+            "version": torch.version.cuda if available else None,
+            "device_count": torch.cuda.device_count() if available else 0,
+        }
+    except Exception:
+        return {"available": False, "version": None, "device_count": 0}
+
+
+def _determinism_snapshot(seed: Optional[int] = None) -> dict:
+    """Records the determinism-relevant settings this run actually
+    controls — torch/numpy seeding (see Trainer.__init__, which calls
+    torch.manual_seed/np.random.seed with this same seed) and whether
+    torch's own deterministic-algorithms flag is set. Does not claim
+    bit-identical results across different hardware/driver/BLAS versions —
+    only that the SAME seed was used for this run's own RNG state."""
+    import torch
+
+    return {
+        "seed": seed,
+        "torch_deterministic_algorithms_enabled": bool(torch.are_deterministic_algorithms_enabled()),
+    }
+
+
+def _environment_snapshot(
+    synthetic: bool, seed: Optional[int] = None, config_fingerprint: Optional[str] = None,
+) -> dict:
     """Records the facts a reproducibility artifact needs to judge whether
     a run can be repeated/compared: interpreter/platform identity, the
     exact versions of every scientific dependency whose behavior could
     affect results (never guessed — each is looked up via
     importlib.metadata, and a package that isn't installed is recorded as
-    None rather than silently omitted), the git SHA this code ran at, and
+    None rather than silently omitted), CUDA availability/version, the
+    determinism settings actually in effect, the git SHA this code ran at,
     whether the working tree was dirty at run time (best-effort — `git
     status` may be unavailable outside a git checkout, e.g. an extracted
-    release tarball)."""
+    release tarball), and (when the caller has one) the config fingerprint
+    and random seed this specific run used. Deliberately excludes any
+    environment-variable dump, username, hostname, or absolute local path —
+    see README's honest-limitations section for what this snapshot does and
+    does not prove about reproducibility."""
     import platform
     import subprocess
     import sys as _sys
@@ -177,14 +217,20 @@ def _environment_snapshot(synthetic: bool) -> dict:
         "git_dirty": git_dirty,
         "synthetic": synthetic,
         "package_versions": collect_core_package_versions(required=False),
+        "cuda": _cuda_snapshot(),
+        "determinism": _determinism_snapshot(seed=seed),
+        "config_fingerprint": config_fingerprint,
     }
 
 
-def write_environment_artifact(run_dir: Path, synthetic: bool) -> dict:
+def write_environment_artifact(
+    run_dir: Path, synthetic: bool, seed: Optional[int] = None, config_fingerprint: Optional[str] = None,
+) -> dict:
     """Writes environment.json (see _environment_snapshot) and returns the
     same dict so a caller can cross-reference it (e.g. embed the git_sha in
-    run_manifest.json) without re-deriving it."""
-    snapshot = _environment_snapshot(synthetic)
+    run_manifest.json, or reference it from a model bundle manifest — see
+    benchmarks/bundle.py) without re-deriving it."""
+    snapshot = _environment_snapshot(synthetic, seed=seed, config_fingerprint=config_fingerprint)
     write_json(run_dir / "environment.json", snapshot)
     return snapshot
 
@@ -323,7 +369,7 @@ def write_benchmark_report(
     comparisons: List[Dict], calibration_report: Optional[Dict] = None, synthetic: bool = False,
 ) -> None:
     write_json(run_dir / "run_manifest.json", run_manifest)
-    write_environment_artifact(run_dir, synthetic)
+    write_environment_artifact(run_dir, synthetic, seed=context.seed, config_fingerprint=context.config_fingerprint)
     write_preprocessing_artifact_record(run_dir, context)
     write_json(run_dir / "eligibility.json", {k: v.to_dict() if hasattr(v, "to_dict") else v
                                                for k, v in eligibility.items()})
