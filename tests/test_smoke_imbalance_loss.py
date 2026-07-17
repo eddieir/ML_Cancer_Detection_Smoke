@@ -76,6 +76,108 @@ def test_focal_class_alpha_applied_exactly_once():
     assert torch.allclose(focal(logits, targets), weighted_ce(logits.detach(), targets), atol=1e-4)
 
 
+def test_focal_alpha_does_not_influence_pt_when_gamma_positive():
+    """The bug this guards against: computing pt from ALREADY class-weighted
+    cross-entropy would make alpha influence the focal modulation itself
+    (not just the final scale), so a large alpha shrinks pt, which changes
+    (1-pt)**gamma, which is wrong. With alpha applied only after
+    modulation, scaling alpha by a constant factor must scale the loss by
+    that exact same factor — never touching pt/the modulation term."""
+    logits, targets = _random_logits_targets(n=32, k=3, seed=5)
+    alpha = torch.tensor([1.0, 3.0, 5.0])
+    focal_a = FocalLoss(gamma=2.0, class_weight=alpha, reduction="none")
+    focal_2a = FocalLoss(gamma=2.0, class_weight=alpha * 10.0, reduction="none")
+    ratio = focal_2a(logits, targets) / focal_a(logits, targets)
+    assert torch.allclose(ratio, torch.full_like(ratio, 10.0), atol=1e-4)
+
+
+def test_focal_matches_manually_computed_tensor_with_gamma_and_alpha():
+    """Blocker 3 requirement 1: compare against a small, fully hand-derived
+    example combining gamma>0 AND alpha, computed independently of
+    FocalLoss's own implementation."""
+    logits = torch.tensor([[2.0, 0.0, -1.0], [0.0, 0.0, 3.0]])
+    targets = torch.tensor([0, 2])
+    alpha = torch.tensor([2.0, 1.0, 0.5])
+    gamma = 2.0
+
+    # Manual per-example computation using plain softmax cross-entropy,
+    # entirely independent of F.cross_entropy/FocalLoss internals.
+    log_probs = torch.log_softmax(logits, dim=1)
+    manual_ce = torch.tensor([
+        -log_probs[0, 0].item(),
+        -log_probs[1, 2].item(),
+    ])
+    manual_pt = torch.exp(-manual_ce)
+    manual_focal = alpha[targets] * ((1.0 - manual_pt) ** gamma) * manual_ce
+
+    focal = FocalLoss(gamma=gamma, class_weight=alpha, reduction="none")
+    assert torch.allclose(focal(logits, targets), manual_focal, atol=1e-5)
+
+
+def test_focal_reduction_none_returns_per_example_tensor():
+    logits, targets = _random_logits_targets(n=10, k=3)
+    focal = FocalLoss(gamma=1.5, reduction="none")
+    out = focal(logits, targets)
+    assert out.shape == (10,)
+
+
+def test_focal_reduction_sum_equals_sum_of_none():
+    logits, targets = _random_logits_targets(n=10, k=3)
+    none_out = FocalLoss(gamma=1.5, reduction="none")(logits, targets)
+    sum_out = FocalLoss(gamma=1.5, reduction="sum")(logits, targets)
+    assert torch.allclose(sum_out, none_out.sum())
+
+
+def test_focal_reduction_mean_is_arithmetic_mean_of_none():
+    """Documented choice: 'mean' is the plain arithmetic mean (sum/N), not
+    nn.CrossEntropyLoss(weight=...)'s weight-normalized mean."""
+    logits, targets = _random_logits_targets(n=10, k=3)
+    alpha = torch.tensor([1.0, 2.0, 5.0])
+    none_out = FocalLoss(gamma=1.5, class_weight=alpha, reduction="none")(logits, targets)
+    mean_out = FocalLoss(gamma=1.5, class_weight=alpha, reduction="mean")(logits, targets)
+    assert torch.allclose(mean_out, none_out.mean())
+
+
+def test_focal_invalid_class_weight_dimensionality_raises():
+    with pytest.raises(ValueError):
+        FocalLoss(gamma=1.0, class_weight=torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_focal_non_finite_class_weight_raises():
+    with pytest.raises(ValueError):
+        FocalLoss(gamma=1.0, class_weight=torch.tensor([1.0, float("inf"), 2.0]))
+
+
+def test_focal_negative_class_weight_raises():
+    with pytest.raises(ValueError):
+        FocalLoss(gamma=1.0, class_weight=torch.tensor([1.0, -0.5, 2.0]))
+
+
+def test_focal_class_weight_count_mismatch_raises():
+    logits, targets = _random_logits_targets(n=8, k=3)
+    focal = FocalLoss(gamma=1.0, class_weight=torch.tensor([1.0, 2.0]))  # only 2, logits have 3 classes
+    with pytest.raises(ValueError):
+        focal(logits, targets)
+
+
+def test_focal_invalid_target_index_raises():
+    logits = torch.randn(4, 3)
+    targets = torch.tensor([0, 1, 5, 2])  # 5 is out of range for 3 classes
+    focal = FocalLoss(gamma=1.0)
+    with pytest.raises(ValueError):
+        focal(logits, targets)
+
+
+def test_focal_preserves_device_and_dtype():
+    logits = torch.randn(6, 3, dtype=torch.float64)
+    targets = torch.randint(0, 3, (6,))
+    alpha = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)  # deliberately different dtype
+    focal = FocalLoss(gamma=1.0, class_weight=alpha)
+    out = focal(logits, targets)
+    assert out.dtype == torch.float64
+    assert out.device == logits.device
+
+
 def test_focal_extreme_logits_remain_finite():
     logits = torch.tensor([[80.0, -80.0, -80.0], [-80.0, -80.0, 80.0]])
     targets = torch.tensor([0, 0])  # second row is confidently WRONG
@@ -117,6 +219,20 @@ def test_multi_task_loss_focal_mode_uses_focal_loss():
 def test_multi_task_loss_rejects_invalid_loss_type():
     with pytest.raises(ValueError):
         MultiTaskLoss(loss_type="not_a_real_loss")
+
+
+def test_multi_task_loss_focal_class_weights_applied_exactly_once():
+    """smoke_class_weights is passed into FocalLoss's class_weight exactly
+    once — verify MultiTaskLoss._ls (the smoke-loss call site) matches a
+    direct FocalLoss(gamma=..., class_weight=...) call bit-for-bit, i.e.
+    MultiTaskLoss does not re-apply the weights anywhere else."""
+    torch.manual_seed(1)
+    weights = torch.tensor([1.0, 4.0, 0.5])
+    logits = torch.randn(12, 3, requires_grad=False)
+    targets = torch.randint(0, 3, (12,))
+    loss_fn = MultiTaskLoss(loss_type="focal", focal_gamma=2.0, smoke_class_weights=weights)
+    direct = FocalLoss(gamma=2.0, class_weight=weights)
+    assert torch.allclose(loss_fn._ls(logits, targets), direct(logits, targets), atol=1e-6)
 
 
 def test_malignancy_cancer_dose_losses_unchanged_by_loss_type():

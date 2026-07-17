@@ -995,6 +995,21 @@ Architectural summary:
   prevent a cell-heavy subject from dominating a class). Consumed via
   `DataLoader(dataset, batch_sampler=...)`, never combined with
   `shuffle=True`.
+  - `cells_per_subject_cap` is a **hard** per-batch ceiling tracked via
+    per-batch remaining-capacity bookkeeping (`class_remaining_subjects`):
+    once every subject of a class is at the cap within the batch being
+    built, that class is excluded from the remaining draws (probability
+    renormalized over the classes still eligible) — there is no fallback to
+    an already-capped subject. Feasibility (`cap * n_unique_subjects >=` the
+    largest batch this sampler will ever need to produce) is checked once
+    at construction; an infeasible configuration raises
+    `SamplingImpossibleError` immediately, not mid-iteration.
+  - `samples_per_epoch` is resolved into an exact, explicit list of
+    per-batch sizes (`_batch_sizes`) at construction — full `batch_size`
+    batches followed by exactly one partial batch of the exact remainder —
+    rather than a batch count derived by ceiling division and then filled
+    with full-size batches (which would silently over-sample). `__len__`
+    returns `len(_batch_sizes)`.
 - **`Trainer._train_cell_loader()`** (`train.py`) is the single place every
   training cell `DataLoader` is now built (`phase1`, `phase1_final_fit`,
   `phase3`'s cell-level component) — it reads
@@ -1013,9 +1028,18 @@ Architectural summary:
   is the explicit double-correction guard for when both subject-balanced
   sampling AND inverse-frequency weighting are active simultaneously.
 - **`model.py`'s `FocalLoss`** — standard per-example
-  `(1-pt)**gamma * CE` formulation, `gamma=0` mathematically identical to
-  (optionally class-weighted) `CrossEntropyLoss`. `MultiTaskLoss` gained
-  `loss_type`/`focal_gamma` constructor parameters; the malignancy/cancer/
+  `(1-pt)**gamma * CE` formulation with `pt` derived from **unweighted**
+  cross-entropy; class alpha (if given) is applied exactly once, multiplied
+  onto the already gamma-modulated per-example loss, never folded into the
+  cross-entropy term `pt` is computed from (which would let alpha distort
+  the focal modulation itself, not just the final scale). `gamma=0` without
+  alpha is mathematically identical to plain unweighted `CrossEntropyLoss`
+  under the same reduction; `reduction="mean"` is a plain arithmetic mean
+  (not `CrossEntropyLoss(weight=...)`'s weight-normalized mean) — a
+  deliberate, documented, tested choice. Constructor/forward validate
+  `gamma >= 0`, `class_weight` shape/finiteness/non-negativity, class-count
+  match, and target validity. `MultiTaskLoss` gained `loss_type`/
+  `focal_gamma` constructor parameters; the malignancy/cancer/
   dose-response loss terms are untouched.
 - **`data/sampling.py::resolve_smoke_imbalance_config`** merges a
   (possibly absent) `train.smoke_imbalance` config block with an explicit
@@ -1039,3 +1063,26 @@ Architectural summary:
   qualitatively different axis than a hyperparameter grid) comparing five
   named strategies over identical outer folds/seeds/preprocessing/
   architecture, development data (context's train+val pool) only.
+  - Only `cap_cell_dataset` on the fold's TRAINING split; every strategy in
+    a fold shares the fold's exact, uncapped, natural validation set —
+    each fold record carries a `validation_fingerprint` proving this.
+  - Primary metrics (`subject_level`, via `metrics.py::
+    subject_weighted_full_smoke_metrics_report`) are majority-voted to one
+    prediction per subject before computing macro-F1/balanced accuracy/
+    per-class precision-recall-F1-support/confusion matrix; the equivalent
+    cell-level numbers are kept only under `cell_level_diagnostic`.
+  - `comparisons` reuses `reporting.py::compare_models`/
+    `summarize_comparison` (§12's own statistical-comparison machinery) to
+    report win/tie/loss counts, mean/median paired differences, and a
+    seed-level bootstrap CI when >=2 seeds ran, with `summary.
+    meaningfully_better` staying `False` whenever the evidence doesn't
+    support a confident selection.
+  - `write_imbalance_ablation_artifact`/`read_imbalance_ablation_artifact`
+    persist/reload the report as a schema-versioned JSON (+ CSV) artifact
+    under `<run_dir>/metrics/`, using the same `atomic_io.py` writes and
+    `_environment_snapshot` every other benchmark artifact uses. Wired into
+    `benchmarks/runner.py`'s CLI via `--imbalance-ablation` (smoke task only).
+  - The default `configs/default.yaml` `sampler: shuffle` is unchanged by
+    this module's existence — no real (non-synthetic) ablation evidence has
+    yet been produced, so the pre-Phase-2 default remains authoritative
+    until such evidence exists.

@@ -971,8 +971,36 @@ currently supports `uniform`. Only the training split may use this sampler
 component and the corresponding `NeuralSmokeAdapter`/`NeuralCancerAdapter`
 benchmark entry points; validation and test `DataLoader`s remain
 `shuffle=False` with no sampler attached, unchanged from Phase 1, and are
-never oversampled, duplicated, or reweighted — see
-`tests/test_phase2_imbalance_integration.py`'s validation-loader tests.
+never oversampled, duplicated, capped, or reweighted — see
+`tests/test_phase2_imbalance_integration.py`'s validation-loader tests and
+`tests/test_benchmarks_imbalance_ablation.py`'s validation-fingerprint tests.
+
+**`cells_per_subject_per_batch` is a hard, per-batch ceiling — never a soft
+target.** When set, no subject may contribute more than that many cells to
+any single batch; there is no fallback to an already-capped subject. Once
+every subject in a class has reached the cap *within the batch being
+built*, that class simply stops being drawn for the rest of that batch (its
+probability mass is redistributed over classes that still have capacity) —
+a feasible degradation of the requested class balance, never a cap
+violation. Feasibility (`cells_per_subject_per_batch * n_unique_subjects >=
+the largest requested batch size`) is checked once at sampler construction;
+an infeasible combination raises `SamplingImpossibleError` immediately,
+never mid-epoch and never by silently exceeding the cap. Cell replacement
+(`replacement: true`, the default) is independent of this cap: the same
+physical cell may be drawn more than once within a batch when replacement
+is enabled, but a subject's *total* contribution to that batch — repeats
+included — still cannot exceed the cap. See
+`tests/test_subject_balanced_sampling.py`'s cap-enforcement tests, including
+the exact-capacity-boundary and single-subject-class cases.
+
+**`samples_per_epoch` is an exact sample count, not a rounding target.**
+`samples_per_epoch=95` with `batch_size=10` yields batch lengths `[10] * 9 +
+[5]` — 95 indices total, never rounded up to 100 by a stray ceil-division.
+`len(sampler)` always equals the number of batches actually yielded
+(`floor(samples_per_epoch / batch_size)`, plus one more for a nonzero
+remainder). The final partial batch still obeys every class/subject-cap
+constraint. `batches_per_epoch` (an alternative, mutually exclusive way to
+set epoch length) always yields `batch_size`-sized batches, unchanged.
 
 **Class weighting vs. sampling — two different corrections.** Inverse-
 frequency `CrossEntropyLoss` class weights (`CellLevelDataset.
@@ -993,10 +1021,26 @@ while remaining reproducible from the base seed.
 
 **Focal loss (`model.py`'s `FocalLoss`) is a configurable ablation, not a
 replacement.** `training.smoke_imbalance.loss` is `cross_entropy` (default)
-or `focal`; `focal_gamma=0` is mathematically identical to (optionally
-class-weighted) cross-entropy — verified directly in
-`tests/test_smoke_imbalance_loss.py`. The malignancy, cancer, and
-dose-response loss terms are unaffected by this setting.
+or `focal`. For each example: `ce = cross_entropy(logits, target,
+reduction="none")` — always **unweighted**; `pt = exp(-ce)`; `focal_factor =
+(1 - pt) ** gamma`; `loss = focal_factor * ce`, then, if class alpha is
+enabled, `loss = alpha[target] * focal_factor * ce` — alpha is applied
+**exactly once**, after the focal modulation, never folded into the
+cross-entropy term used to compute `pt` (computing `pt` from an
+already-weighted cross-entropy would let alpha distort "how easy is this
+example" as well as the final scale — a double-counted correction).
+`reduction="mean"` is the plain arithmetic mean of the per-example values —
+**not** `nn.CrossEntropyLoss(weight=...)`'s weight-normalized mean — a
+deliberate, documented, and tested choice; `reduction="sum"` is
+convention-independent and is what the test suite uses to verify alpha is
+applied exactly once. `focal_gamma=0` without alpha is mathematically
+identical to plain (unweighted) cross-entropy under the same reduction —
+verified directly in `tests/test_smoke_imbalance_loss.py`, including a
+manually hand-derived tensor example combining `gamma>0` and alpha. The
+malignancy, cancer, and dose-response loss terms are unaffected by this
+setting. `class_weighting` (sampling-adjacent, computed once per training
+run) and `focal_alpha_mode` (loss-adjacent) are two independently
+configurable axes — see the double-correction discussion below.
 
 **Rare-class handling is unchanged and still honest.** Phase 2 does not
 touch `data/rare_class.py` or `data/label_mapping.py`: the sampler and
@@ -1011,6 +1055,32 @@ built from. This project still does not claim six-class classification
 success — the effective, reported class count is whatever
 `EffectiveLabelMapping.k` resolves to for the configured rare-class policy.
 
+**Only the training half of each fold is ever capped or rebalanced.**
+`run_smoke_imbalance_ablation` calls `cap_cell_dataset` on the fold's
+training cells only; every strategy compared in one fold is scored against
+that fold's *complete, uncapped, natural* validation population — never
+resampled, duplicated, or filtered. Every strategy's fold record carries a
+`validation_fingerprint` (subject IDs, per-subject cell counts, total cell
+count, a label checksum) so this can be verified directly rather than taken
+on faith — `tests/test_benchmarks_imbalance_ablation.py` asserts this
+fingerprint is byte-identical across every strategy in the same fold.
+
+**Primary metrics are subject-level, not cell-level.** Every fold record's
+`subject_level` block (from
+`metrics.py::subject_weighted_full_smoke_metrics_report`) — macro-F1,
+balanced accuracy, per-class precision/recall/F1/support, confusion matrix
+— is computed after majority-voting each subject's cell-level predictions
+into one prediction per subject first, so a subject with many cells cannot
+dominate any of these numbers (per-class `support` counts SUBJECTS, not
+cells). `subject_weighted_macro_f1`, the ablation's primary comparison
+metric, is exactly `subject_level["macro_f1"]`. The equivalent cell-level
+numbers are still reported, but only under the explicitly-labeled
+`cell_level_diagnostic` key — a secondary diagnostic, never described as
+"subject-weighted." Class ordering is always `range(num_classes)`
+(stable, independent of which classes happen to be present in a given
+fold); absent classes are recorded in `classes_absent_from_val` and get an
+honest zero support, never a manufactured value.
+
 **Development-only ablation protocol.**
 `src/benchmarks/imbalance_ablation.py::run_smoke_imbalance_ablation` compares
 five named strategies (`natural_no_weight`, `natural_inverse_frequency`,
@@ -1020,23 +1090,67 @@ five named strategies (`natural_no_weight`, `natural_inverse_frequency`,
 identical per-fold preprocessing refit, identical candidate architecture,
 only `train.smoke_imbalance` differs between strategies. It runs entirely
 over the experiment context's train+val subject pool; the frozen test split
-is never accessed and this comparison never invokes the frozen-test guard.
-The returned report includes `paired_fold_differences` (per seed/fold, not
-just a pooled mean) specifically so a strategy is not called "better" merely
-because its mean macro-F1 is nominally higher — see
-`tests/test_benchmarks_imbalance_ablation.py`.
+is never accessed and this comparison never invokes the frozen-test guard —
+`tests/test_benchmarks_imbalance_ablation.py` proves this directly by
+installing a sentinel in place of the context's test data that raises on
+any access whatsoever (attribute lookup, indexing, iteration, `len()`) and
+running the full ablation against it.
 
-**Reproducibility and identity.** `training.smoke_imbalance` lives inside
-`ExperimentContext.config`, so it is already covered by
+**Honest paired strategy comparisons — never a winner from the mean
+alone.** The report's `paired_fold_differences` gives per-(seed, fold)
+differences against the declared baseline (`natural_no_weight` by default);
+`comparisons` reuses `reporting.py`'s existing `compare_models`/
+`summarize_comparison` (the same machinery Phase 1's own CV report uses,
+never a duplicated weaker implementation) to add win/tie/loss counts (a
+fixed, deterministic tie tolerance), mean and median paired differences, a
+count of missing/invalid pairs, and — only when >=2 seeds were run — a
+seed-level bootstrap confidence interval (`ci_diff_by_seed`, explicitly
+labeled with its resampling unit). `comparisons[name].summary.
+meaningfully_better` is `False` whenever the evidence (win fraction,
+seed-level CI) does not support a confident selection — including whenever
+only one seed was run, regardless of how consistent that one seed's folds
+look. Every comparison carries an `independence_note`: folds drawn from
+repeated seeds over the same overlapping development subject pool are
+explicitly **not** independent biological replications, and per-fold
+win/loss counts are descriptive, not a formal significance test.
+
+**Reproducibility, identity, and artifacts.** `training.smoke_imbalance`
+lives inside `ExperimentContext.config`, so it is already covered by
 `config_fingerprint`/`guard_identity_fingerprint` (see `benchmarks/
 context.py`) with no additional plumbing — two runs with different
 imbalance strategies never share scientific or frozen-test-guard identity.
 Every checkpoint (`Trainer._save`) persists the resolved
 `smoke_imbalance_config` and, when the subject-balanced sampler was used,
 its realized per-epoch sampling diagnostics (observed/absent effective
-classes, unique subjects per class, realized cells/subjects per class);
-`NeuralSmokeAdapter.metadata()`/`NeuralCancerAdapter.metadata()` expose the
-same fields for benchmark reports.
+classes, unique subjects per class, exact realized samples/batches,
+realized cells/subjects per class); `NeuralSmokeAdapter.metadata()`/
+`NeuralCancerAdapter.metadata()` expose the same fields for benchmark
+reports. `run_smoke_imbalance_ablation`'s own output is not only an
+in-memory dict: `write_imbalance_ablation_artifact` persists it atomically
+under `<run_dir>/metrics/smoke_imbalance_ablation.json` (plus a flattened
+per-fold CSV), reusing the same atomic-write and environment-snapshot
+machinery every other benchmark artifact uses (`schema_version`, git SHA,
+package versions, `development_only: true`, `frozen_test_data_accessed:
+false`) — never a parallel, incompatible persistence system.
+`python -m benchmarks.runner --task smoke --imbalance-ablation ...` wires it
+into the existing CLI entry point.
+
+**Default sampler status: `shuffle`, deliberately unchanged.** No real
+(non-synthetic) development-only comparison has yet established that
+`subject_balanced` — or any specific `class_weighting`/`loss` combination —
+actually outperforms the pre-Phase-2 default on real data; the ablation
+framework above exists to eventually produce that evidence, not to
+presuppose its outcome. `configs/default.yaml`'s `train.smoke_imbalance`
+block therefore matches `data/sampling.py::DEFAULT_SMOKE_IMBALANCE_CONFIG`
+exactly (`sampler: shuffle`, `class_weighting: inverse_frequency`,
+`loss: cross_entropy`) — verified by
+`tests/test_subject_balanced_sampling.py`'s YAML/Python consistency tests —
+so an absent or default `smoke_imbalance` config reproduces pre-Phase-2
+behavior exactly. `subject_balanced` sampling and focal loss are fully
+implemented, tested, and available as opt-in/experimental configuration;
+switching the *default* requires real development-only ablation evidence
+selected before any frozen-test use, never a frozen-test result and never
+the mere existence of the feature.
 
 **No real held-out imbalance-strategy comparison has been run.** Everything
 above has been exercised on synthetic data (`tests/`, and the CLI's
@@ -1046,7 +1160,9 @@ frozen-test guard is a deliberate, one-time, separately-authorized action
 (see the guard discussion above), not something this pass performs. Any
 future macro-F1/accuracy numbers for a specific strategy must come from an
 actual run of `run_smoke_imbalance_ablation` (development-only) or the
-frozen-test protocol (at most once), never from this description.
+frozen-test protocol (at most once), never from this description — and a
+development-only ablation result never by itself authorizes a claim of
+scientific superiority.
 
 ## Pipeline
 

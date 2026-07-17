@@ -62,6 +62,38 @@ def subject_weighted_smoke_metrics(
     return multiclass_f1_report(subj_true, subj_pred, num_classes)
 
 
+def _majority_vote_by_subject(
+    y_true: Sequence[int], y_pred: Sequence[int], subject_ids: Sequence[str], num_classes: int,
+):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    subject_ids = np.asarray([str(s) for s in subject_ids])
+    subj_true, subj_pred = [], []
+    for sid in sorted(set(subject_ids.tolist())):
+        mask = subject_ids == sid
+        subj_true.append(int(np.bincount(y_true[mask]).argmax()))
+        subj_pred.append(int(np.bincount(y_pred[mask], minlength=num_classes).argmax()))
+    return subj_true, subj_pred
+
+
+def subject_weighted_full_smoke_metrics_report(
+    y_true: Sequence[int], y_pred: Sequence[int], subject_ids: Sequence[str], num_classes: int,
+) -> Dict:
+    """
+    The PRIMARY smoke-classification report: one vote per subject (see
+    subject_weighted_smoke_metrics) carried through the FULL secondary-
+    metric bundle (balanced accuracy, per-class precision/recall/F1/
+    support, confusion matrix) — not just macro/weighted F1. "support" in
+    the returned per_class dict therefore counts SUBJECTS, not cells, and a
+    subject with many cells cannot dominate any of these numbers any more
+    than a subject with few cells can. Class ordering is always
+    range(num_classes), so confusion-matrix rows/columns and per_class keys
+    are stable across strategies/folds/runs.
+    """
+    subj_true, subj_pred = _majority_vote_by_subject(y_true, y_pred, subject_ids, num_classes)
+    return full_smoke_metrics_report(subj_true, subj_pred, num_classes)
+
+
 def full_smoke_metrics_report(y_true: Sequence[int], y_pred: Sequence[int], num_classes: int) -> Dict:
     """multiclass_f1_report plus the secondary metrics section 2 requires:
     balanced accuracy, per-class precision/recall/F1/support, confusion matrix."""

@@ -159,7 +159,12 @@ def test_phase3_cell_component_uses_subject_balanced_sampler(tmp_path):
     train_sd = SubjectLevelDataset(_bags(train_ds, 3))
     val_sd = SubjectLevelDataset(_bags(val_ds, 4))
 
-    trainer = _trainer({"sampler": "subject_balanced", "cells_per_subject_per_batch": 4}, tmp_path)
+    # phase3's cell-level component uses a fixed batch_size=256 (see
+    # train.py) — cells_per_subject_per_batch must be large enough that
+    # cap * n_train_subjects >= 256 or the (correct, hard) hard-cap
+    # feasibility check in SubjectBalancedBatchSampler raises
+    # SamplingImpossibleError, per Blocker 1's construction-time validation.
+    trainer = _trainer({"sampler": "subject_balanced", "cells_per_subject_per_batch": 16}, tmp_path)
     trainer.phase3(train_ds, val_ds, train_sd, val_sd, skip_eligibility_check=True)
     assert trainer._last_subject_balanced_sampler is not None
 

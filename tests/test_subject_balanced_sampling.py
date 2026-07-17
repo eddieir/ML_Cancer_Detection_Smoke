@@ -182,11 +182,71 @@ def test_batch_size_and_epoch_length_are_exact():
     assert all(len(b) == 17 for b in batches)
 
 
-def test_samples_per_epoch_derives_batches_per_epoch_by_ceil_division():
+def test_samples_per_epoch_produces_exact_total_with_one_partial_final_batch():
+    """samples_per_epoch=95, batch_size=10 must yield batch lengths
+    [10]*9 + [5] — 95 indices total, NEVER rounded up to 100 (10 full
+    batches) by a stray ceil-division."""
     subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
     idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
     sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=95)
-    assert len(sampler) == 10  # ceil(95/10)
+    assert len(sampler) == 10  # 9 full + 1 partial
+    batches = list(sampler)
+    assert len(batches) == 10
+    assert [len(b) for b in batches] == [10] * 9 + [5]
+    assert sum(len(b) for b in batches) == 95
+
+
+def test_samples_per_epoch_evenly_divisible_yields_only_full_batches():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=100)
+    batches = list(sampler)
+    assert len(batches) == 10
+    assert all(len(b) == 10 for b in batches)
+    assert sum(len(b) for b in batches) == 100
+
+
+def test_samples_per_epoch_smaller_than_batch_size_yields_one_partial_batch():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=64, seed=0, samples_per_epoch=7)
+    assert len(sampler) == 1
+    batches = list(sampler)
+    assert len(batches) == 1
+    assert len(batches[0]) == 7
+
+
+def test_samples_per_epoch_final_partial_batch_still_respects_subject_cap():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=10, seed=0, samples_per_epoch=25, cells_per_subject_cap=3,
+    )
+    batches = list(sampler)
+    assert [len(b) for b in batches] == [10, 10, 5]
+    for batch in batches:
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert all(v <= 3 for v in per_subject.values())
+
+
+def test_len_matches_number_of_yielded_batches_for_samples_per_epoch():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=95)
+    assert len(sampler) == len(list(sampler))
+
+
+def test_samples_per_epoch_realized_diagnostics_report_exact_total():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, samples_per_epoch=95)
+    for _ in sampler:
+        pass
+    diag = sampler.last_realized_diagnostics
+    assert diag.samples_per_epoch == 95
+    assert sum(diag.realized_cells_per_class.values()) == 95
 
 
 def test_batches_per_epoch_and_samples_per_epoch_both_set_raises():
@@ -196,9 +256,12 @@ def test_batches_per_epoch_and_samples_per_epoch_both_set_raises():
         SubjectBalancedBatchSampler(idx, batch_size=10, seed=0, batches_per_epoch=5, samples_per_epoch=50)
 
 
-# ─── 10. Cells-per-subject batch cap is enforced ───────────────────────────────
+# ─── 10. Cells-per-subject batch cap is enforced (HARD, no exceptions) ─────────
 
 def test_cells_per_subject_cap_is_enforced():
+    """cells_per_subject_cap is a hard per-batch ceiling — every subject's
+    contribution to every batch must be <= cap, with zero exceptions (no
+    permitted violation count, unlike a prior looser version of this test)."""
     subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
     idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
     sampler = SubjectBalancedBatchSampler(
@@ -208,13 +271,84 @@ def test_cells_per_subject_cap_is_enforced():
         per_subject = {}
         for i in batch:
             per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
-        # class 0 only has subjects A and B (2 candidates); a batch of 64
-        # cells drawing from only 2 class-0-eligible subjects at a time
-        # (interleaved with class 1 draws) can still exceed the cap once
-        # both candidates are already at the cap — allow that documented
-        # fallback, but the OVERWHELMING majority of draws must respect it.
-        over_cap = sum(1 for v in per_subject.values() if v > 4)
-        assert over_cap <= 2
+        assert all(v <= 4 for v in per_subject.values()), per_subject
+
+
+def test_cells_per_subject_cap_enforced_across_multiple_seeds_and_epochs():
+    subj, labels = _dataset(IMBALANCED_SPEC, num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    for seed in (0, 1, 2, 17):
+        sampler = SubjectBalancedBatchSampler(
+            idx, batch_size=32, seed=seed, batches_per_epoch=20, cells_per_subject_cap=3,
+        )
+        for _epoch in range(3):  # multiple epochs from the SAME sampler instance
+            for batch in sampler:
+                per_subject = {}
+                for i in batch:
+                    per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+                assert all(v <= 3 for v in per_subject.values())
+
+
+def test_cells_per_subject_cap_at_exact_capacity_boundary_succeeds():
+    """batch_size exactly equals cap * n_unique_subjects — the tightest
+    feasible configuration; must succeed and use every subject to the cap."""
+    subj, labels = _dataset([("A", 0, 20), ("B", 0, 20), ("C", 1, 20)], num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    cap = 4
+    n_subjects = 3
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=cap * n_subjects, seed=0, batches_per_epoch=5, cells_per_subject_cap=cap,
+    )
+    for batch in sampler:
+        assert len(batch) == cap * n_subjects
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert all(v <= cap for v in per_subject.values())
+        # at the exact boundary every subject must be used to its full cap
+        assert all(per_subject.get(s, 0) == cap for s in ("A", "B", "C"))
+
+
+def test_cells_per_subject_cap_infeasible_batch_size_raises_at_construction():
+    """cap * n_unique_subjects < batch_size can never be filled without a
+    cap violation — must fail clearly at construction, never mid-iteration."""
+    subj, labels = _dataset([("A", 0, 100), ("B", 1, 100)], num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    with pytest.raises(SamplingImpossibleError):
+        SubjectBalancedBatchSampler(
+            idx, batch_size=64, seed=0, batches_per_epoch=5, cells_per_subject_cap=4,  # 4*2=8 << 64
+        )
+
+
+def test_cells_per_subject_cap_single_subject_class_redistributes_not_violates():
+    """A minority class with exactly one subject exhausts its cap quickly;
+    the sampler must redistribute remaining draws to other classes rather
+    than exceed the cap on that one subject."""
+    subj, labels = _dataset([("A", 0, 200)] + [(f"C{i}", 1, 200) for i in range(10)], num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=24, seed=0, batches_per_epoch=10, cells_per_subject_cap=4,
+    )
+    for batch in sampler:
+        per_subject = {}
+        for i in batch:
+            per_subject[subj[i]] = per_subject.get(subj[i], 0) + 1
+        assert per_subject.get("A", 0) <= 4
+        assert all(v <= 4 for v in per_subject.values())
+        assert len(batch) == 24  # still fully filled, using class-1 subjects for the rest
+
+
+def test_cells_per_subject_cap_no_hang_across_many_epochs():
+    """A tight-but-feasible cap configuration must complete promptly across
+    many epochs — no infinite loop / unbounded retry."""
+    subj, labels = _dataset([("A", 0, 50), ("B", 1, 50)], num_classes=2)
+    idx = SubjectClassIndex(subject_ids=subj, labels=labels, num_classes=2)
+    sampler = SubjectBalancedBatchSampler(
+        idx, batch_size=8, seed=0, batches_per_epoch=30, cells_per_subject_cap=4,  # 4*2=8 == batch_size
+    )
+    for _ in range(5):
+        batches = list(sampler)
+        assert len(batches) == 30
 
 
 def test_cells_per_subject_cap_must_be_positive():
@@ -389,3 +523,36 @@ def test_resolve_smoke_imbalance_config_merges_partial_overrides():
     resolved = resolve_smoke_imbalance_config({"sampler": "subject_balanced"})
     assert resolved["sampler"] == "subject_balanced"
     assert resolved["class_weighting"] == "inverse_frequency"  # untouched default preserved
+
+
+# ─── configs/default.yaml agrees exactly with the Python default ──────────────
+
+def _load_default_yaml_smoke_imbalance():
+    import yaml
+    path = Path(__file__).parents[1] / "configs" / "default.yaml"
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    return cfg["train"]["smoke_imbalance"]
+
+
+def test_default_yaml_smoke_imbalance_matches_python_default_exactly():
+    """configs/default.yaml's train.smoke_imbalance block must resolve to
+    EXACTLY DEFAULT_SMOKE_IMBALANCE_CONFIG — any drift here would mean a
+    real config file silently activates different behaviour than the
+    documented backward-compatible default (see resolve_smoke_imbalance_config)."""
+    from data.sampling import DEFAULT_SMOKE_IMBALANCE_CONFIG
+    yaml_cfg = _load_default_yaml_smoke_imbalance()
+    assert yaml_cfg == DEFAULT_SMOKE_IMBALANCE_CONFIG
+
+
+def test_default_yaml_smoke_imbalance_resolves_without_modification():
+    resolved = resolve_smoke_imbalance_config(_load_default_yaml_smoke_imbalance())
+    from data.sampling import DEFAULT_SMOKE_IMBALANCE_CONFIG
+    assert resolved == DEFAULT_SMOKE_IMBALANCE_CONFIG
+
+
+def test_default_yaml_smoke_imbalance_sampler_is_shuffle_by_default():
+    """The default sampler stays 'shuffle' (subject_balanced remains
+    opt-in/experimental) until real development-only ablation evidence
+    justifies changing it — see configs/default.yaml's own comment."""
+    assert _load_default_yaml_smoke_imbalance()["sampler"] == "shuffle"

@@ -224,6 +224,7 @@ class SamplingDiagnostics:
     cells_per_subject_cap:        Optional[int]
     batch_size:                   int
     batches_per_epoch:             int
+    samples_per_epoch:            int          # exact total cells yielded per epoch
     observed_effective_classes:   List[int]
     absent_effective_classes:     List[int]
     unique_subjects_per_class:    Dict[int, int]
@@ -270,6 +271,19 @@ class SubjectBalancedBatchSampler(Sampler):
     Never combine with shuffle=True or another sampler — DataLoader forbids
     batch_sampler + shuffle/sampler/batch_size/drop_last together, which is
     the correct behaviour here too.
+
+    cells_per_subject_cap, when set, is a HARD per-batch ceiling: no subject
+    may contribute more than that many cells to any single batch, with no
+    exception and no silent fallback to an already-capped subject. Once a
+    class's every subject has reached the cap within the batch being built,
+    that class simply stops being drawn for the REST of that batch (its
+    probability mass is redistributed over classes that still have capacity)
+    — this is a feasible degradation of the requested class balance, never a
+    cap violation. If every class is simultaneously exhausted before a
+    batch reaches its target size, construction-time validation below is
+    designed to make that unreachable; a SamplingImpossibleError is raised
+    defensively if it happens anyway, rather than silently yielding a short
+    or malformed batch.
     """
 
     def __init__(
@@ -303,12 +317,27 @@ class SubjectBalancedBatchSampler(Sampler):
         self.index = index
         self.batch_size = batch_size
         self.seed = seed
+
+        # _batch_sizes[i] is the EXACT number of cells batch i must contain.
+        # samples_per_epoch is an exact contract: full_batches batches of
+        # batch_size, followed by exactly one partial batch of the remainder
+        # (never rounded up to a full extra batch — see requirement that
+        # samples_per_epoch=95/batch_size=10 yields [10]*9 + [5], 95 total,
+        # not 100). batches_per_epoch (explicit) always yields batch_size-
+        # sized batches, matching the pre-existing contract for that mode.
         if samples_per_epoch is not None:
-            self.batches_per_epoch = max(1, -(-samples_per_epoch // batch_size))  # ceil div
+            full_batches, remainder = divmod(samples_per_epoch, batch_size)
+            self._batch_sizes = [batch_size] * full_batches + ([remainder] if remainder else [])
+            if not self._batch_sizes:
+                self._batch_sizes = [samples_per_epoch]  # samples_per_epoch < batch_size
+            self.batches_per_epoch = len(self._batch_sizes)
         elif batches_per_epoch is not None:
             self.batches_per_epoch = batches_per_epoch
+            self._batch_sizes = [batch_size] * batches_per_epoch
         else:
             self.batches_per_epoch = max(1, -(-len(index.subject_ids) // batch_size))
+            self._batch_sizes = [batch_size] * self.batches_per_epoch
+        self.samples_per_epoch = sum(self._batch_sizes)
 
         self.class_selection = class_selection
         self.subject_selection = subject_selection
@@ -346,6 +375,27 @@ class SubjectBalancedBatchSampler(Sampler):
                     "subject has. Lower cells_per_subject_cap or enable replacement."
                 )
 
+        # Hard feasibility check: the maximum cells any single batch needs
+        # must not exceed the total cap-limited capacity available across
+        # every subject in every OBSERVED class (capacity resets fully at
+        # the start of each batch, so this bound applies independently to
+        # every batch). If it does, no batch could ever be filled to its
+        # required size without violating the cap — fail now, deterministically,
+        # rather than raising deep inside a later __iter__() call or (worse)
+        # silently yielding a short/malformed batch.
+        if self.cells_per_subject_cap is not None:
+            total_capacity = self.cells_per_subject_cap * len(self.index.unique_subjects)
+            max_batch_needed = max(self._batch_sizes) if self._batch_sizes else 0
+            if total_capacity < max_batch_needed:
+                raise SamplingImpossibleError(
+                    "SubjectBalancedBatchSampler: cells_per_subject_cap="
+                    f"{self.cells_per_subject_cap} x {len(self.index.unique_subjects)} unique "
+                    f"subject(s) = {total_capacity} max cells available per batch, which is less "
+                    f"than the {max_batch_needed} cells the largest requested batch needs. Lower "
+                    "batch_size/samples_per_epoch's per-batch size, raise cells_per_subject_cap, "
+                    "or provide more subjects."
+                )
+
     def __len__(self) -> int:
         return self.batches_per_epoch
 
@@ -359,6 +409,7 @@ class SubjectBalancedBatchSampler(Sampler):
             cells_per_subject_cap=self.cells_per_subject_cap,
             batch_size=self.batch_size,
             batches_per_epoch=self.batches_per_epoch,
+            samples_per_epoch=self.samples_per_epoch,
             observed_effective_classes=list(self.classes_present),
             absent_effective_classes=list(self.index.absent_classes),
             unique_subjects_per_class={c: len(self.index.class_to_subjects[c])
@@ -384,25 +435,45 @@ class SubjectBalancedBatchSampler(Sampler):
     def __iter__(self):
         rng = np.random.RandomState(self._derive_epoch_seed())
         self._epoch += 1
+        cap = self.cells_per_subject_cap
 
         realized_cells: Dict[int, int] = {c: 0 for c in self.classes_present}
         realized_subjects: Dict[int, set] = {c: set() for c in self.classes_present}
 
-        for _ in range(self.batches_per_epoch):
+        for batch_size in self._batch_sizes:
             batch: List[int] = []
             per_subject_used: Dict[str, int] = {}
             no_replace_used: Dict[str, set] = {}
+            # Per-batch remaining-capacity bookkeeping (cap is a HARD, per-
+            # batch constraint — capacity resets fully at the start of every
+            # batch). class_remaining_subjects[c] holds exactly the subjects
+            # of class c that have not yet reached the cap WITHIN this
+            # batch; once it empties, class c is skipped for the rest of
+            # this batch (never a fallback to an exhausted subject).
+            class_remaining_subjects: Dict[int, List[str]] = (
+                {c: list(self.index.class_to_subjects[c]) for c in self.classes_present}
+                if cap is not None else {}
+            )
 
-            for _ in range(self.batch_size):
-                cls = int(rng.choice(self.classes_present, p=self._class_p))
-                subjects = self.index.class_to_subjects[cls]
-                cap = self.cells_per_subject_cap
-                if cap is not None:
-                    candidates = [s for s in subjects if per_subject_used.get(s, 0) < cap]
-                    if not candidates:
-                        candidates = subjects
+            for _ in range(batch_size):
+                if cap is None:
+                    eligible_classes = self.classes_present
+                    eligible_p = self._class_p
                 else:
-                    candidates = subjects
+                    eligible_classes = [c for c in self.classes_present if class_remaining_subjects[c]]
+                    if not eligible_classes:
+                        raise SamplingImpossibleError(
+                            "SubjectBalancedBatchSampler: every observed class's subjects "
+                            f"reached cells_per_subject_cap={cap} before this batch reached its "
+                            f"required size ({batch_size}) — this should have been prevented by "
+                            "the construction-time capacity check; lower batch_size/"
+                            "samples_per_epoch's per-batch size or raise cells_per_subject_cap."
+                        )
+                    raw_p = np.array([self.class_probs[c] for c in eligible_classes], dtype=np.float64)
+                    eligible_p = raw_p / raw_p.sum()
+
+                cls = int(rng.choice(eligible_classes, p=eligible_p))
+                candidates = class_remaining_subjects[cls] if cap is not None else self.index.class_to_subjects[cls]
                 subj = str(rng.choice(candidates))
 
                 cell_idx = self.index.subject_to_indices[subj]
@@ -421,10 +492,17 @@ class SubjectBalancedBatchSampler(Sampler):
                     used.add(chosen)
 
                 per_subject_used[subj] = per_subject_used.get(subj, 0) + 1
+                if cap is not None and per_subject_used[subj] >= cap:
+                    class_remaining_subjects[cls].remove(subj)
                 batch.append(chosen)
                 realized_cells[cls] += 1
                 realized_subjects[cls].add(subj)
 
+            if cap is not None:
+                assert all(v <= cap for v in per_subject_used.values()), (
+                    "SubjectBalancedBatchSampler: internal invariant violated — a subject "
+                    "exceeded cells_per_subject_cap within one batch."
+                )
             yield batch
 
         realized_all_subjects = set()

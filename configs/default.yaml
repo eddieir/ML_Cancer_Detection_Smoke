@@ -91,6 +91,14 @@ train:
     # "shuffle" (pre-Phase-2 default) | "subject_balanced" (class -> subject
     # -> cell sampling — a subject's cell count never affects its own
     # selection probability; see data/sampling.py's module docstring).
+    # Stays "shuffle" here deliberately: no real (non-synthetic) held-out
+    # comparison has established that subject_balanced (or any other
+    # strategy) outperforms this default — see benchmarks/imbalance_ablation.py,
+    # which exists to produce that development-only evidence but has not
+    # yet been run against real data. Switching this default requires real
+    # development-only evidence, never a frozen-test result and never the
+    # mere existence of the subject_balanced sampler. subject_balanced is a
+    # supported, tested, but experimental/opt-in configuration until then.
     sampler: shuffle
     # Only used when sampler=subject_balanced.
     # "uniform" (equal probability per observed effective class, default),
@@ -106,9 +114,14 @@ train:
     batches_per_epoch: null
     samples_per_epoch: null
     # Maximum cells drawn from any one subject within a single batch. Null
-    # means unbounded (a very-high-cell-count subject can still fill a
-    # batch, subject only to the subject-selection draw itself).
-    cells_per_subject_per_batch: 8
+    # (the backward-compatible default — must match
+    # data/sampling.py::DEFAULT_SMOKE_IMBALANCE_CONFIG exactly) means
+    # unbounded: a very-high-cell-count subject can still fill a batch,
+    # subject only to the subject-selection draw itself. A concrete cap
+    # (e.g. 8, as used by benchmarks/imbalance_ablation.py's
+    # subject_balanced_* strategies) is a hard per-batch ceiling once set —
+    # see data/sampling.py's SubjectBalancedBatchSampler docstring.
+    cells_per_subject_per_batch: null
     # Whether a cell may be drawn more than once from the same subject
     # within one batch. replacement=false requires cells_per_subject_per_batch
     # to be set and requires every subject to have at least that many cells.

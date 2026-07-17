@@ -208,8 +208,19 @@ def run_smoke_task(context, args, run_dir) -> dict:
         from .reporting import write_json
         write_json(run_dir / "metrics" / "leave_one_source_out.json", ood_report)
 
+    imbalance_ablation_report = None
+    if getattr(args, "imbalance_ablation", False):
+        from .imbalance_ablation import run_smoke_imbalance_ablation, write_imbalance_ablation_artifact
+        imbalance_ablation_report = run_smoke_imbalance_ablation(
+            context, n_folds=args.cv_folds, seeds=args.seeds, device=args.device,
+        )
+        write_imbalance_ablation_artifact(
+            run_dir, context, imbalance_ablation_report, synthetic=bool(getattr(args, "synthetic", False)),
+        )
+
     return {"eligibility": eligibility, "cv_reports": {"smoke_classification": cv_report},
-            "comparisons": comparisons, "ood_report": ood_report}
+            "comparisons": comparisons, "ood_report": ood_report,
+            "imbalance_ablation_report": imbalance_ablation_report}
 
 
 def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outcomes_by_subject,
@@ -544,6 +555,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--pooling", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--leave-one-source-out", action="store_true")
+    # Development-only comparison of Phase 2 smoke-imbalance strategies
+    # (benchmarks/imbalance_ablation.py) — only meaningful for --task smoke.
+    # Runs entirely over the train+val subject pool; never touches test
+    # data or the frozen-test guard. Writes its own artifact under
+    # <run_dir>/metrics/smoke_imbalance_ablation.json.
+    parser.add_argument("--imbalance-ablation", action="store_true")
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--run-id", type=str, default=None)

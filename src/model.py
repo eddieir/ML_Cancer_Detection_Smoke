@@ -342,14 +342,39 @@ class FocalLoss(nn.Module):
     MultiTaskLoss's loss_type parameter), never an unconditional
     replacement.
 
-    Computes per-example cross-entropy first, derives pt = exp(-ce), then
-    scales by (1 - pt) ** gamma so confidently-correct ("easy") examples
-    contribute progressively less to the loss as gamma increases; gamma=0
-    makes the scaling factor exactly 1 for every example, i.e. identical to
-    plain (optionally class-weighted) cross-entropy. class_weight (alpha),
-    if given, is passed once into the underlying per-example cross-entropy
-    term — it is never applied a second time to the reduced/modulated loss,
-    which would double-count the class correction.
+    Computes per-example cross-entropy from the RAW (unweighted) logits
+    first, derives pt = exp(-ce) from that unweighted term, then scales by
+    (1 - pt) ** gamma so confidently-correct ("easy") examples contribute
+    progressively less to the loss as gamma increases; gamma=0 makes the
+    scaling factor exactly 1 for every example. class_weight (alpha), if
+    given, is applied exactly once — AFTER the focal modulation — as
+    alpha[target] * focal_factor * ce, never folded into the cross-entropy
+    term itself. Computing pt from an already class-weighted cross-entropy
+    would let alpha leak into the "how easy is this example" judgement
+    (a large alpha inflates ce, which shrinks pt, which changes the focal
+    factor) as well as into the final scale — double-counting the class
+    correction instead of applying it once.
+
+    reduction semantics (mirroring nn.CrossEntropyLoss's "none"/"sum", but
+    NOT its weight-normalized "mean" — see below):
+      "none" — per-example alpha[target] * (1-pt)**gamma * ce, unreduced.
+      "sum"  — sum of the above.
+      "mean" — ARITHMETIC mean of the above (sum / N), not weighted-mean
+               normalized by sum(alpha[target]) the way
+               nn.CrossEntropyLoss(weight=...) computes "mean". This is a
+               deliberate, documented choice: plain arithmetic mean is simpler
+               and unambiguous, and is what makes the gamma=0 contract below
+               exact. Callers relying on CrossEntropyLoss's weight-normalized
+               mean convention must reduce with "sum" and normalize themselves.
+
+    gamma=0 contract:
+      - Without alpha: identical to nn.CrossEntropyLoss(reduction=same)
+        (unweighted), since (1-pt)**0 == 1 for every example.
+      - With alpha: identical to alpha[target]*ce reduced with the SAME
+        arithmetic-mean/sum/none convention as above — NOT identical to
+        nn.CrossEntropyLoss(weight=alpha, reduction="mean")'s weight-
+        normalized mean (compare with reduction="sum" for an exact,
+        convention-independent equivalence check).
     """
 
     def __init__(
@@ -363,17 +388,53 @@ class FocalLoss(nn.Module):
             raise ValueError(f"FocalLoss: gamma must be >= 0, got {gamma}.")
         if reduction not in ("mean", "sum", "none"):
             raise ValueError(f"FocalLoss: reduction must be 'mean', 'sum' or 'none', got {reduction!r}.")
+        if class_weight is not None:
+            if class_weight.dim() != 1:
+                raise ValueError(
+                    f"FocalLoss: class_weight must be a 1-D tensor, got shape {tuple(class_weight.shape)}."
+                )
+            if not torch.isfinite(class_weight).all():
+                raise ValueError("FocalLoss: class_weight must be finite.")
+            if (class_weight < 0).any():
+                raise ValueError("FocalLoss: class_weight must be non-negative.")
         self.gamma = gamma
         self.class_weight = class_weight
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(logits, targets, weight=self.class_weight, reduction="none")
+        if logits.dim() != 2:
+            raise ValueError(f"FocalLoss: logits must be 2-D [N, C], got shape {tuple(logits.shape)}.")
+        num_classes = logits.shape[1]
+        if targets.dim() != 1 or targets.shape[0] != logits.shape[0]:
+            raise ValueError(
+                f"FocalLoss: targets must be 1-D with shape [N={logits.shape[0]}], "
+                f"got shape {tuple(targets.shape)}."
+            )
+        if targets.numel() > 0 and ((targets < 0).any() or (targets >= num_classes).any()):
+            raise ValueError(
+                f"FocalLoss: targets must be valid class indices in [0, {num_classes}) for "
+                f"logits with {num_classes} classes."
+            )
+        class_weight = self.class_weight
+        if class_weight is not None and class_weight.numel() != num_classes:
+            raise ValueError(
+                f"FocalLoss: class_weight has {class_weight.numel()} entries but logits have "
+                f"{num_classes} classes."
+            )
+        if class_weight is not None:
+            class_weight = class_weight.to(device=logits.device, dtype=logits.dtype)
+
+        # pt/focal_factor are derived from UNWEIGHTED cross-entropy — alpha
+        # must never influence "how easy is this example", only the final
+        # per-example scale (applied exactly once, below).
+        ce = F.cross_entropy(logits, targets, reduction="none")
         # clamp(max=1.0) guards against a pt slightly > 1.0 from floating-point
         # error when ce is extremely close to 0, which would make (1-pt)
         # negative and (1-pt)**gamma NaN for non-integer gamma.
         pt = torch.exp(-ce).clamp(max=1.0)
         focal = ((1.0 - pt) ** self.gamma) * ce
+        if class_weight is not None:
+            focal = class_weight[targets] * focal
         if self.reduction == "mean":
             return focal.mean()
         if self.reduction == "sum":
