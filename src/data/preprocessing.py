@@ -15,7 +15,9 @@ alongside a checkpoint and reloaded for inference-time compatibility
 checks (required genes, gene order, input dimension, artifact version).
 """
 
+import hashlib
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -25,6 +27,66 @@ import numpy as np
 import scanpy as sc
 
 ARTIFACT_VERSION = "1"
+
+# Gene-contract policy defaults — must agree with configs/default.yaml's
+# preprocessing.* keys (see tests/test_config_consistency.py, which fails
+# the build if these ever drift apart). "error" is the conservative default
+# everywhere: silently tolerating a missing/duplicate gene or unlabelled
+# coverage shortfall is exactly the kind of silent-recovery behavior Phase 4
+# forbids (see this module's own docstring and README.md).
+DEFAULT_MISSING_GENE_POLICY = "error"       # "error" | "zero_fill" (explicit opt-in only)
+DEFAULT_DUPLICATE_GENE_POLICY = "error"     # "error" only — no aggregation policy implemented
+DEFAULT_UNEXPECTED_GENE_POLICY = "ignore"   # "ignore" (recorded in diagnostics) | "error"
+DEFAULT_MINIMUM_GENE_COVERAGE = 1.0         # fraction of artifact.gene_list that must be present
+
+
+class PreprocessingArtifactError(ValueError):
+    """Base class for every error this module raises about an artifact's
+    identity, integrity, or compatibility with a given input. Subclasses
+    ValueError (rather than a bare Exception) so existing callers/tests
+    that catch the historical `pytest.raises(ValueError)` for a bad gene
+    panel keep working unchanged; callers that want to catch "something is
+    wrong with this artifact" specifically should catch this class."""
+
+
+class GeneContractError(PreprocessingArtifactError):
+    """Raised when an input's genes violate the artifact's gene contract:
+    a missing required gene under the default error policy, a duplicate
+    gene identifier, an unexpected gene under an error policy, or
+    insufficient gene coverage against the artifact's configured minimum."""
+
+
+class ArtifactCompatibilityError(PreprocessingArtifactError):
+    """Raised when a model checkpoint and a PreprocessingArtifact do not
+    agree on scientific identity (fingerprint mismatch, gene-list mismatch,
+    or gene-count mismatch) — see checkpoint_matches_artifact() and
+    train.py/inference.py's checkpoint<->artifact binding."""
+
+
+class LegacyArtifactError(PreprocessingArtifactError):
+    """Raised when a checkpoint has no associated PreprocessingArtifact (or
+    no recorded artifact fingerprint) and the caller did not explicitly opt
+    into legacy/non-reproducible behavior (unsafe_legacy_mode=True)."""
+
+
+# Scientific-content fields that make up PreprocessingArtifact's fingerprint.
+# Deliberately excludes `created_at` (a volatile timestamp — see
+# scientific_fingerprint()'s docstring) and `notes` (free-text commentary,
+# not scientific state). Every other field is part of the artifact's
+# reproducible identity: two artifacts fit from the same training data,
+# config, and code produce the same fingerprint regardless of output
+# directory, hostname, or wall-clock time.
+_FINGERPRINT_FIELDS = (
+    "version", "gene_list", "gene_means", "gene_stds", "n_hvgs",
+    "smoke_marker_genes_forced", "fit_n_cells", "fit_n_subjects",
+    "label_mapping", "expected_input_stage", "cell_type_map_fingerprint",
+    "cell_type_annotation_mode", "cell_type_annotation_degraded",
+    "cell_type_annotation_compatibility", "missing_gene_policy",
+    "duplicate_gene_policy", "unexpected_gene_policy", "minimum_gene_coverage",
+    "batch_correction_status",
+)
+
+_VALID_BATCH_CORRECTION_STATUSES = frozenset({"disabled", "transductive_diagnostic_only"})
 
 # The only input stages apply_preprocessing()/predict_h5ad() know how to
 # handle — see inference.py. "normalized_expression" is what this artifact's
@@ -88,22 +150,170 @@ class PreprocessingArtifact:
     # before a model could be loaded, or for artifacts fit before this
     # field existed.
     cell_type_annotation_compatibility: Optional[Dict] = None
+    # Gene-contract policies actually enforced by verify_compatible()/
+    # apply_preprocessing() below — see the DEFAULT_* constants above.
+    # Persisted explicitly (not just implied by code defaults) so a reloaded
+    # artifact enforces the SAME policy it was fit under, even if the
+    # module-level defaults change in a later code version.
+    missing_gene_policy:        str = DEFAULT_MISSING_GENE_POLICY
+    duplicate_gene_policy:      str = DEFAULT_DUPLICATE_GENE_POLICY
+    unexpected_gene_policy:     str = DEFAULT_UNEXPECTED_GENE_POLICY
+    minimum_gene_coverage:      float = DEFAULT_MINIMUM_GENE_COVERAGE
+    # Whether the RUN that produced this artifact also opted into batch
+    # correction — see data/transforms.py's UnsafeBatchCorrectionError
+    # module docstring for why "train_fitted_inductive" is not a value that
+    # can occur here (no inductive implementation exists). Note this
+    # artifact's OWN fitted state (gene selection, scaling means/stds) never
+    # includes Harmony's output either way — preprocess.py runs Harmony
+    # AFTER apply_preprocessing, on the already gene-selected/scaled
+    # output, never before or during this artifact's own fit. "disabled"
+    # (default) means the run never opted into batch correction at all;
+    # "transductive_diagnostic_only" means Harmony ran, across the full
+    # train+val+test dataset, as a disclosed, non-leakage-free diagnostic
+    # step downstream of this artifact — assert_batch_correction_safe()
+    # (data/transforms.py) refuses to let a run in this state reach
+    # CV/OOF/final-dev-pool/frozen-test evaluation.
+    batch_correction_status:    str = "disabled"
+    # Wall-clock creation time (time.time()) — informational only, excluded
+    # from scientific_fingerprint() (see _FINGERPRINT_FIELDS above). None
+    # for artifacts fit before this field existed.
+    created_at:                  Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.created_at is None:
+            self.created_at = time.time()
+        if len(self.gene_list) == 0:
+            raise GeneContractError(
+                "PreprocessingArtifact: gene_list is empty — an artifact with no selected "
+                "genes cannot transform any input and is refused at construction time."
+            )
+        if len(set(self.gene_list)) != len(self.gene_list):
+            dupes = sorted({g for g in self.gene_list if self.gene_list.count(g) > 1})
+            raise GeneContractError(
+                f"PreprocessingArtifact: gene_list contains duplicate gene identifiers "
+                f"{dupes[:10]} — the artifact's own selected-gene panel must be unique."
+            )
+        if not (len(self.gene_list) == len(self.gene_means) == len(self.gene_stds)):
+            raise GeneContractError(
+                f"PreprocessingArtifact: gene_list ({len(self.gene_list)}), gene_means "
+                f"({len(self.gene_means)}), and gene_stds ({len(self.gene_stds)}) must be "
+                "the same length — one scaling statistic per selected gene."
+            )
+        if self.missing_gene_policy not in ("error", "zero_fill"):
+            raise GeneContractError(
+                f"PreprocessingArtifact: missing_gene_policy={self.missing_gene_policy!r} "
+                "is not one of 'error', 'zero_fill'."
+            )
+        if self.duplicate_gene_policy != "error":
+            raise GeneContractError(
+                f"PreprocessingArtifact: duplicate_gene_policy={self.duplicate_gene_policy!r} "
+                "is not 'error' — no deterministic duplicate-aggregation policy is implemented, "
+                "so 'error' is the only supported value."
+            )
+        if self.unexpected_gene_policy not in ("ignore", "error"):
+            raise GeneContractError(
+                f"PreprocessingArtifact: unexpected_gene_policy="
+                f"{self.unexpected_gene_policy!r} is not one of 'ignore', 'error'."
+            )
+        if not (0.0 < self.minimum_gene_coverage <= 1.0):
+            raise GeneContractError(
+                f"PreprocessingArtifact: minimum_gene_coverage={self.minimum_gene_coverage!r} "
+                "must be in (0.0, 1.0]."
+            )
+        if self.batch_correction_status not in _VALID_BATCH_CORRECTION_STATUSES:
+            raise GeneContractError(
+                f"PreprocessingArtifact: batch_correction_status="
+                f"{self.batch_correction_status!r} is not one of "
+                f"{sorted(_VALID_BATCH_CORRECTION_STATUSES)}."
+            )
 
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def scientific_fingerprint(self) -> str:
+        """SHA-256 over every scientifically meaningful field of this
+        artifact (see _FINGERPRINT_FIELDS) — excludes `created_at` and
+        `notes`. Two artifacts fit from the same training subjects, config,
+        and code produce the same fingerprint regardless of output
+        directory, hostname, or when they were fit; changing the selected
+        genes, gene order, scaling statistics, label policy, species/assay
+        provenance, or gene-contract policy changes it."""
+        payload = {k: getattr(self, k) for k in _FINGERPRINT_FIELDS}
+        blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def inspect(self) -> dict:
+        """Read-only, machine-readable summary of this artifact's identity
+        and contract — never exposes raw scaling arrays or participant-level
+        data, only counts/policies/fingerprints. Safe to print, log, or
+        attach to a bundle manifest (see model.py's bundle helpers)."""
+        return {
+            "schema_version": self.version,
+            "artifact_fingerprint": self.scientific_fingerprint(),
+            "selected_gene_count": len(self.gene_list),
+            "n_hvgs_requested": self.n_hvgs,
+            "smoke_marker_genes_forced": len(self.smoke_marker_genes_forced),
+            "fit_n_cells": self.fit_n_cells,
+            "fit_n_subjects": self.fit_n_subjects,
+            "expected_input_stage": self.expected_input_stage,
+            "missing_gene_policy": self.missing_gene_policy,
+            "duplicate_gene_policy": self.duplicate_gene_policy,
+            "unexpected_gene_policy": self.unexpected_gene_policy,
+            "minimum_gene_coverage": self.minimum_gene_coverage,
+            "batch_correction_status": self.batch_correction_status,
+            "cell_type_annotation_mode": self.cell_type_annotation_mode,
+            "cell_type_annotation_degraded": self.cell_type_annotation_degraded,
+            "cell_type_map_fingerprint": self.cell_type_map_fingerprint,
+            "label_mapping_present": self.label_mapping is not None,
+            "created_at": self.created_at,
+            "notes": list(self.notes),
+        }
+
     def save(self, path: Union[str, Path]) -> None:
+        """Atomic write: builds the full JSON in memory, then writes it via
+        a temp-file + os.replace() so a reader never observes a partially
+        written artifact and a crash mid-write leaves the previous file (or
+        nothing), never a truncated one."""
+        from benchmarks.atomic_io import atomic_write_json
+
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
-        print(f"[preprocessing] artifact saved → {path}  ({len(self.gene_list)} genes)")
+        atomic_write_json(path, self.to_dict())
+        print(f"[preprocessing] artifact saved → {path}  ({len(self.gene_list)} genes, "
+              f"fingerprint={self.scientific_fingerprint()[:12]})")
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "PreprocessingArtifact":
-        with open(path) as f:
-            d = json.load(f)
-        return cls(**d)
+        path = Path(path)
+        try:
+            with open(path) as f:
+                text = f.read()
+            d = json.loads(text)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            raise PreprocessingArtifactError(
+                f"PreprocessingArtifact.load: {path} exists but could not be parsed as valid "
+                f"JSON ({exc!r}) — this looks like a truncated or corrupted write, not a valid "
+                "artifact. Refusing to silently recover; regenerate the artifact instead."
+            ) from exc
+        if d.get("version") != ARTIFACT_VERSION:
+            raise LegacyArtifactError(
+                f"PreprocessingArtifact.load: {path} has version={d.get('version')!r}, this "
+                f"code understands version={ARTIFACT_VERSION!r} only. Loading an artifact "
+                "from an unknown/future schema version is refused rather than guessed at; "
+                "loading a genuinely legacy (pre-Phase-4) artifact-less checkpoint is a "
+                "separate, explicit opt-in — see unsafe_legacy_mode in inference.py."
+            )
+        # Unknown keys (e.g. a future field this code doesn't know about yet)
+        # are rejected rather than silently dropped — cls(**d) already does
+        # this via TypeError, but re-raised here as a clearer, artifact-
+        # specific error.
+        try:
+            return cls(**d)
+        except TypeError as exc:
+            raise PreprocessingArtifactError(
+                f"PreprocessingArtifact.load: {path} does not match the fields this code's "
+                f"PreprocessingArtifact expects ({exc!r}) — likely a schema mismatch. "
+                "Regenerate the artifact with the matching code version."
+            ) from exc
 
 
 def fit_preprocessing(
@@ -112,6 +322,11 @@ def fit_preprocessing(
     n_hvgs:             int = 2000,
     batch_key:          Optional[str] = "batch",
     subject_col:        str = "subject_id",
+    missing_gene_policy:    str = DEFAULT_MISSING_GENE_POLICY,
+    duplicate_gene_policy:  str = DEFAULT_DUPLICATE_GENE_POLICY,
+    unexpected_gene_policy: str = DEFAULT_UNEXPECTED_GENE_POLICY,
+    minimum_gene_coverage:  float = DEFAULT_MINIMUM_GENE_COVERAGE,
+    batch_correction_status: str = "disabled",
 ) -> PreprocessingArtifact:
     """
     Fit gene mean/std scaling + smoke-aware HVG selection using ONLY cells
@@ -120,6 +335,12 @@ def fit_preprocessing(
     with forced smoke-marker inclusion, but restricted to the train
     partition so val/test statistics never influence what genes are kept
     or how they're scaled.
+
+    The four `*_policy`/`minimum_gene_coverage` arguments are recorded on
+    the returned artifact and enforced later by verify_compatible()/
+    apply_preprocessing() against every val/test/inference input — see the
+    DEFAULT_* module constants and configs/default.yaml's preprocessing.*
+    keys, which must agree with these defaults.
     """
     from constants import ALL_SMOKE_MARKERS
 
@@ -190,6 +411,11 @@ def fit_preprocessing(
         cell_type_annotation_mode=adata.uns.get("cell_type_annotation_mode"),
         cell_type_annotation_degraded=adata.uns.get("cell_type_annotation_degraded"),
         cell_type_annotation_compatibility=adata.uns.get("cell_type_annotation_compatibility"),
+        missing_gene_policy=missing_gene_policy,
+        duplicate_gene_policy=duplicate_gene_policy,
+        unexpected_gene_policy=unexpected_gene_policy,
+        minimum_gene_coverage=minimum_gene_coverage,
+        batch_correction_status=batch_correction_status,
         notes=[
             "Batch correction (Harmony) is NOT part of this artifact: Harmony has "
             "no native train-only-fit / apply-to-new-data transform, so it cannot "
@@ -206,40 +432,128 @@ def apply_preprocessing(adata: ad.AnnData, artifact: PreprocessingArtifact) -> a
     Transform-only: subset/reorder genes to artifact.gene_list (in that
     exact order) and apply the train-fit mean/std scaling, clipped to
     [-10, 10] to match sc.pp.scale(max_value=10)'s legacy behaviour.
-    Raises if the input is missing genes the artifact requires.
+
+    Never mutates `artifact` and never infers/refits any parameter from
+    `adata` — this function's only job is to apply the already-fitted
+    scaling/gene-selection to new data. Raises GeneContractError per the
+    policies recorded on `artifact` (see verify_compatible()); repeated
+    calls with the same inputs produce identical output, and calling this
+    on validation data before/after calling it on test data (or vice
+    versa) never changes either result.
     """
-    verify_compatible(artifact, adata.var_names)
-    out = adata[:, artifact.gene_list].copy()
-    X = out.X
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-    X = np.asarray(X, dtype=np.float64)
+    diagnostics = verify_compatible(artifact, adata.var_names)
+
+    if diagnostics["missing"]:
+        # Only reachable when missing_gene_policy == "zero_fill" (verify_
+        # compatible already raised for policy=="error") — pad the missing
+        # columns with exact zeros (pre-scaling), which the mean/std
+        # scaling step below then transforms like any other gene. This is
+        # never presented as observed expression: diagnostics (and the
+        # printed warning) always record which genes were synthesized.
+        present = adata[:, [g for g in artifact.gene_list if g not in diagnostics["missing"]]].copy()
+        X_present = present.X
+        if hasattr(X_present, "toarray"):
+            X_present = X_present.toarray()
+        X_present = np.asarray(X_present, dtype=np.float64)
+        present_genes = list(present.var_names)
+        full = np.zeros((adata.n_obs, len(artifact.gene_list)), dtype=np.float64)
+        present_idx = {g: i for i, g in enumerate(present_genes)}
+        for j, g in enumerate(artifact.gene_list):
+            if g in present_idx:
+                full[:, j] = X_present[:, present_idx[g]]
+        X = full
+        print(f"[preprocessing] WARNING: zero-filled {len(diagnostics['missing'])} missing "
+              f"gene(s) under missing_gene_policy='zero_fill': {diagnostics['missing'][:10]}"
+              + (" ..." if len(diagnostics["missing"]) > 10 else ""))
+        out = ad.AnnData(X=X.astype(np.float32), obs=adata.obs.copy(),
+                          var=adata.var.reindex(artifact.gene_list))
+        X = full
+    else:
+        out = adata[:, artifact.gene_list].copy()
+        X = out.X
+        if hasattr(X, "toarray"):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float64)
+
     means = np.array(artifact.gene_means)
     stds  = np.array(artifact.gene_stds)
     X = np.clip((X - means) / stds, -10, 10)
     out.X = X.astype(np.float32)
+    out.uns["preprocessing_compatibility_diagnostics"] = diagnostics
     return out
 
 
-def verify_compatible(artifact: PreprocessingArtifact, gene_names) -> None:
+def verify_compatible(artifact: PreprocessingArtifact, gene_names) -> Dict:
     """
-    Raise a clear error if `gene_names` cannot be safely transformed with
-    this artifact — missing required genes, or (for direct array input,
-    where reordering isn't possible after the fact) wrong gene order.
-    Called by apply_preprocessing() and should also be called by inference
-    code paths that receive an already-HVG-selected array instead of an
-    AnnData (see inference.py).
+    Enforce this artifact's gene contract against `gene_names` and return a
+    diagnostics dict ({"missing": [...], "unexpected": [...], "duplicate":
+    [...], "coverage": float, "n_expected": int, "n_present": int}).
+    Raises GeneContractError (a ValueError subclass, for backward
+    compatibility with existing `pytest.raises(ValueError)` call sites) when:
+
+      * any gene name in `gene_names` is duplicated (always fatal — no
+        deterministic aggregation policy is implemented);
+      * a required gene is missing and artifact.missing_gene_policy=="error"
+        (the default — "zero_fill" is an explicit, non-default opt-in
+        applied by apply_preprocessing(), never silently);
+      * an unexpected gene is present and
+        artifact.unexpected_gene_policy=="error" (default policy is
+        "ignore" — unexpected genes are recorded in diagnostics but never
+        fatal on their own);
+      * gene coverage (fraction of artifact.gene_list actually present)
+        falls below artifact.minimum_gene_coverage.
+
+    Called by apply_preprocessing() and by inference code paths that
+    receive an already-HVG-selected array instead of an AnnData (see
+    inference.py). Never mutates `artifact`.
     """
     gene_names = list(gene_names)
-    missing = [g for g in artifact.gene_list if g not in gene_names]
-    if missing:
-        raise ValueError(
+
+    seen = set()
+    duplicate = sorted({g for g in gene_names if g in seen or seen.add(g)})
+    if duplicate:
+        raise GeneContractError(
+            f"Input contains {len(duplicate)} duplicate gene identifier(s): "
+            f"{duplicate[:10]}{' ...' if len(duplicate) > 10 else ''}. Duplicate gene "
+            "identifiers make gene selection/reordering ambiguous and are always rejected "
+            "— deduplicate the input (there is no supported aggregation policy)."
+        )
+
+    present = set(gene_names)
+    missing = [g for g in artifact.gene_list if g not in present]
+    unexpected = sorted(set(gene_names) - set(artifact.gene_list))
+    n_expected = len(artifact.gene_list)
+    n_present = n_expected - len(missing)
+    coverage = n_present / n_expected if n_expected else 0.0
+
+    diagnostics = {
+        "missing": missing, "unexpected": unexpected, "duplicate": duplicate,
+        "coverage": coverage, "n_expected": n_expected, "n_present": n_present,
+    }
+
+    if missing and artifact.missing_gene_policy == "error":
+        raise GeneContractError(
             f"Input is missing {len(missing)} gene(s) required by "
             f"PreprocessingArtifact version {artifact.version}: {missing[:10]}"
             + (" ..." if len(missing) > 10 else "") +
             ". Re-run the same conversion/harmonization pipeline used to fit "
-            "this artifact, or refit a new artifact for this gene panel."
+            "this artifact, or refit a new artifact for this gene panel. "
+            "(missing_gene_policy='error' is the default; 'zero_fill' is an explicit, "
+            "documented, non-default opt-in — see PreprocessingArtifact.missing_gene_policy.)"
         )
+    if unexpected and artifact.unexpected_gene_policy == "error":
+        raise GeneContractError(
+            f"Input contains {len(unexpected)} unexpected gene(s) not in this artifact's "
+            f"selected panel: {unexpected[:10]}{' ...' if len(unexpected) > 10 else ''}. "
+            "unexpected_gene_policy='error' is configured for this artifact."
+        )
+    if coverage < artifact.minimum_gene_coverage:
+        raise GeneContractError(
+            f"Gene coverage {coverage:.4f} is below this artifact's configured minimum "
+            f"({artifact.minimum_gene_coverage:.4f}): {n_present}/{n_expected} required "
+            "genes present. Refusing to transform an input this incomplete."
+        )
+    return diagnostics
 
 
 class CellTypeProvenanceError(ValueError):

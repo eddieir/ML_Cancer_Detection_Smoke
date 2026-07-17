@@ -51,6 +51,7 @@ from .hyperparameter_search import build_param_grid, select_nested_hyperparamete
 from .reporting import compare_models, new_run_dir, write_benchmark_report, write_csv_table, write_json
 from .ood import run_leave_one_source_out
 from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError, default_guard_dir
+from data.transforms import assert_batch_correction_safe
 
 
 def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentContext:
@@ -187,7 +188,8 @@ def run_smoke_task(context, args, run_dir) -> dict:
         print(f"[benchmarks] Task A NOT_EVALUABLE: {eligibility['smoke_classification'].reasons}")
         return {"eligibility": eligibility, "cv_reports": {}, "comparisons": []}
 
-    cv_report = run_smoke_cv(context, args.models, n_folds=args.cv_folds, seeds=args.seeds, device=args.device)
+    cv_report = run_smoke_cv(context, args.models, n_folds=args.cv_folds, seeds=args.seeds, device=args.device,
+                              artifact_output_root=str(run_dir))
     comparisons = []
     baseline_ref = "majority" if "majority" in args.models else args.models[0]
     for name in args.models:
@@ -353,7 +355,7 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
         return {"eligibility": eligibility, "cv_reports": {}, "comparisons": [], "calibration_report": None}
 
     cv_report = run_cancer_cv(context, args.models, n_folds=args.cv_folds, seeds=args.seeds,
-                                device=args.device, pooling=args.pooling)
+                                device=args.device, pooling=args.pooling, artifact_output_root=str(run_dir))
     comparisons = []
     baseline_ref = "prevalence" if "prevalence" in args.models else args.models[0]
     for name in args.models:
@@ -438,6 +440,14 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     # labels, and test predictions are resolved for the FIRST time only
     # inside the try block below, strictly after guard.acquire() succeeds.
     # ══════════════════════════════════════════════════════════════════════
+    # Refuse to even approach guard acquisition if this run's outer artifact
+    # was produced under transductive (disclosed, non-leakage-free) batch
+    # correction — the one-shot frozen-test guarantee is meaningless if
+    # held-out expression already influenced a shared batch-correction
+    # embedding before the guard was ever acquired. See data/transforms.py::
+    # assert_batch_correction_safe / UnsafeBatchCorrectionError.
+    assert_batch_correction_safe(context.transductive_batch_correction, context_name="runner.run (frozen-test stage)")
+
     bench_cfg = context.config.get("benchmarks", {})
     disable_guard = bool(bench_cfg.get("disable_frozen_test_guard", False))
     if disable_guard and not synthetic:

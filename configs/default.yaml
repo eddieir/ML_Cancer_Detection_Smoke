@@ -117,7 +117,22 @@ preprocessing:
   scaling:
     fit_partition: train
     zero_variance_policy: unit_scale
+  # Gene-contract policies enforced by data/preprocessing.py::verify_compatible
+  # against every validation/test/inference input transformed with a fitted
+  # PreprocessingArtifact — see PreprocessingArtifact.missing_gene_policy etc.
+  # and tests/test_config_consistency.py, which fails the build if these
+  # ever drift from data/preprocessing.py's DEFAULT_* constants.
   missing_gene_policy: error
+  # No aggregation policy is implemented for a duplicate gene identifier —
+  # 'error' is the only supported value.
+  duplicate_gene_policy: error
+  # 'ignore' (default): a gene present in the input but not in the
+  # artifact's selected panel is recorded in compatibility diagnostics but
+  # does not block the transform. 'error' rejects it outright.
+  unexpected_gene_policy: ignore
+  # Fraction (0, 1] of the artifact's selected gene panel that must be
+  # present in an input before it is transformed at all.
+  minimum_gene_coverage: 1.0
   batch_correction:
     method: harmony
     # mode: none (default) | train_fitted_inductive | transductive_diagnostic_only

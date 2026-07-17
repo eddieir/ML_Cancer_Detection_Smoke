@@ -73,3 +73,25 @@ def test_cancer_cv_baseline_folds_never_touch_test_split():
     result = run_cancer_cv(ctx, ["prevalence"], n_folds=2, seeds=[42])
     for fold in result["results"]["prevalence"]["folds"]:
         assert fold["auroc"] in (None, 0.5) or (0.0 <= fold["auroc"] <= 1.0)
+
+
+def test_smoke_cv_persists_fold_artifacts_when_output_root_given(tmp_path):
+    """artifact_output_root wires run_smoke_cv's per-fold refit into
+    fold_preprocessing.save_fold_artifact — an on-disk artifact per
+    (seed, fold), not just an in-memory object discarded after the run."""
+    from benchmarks.fold_preprocessing import load_fold_artifact
+
+    ctx = build_synthetic_context(seed=1, fast=True)
+    run_smoke_cv(ctx, ["majority"], n_folds=2, seeds=[42], artifact_output_root=str(tmp_path))
+    art_f0 = load_fold_artifact(tmp_path, "s42_f0")
+    art_f1 = load_fold_artifact(tmp_path, "s42_f1")
+    assert art_f0.scientific_fingerprint() != art_f1.scientific_fingerprint()
+
+
+def test_cancer_cv_persists_fold_artifacts_when_output_root_given(tmp_path):
+    from benchmarks.fold_preprocessing import load_fold_artifact
+
+    ctx = build_synthetic_context(seed=1, fast=True)
+    run_cancer_cv(ctx, ["prevalence"], n_folds=2, seeds=[42], artifact_output_root=str(tmp_path))
+    art_f0 = load_fold_artifact(tmp_path, "s42_f0")
+    assert art_f0.fit_n_subjects > 0

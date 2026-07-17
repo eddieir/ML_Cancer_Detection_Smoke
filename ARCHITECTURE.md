@@ -1280,3 +1280,173 @@ independently, so the report can't drift from what the pipeline itself
 recorded. It flags at minimum: zero subjects with a known cancer outcome,
 and classes that couldn't be stratified across splits. Persisted as JSON
 (full detail) plus a compact per-split CSV summary.
+
+### 14.9 Preprocessing artifact contract ("Phase 4")
+
+The fit/apply boundary itself (§14.3) was already correct: `fit_preprocessing`
+only ever sees training-subject cells, and `apply_preprocessing` only ever
+subsets/reorders/scales using parameters already fixed at fit time. What
+this section adds is a stricter, checkable contract around that boundary.
+
+**Fingerprint hierarchy.** `PreprocessingArtifact.scientific_fingerprint()`
+hashes a fixed, explicit field list (`_FINGERPRINT_FIELDS` in
+`data/preprocessing.py`): gene list/order, scaling statistics, HVG count,
+forced-marker list, fit cell/subject counts, label-mapping, cell-type
+annotation provenance, and gene-contract policy. `created_at` and free-text
+`notes` are excluded — they're informational, not scientific state. This is
+a single flat fingerprint over the artifact itself, not a tree of
+sub-fingerprints; `fold_preprocessing.py::artifact_fingerprint` (already
+present) computes a related but distinct identity used specifically for
+per-fold/OOF bookkeeping and is unchanged by this section.
+
+**Checkpoint/artifact binding.** `Trainer._save()` embeds
+`preprocessing_artifact_fingerprint` (and the artifact's gene count) in
+every checkpoint, sourced from whichever artifact `Trainer.
+set_preprocessing_artifact()` was given (`Trainer.from_experiment_context`
+wires this automatically from `ExperimentContext.preprocessing_artifact`).
+`Predictor.from_config()` recomputes the fingerprint of the
+`preprocessing_artifact.json` it finds next to the checkpoint and raises
+`ArtifactCompatibilityError` if the two disagree, or if the artifact's gene
+count doesn't match what the checkpoint was trained with. A checkpoint
+saved without a wired-in artifact (legacy runs, or a Trainer that never
+called `set_preprocessing_artifact`) records `None` and is treated by
+`Predictor.from_config` exactly as before this change: it proceeds only
+under the existing `unsafe_legacy_mode` opt-in.
+
+**Gene contract.** `verify_compatible()` now performs four checks, each
+independently configurable on the artifact and defaulting to the
+conservative option: duplicate identifiers in the input (always fatal —
+no aggregation policy exists), missing required genes
+(`missing_gene_policy`, default `error`; `zero_fill` is available only as
+an explicit, recorded, non-default opt-in applied inside
+`apply_preprocessing`, never silently), genes present but outside the
+artifact's selected panel (`unexpected_gene_policy`, default `ignore` —
+recorded in `uns["preprocessing_compatibility_diagnostics"]`, never fatal
+by itself), and overall coverage against `minimum_gene_coverage` (default
+`1.0`). `configs/default.yaml`'s `preprocessing.*` keys mirror these
+defaults exactly, checked by a dedicated consistency test.
+
+**Serialization.** `PreprocessingArtifact.save()`/`.load()` route through
+`benchmarks/atomic_io.py`'s existing temp-file-plus-`os.replace()` atomic
+write path (the same primitive `test_guard.py` and `reporting.py` already
+use) and raise typed errors (`PreprocessingArtifactError`,
+`GeneContractError`, `ArtifactCompatibilityError`, `LegacyArtifactError`)
+on corruption, an unrecognized schema version, or a field-set mismatch,
+rather than a generic exception or a silent partial load.
+
+### 14.10 Per-fold artifact ownership
+
+`fold_preprocessing.py::refit_artifact_for_fold` already fit an
+independent `PreprocessingArtifact` per CV fold, from only that fold's
+training subjects — a property that predates this section. What this
+section adds is persistence: `save_fold_artifact(artifact, output_root,
+fold_idx, train_subjects, val_subjects)` writes
+`<output_root>/preprocessing/fold_XX/artifact.json` (via
+`PreprocessingArtifact.save`, atomic) and, LAST, `manifest.json`
+(deterministic train/val-subject fingerprints via SHA-256 over a
+sorted-and-JSON-encoded subject-ID list, plus the artifact's own
+`scientific_fingerprint()`, plus `status: "complete"`). Writing the
+manifest last, after the artifact file is durably on disk, is what makes
+an interrupted persist detectable: `load_fold_artifact()` raises
+`IncompleteFoldArtifactError` if `manifest.json` is missing or doesn't
+record `status="complete"`. `load_fold_artifact(expected_train_subjects=,
+expected_val_subjects=, expected_artifact_fingerprint=)` verifies every
+supplied expectation against what was actually persisted before returning
+anything, raising `FoldArtifactMismatchError` on any mismatch — this is
+the mechanism that stops one fold's persisted artifact from being reused
+under another fold's identity. `cross_validation.py`'s
+`run_smoke_cv`/`run_cancer_cv` gained an optional `artifact_output_root`
+parameter (default `None`, preserving prior in-memory-only behavior
+exactly) that wires this persistence in, keyed by `f"s{seed}_f{fold_idx}"`
+so multiple seeds never collide on the same fold directory; `runner.py`'s
+benchmark CLI always passes the run's own output directory.
+
+### 14.11 Batch-correction safety gate
+
+`data/transforms.py::assert_batch_correction_safe(transductive_batch_correction,
+context_name)` raises `UnsafeBatchCorrectionError` when its first argument
+is `True`. It is called from three places: `fold_preprocessing.py::
+require_normalized_adata` (the single chokepoint every CV/OOF fold refit
+and the final development-pool fit already funneled through), and
+`runner.py`, immediately before frozen-test guard acquisition. Previously,
+`ExperimentContext.transductive_batch_correction` was recorded and
+reported but never used to gate anything — a run that opted into
+disclosed, non-leakage-free Harmony at the outer-split stage could still
+reach CV, OOF generation, the final fit, and frozen-test evaluation
+without any of them refusing it. `PreprocessingArtifact.
+batch_correction_status` (`"disabled"` default, or
+`"transductive_diagnostic_only"`) is set from the same resolved
+`bc_mode`/`allow_transductive_harmony` config values `preprocess.py`
+already computed, moved earlier in that function so the artifact's own
+field reflects the actual resolved mode rather than being patched onto an
+already-constructed (and, by this section's own fit/apply contract,
+treated-as-immutable) artifact after the fact. `fold_preprocessing.
+artifact_fingerprint()` was changed from an independently-computed SHA-256
+over a hand-picked field subset to a thin wrapper around
+`PreprocessingArtifact.scientific_fingerprint()` — every caller (per-fold
+records, OOF prediction records, the final development artifact, the
+frozen-test guard identity, `ExperimentContext.
+preprocessing_artifact_fingerprint`) now collides on exactly one
+fingerprint definition instead of two that happened to agree by
+construction.
+
+### 14.12 Model bundle manifest
+
+`benchmarks/bundle.py` defines a bundle: a directory holding a model
+checkpoint (referenced by a bundle-relative path plus SHA-256, never
+copied — checkpoints are large binaries this repository does not commit),
+a copy of the `PreprocessingArtifact` it was trained with, and
+`bundle_manifest.json` — model configuration, class vocabulary, label
+policy, species policy, assay mode, dataset-manifest fingerprint, split
+fingerprint, calibration state, decision threshold, an environment
+snapshot, per-component SHA-256 hashes, and one `bundle_fingerprint`
+covering the whole manifest (order-independent — computed over a
+canonical sorted-key JSON encoding, so unrelated key reordering never
+changes it, but any content change does). `write_model_bundle()` is the
+only writer; `load_and_validate_bundle()` re-derives every hash and
+fingerprint and raises `BundleCorruptionError` (missing/unparsable/wrong-
+schema manifest, missing referenced file) or `BundleValidationError`
+(hash/fingerprint/gene-count mismatch) before returning anything usable.
+`validate_bundle_for_model(manifest, model)` additionally checks a
+constructed model's `input_dim`/`num_smoke` against the bundle's own
+gene count/class vocabulary. `validate_bundle_matches_identity(manifest,
+expected)` is the resume-safety check: it compares
+`dataset_manifest_fingerprint`/`split_fingerprint` against caller-supplied
+expectations before a bundle is treated as reusable. `Trainer.
+write_bundle()` (`train.py`) is the integration point: it requires
+`self.preprocessing_artifact` to already be wired in (via
+`set_preprocessing_artifact`, itself now called automatically by
+`Trainer.from_experiment_context`) and refuses to build a bundle without
+one. A directory with a checkpoint but no `bundle_manifest.json` — the
+shape every pre-Phase-4 checkpoint directory has — raises
+`LegacyBundleError` unless the caller passes `allow_legacy=True`
+explicitly, mirroring `inference.py`'s existing `unsafe_legacy_mode` policy
+rather than introducing a second, differently-shaped legacy contract.
+
+### 14.13 Frozen-test access sentinels
+
+`benchmarks/sentinel.py::FrozenAccessSentinel` is deliberately narrow in
+scope: it does not gate WHEN test data may be evaluated (that remains
+`test_guard.py`'s job, unchanged) — it makes "was this specific object
+ever read" a directly testable property. Every dunder a real piece of test
+data (an AnnData, a numpy array, a pandas object, a plain dict/list of bag
+metadata) could plausibly be read through — `__getattr__`, `__iter__`,
+`__getitem__`, `__len__`, `__array__`, `__bool__`, `__repr__`, `__eq__`,
+`__contains__`, and others — raises `FrozenDataAccessError` immediately.
+`tests/test_frozen_test_sentinel.py` wraps a real synthetic
+`ExperimentContext`'s `test_bags`/`test_cell_dataset` in sentinels and runs
+the actual development call sequence `runner.py` uses before guard
+acquisition (`run_smoke_cv`, `run_cancer_cv`, `generate_subject_oof_predictions`,
+`fit_final_candidate_on_dev_pool`) end to end — if any of those functions
+ever touched test data, the test would fail with a traceback pointing at
+the exact line that did.
+
+**Scope note.** This section (§14.9–§14.13) hardens the artifact's own
+identity/contract, its binding to a checkpoint and to a full bundle
+manifest, per-fold artifact persistence, batch-correction gating at every
+leakage-free protocol's entry point, and frozen-test access verifiability.
+It does not introduce a new inductive batch-correction method — Harmony
+remains transductive-only, and `UnsafeBatchCorrectionError` makes that
+limitation enforced rather than merely documented, not fixed. It does not
+change `test_guard.py` itself. These remain the section's honest
+boundaries, not claims made beyond them.

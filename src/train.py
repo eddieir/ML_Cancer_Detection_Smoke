@@ -531,6 +531,17 @@ class Trainer:
         # Experiment metadata carried into every saved checkpoint (section 8/22).
         self.split_manifest_path:      Optional[str] = None
         self.preprocessing_artifact_path: Optional[str] = None
+        # The actual fitted PreprocessingArtifact this Trainer's data was
+        # transformed with, if known — set via set_preprocessing_artifact()
+        # (called automatically by from_experiment_context()). _save()
+        # embeds its scientific_fingerprint() in every checkpoint so a
+        # later loader (Predictor.from_config, evaluate.py) can reject a
+        # checkpoint paired with a DIFFERENT preprocessing artifact instead
+        # of silently trusting whatever preprocessing_artifact.json happens
+        # to sit next to the checkpoint file. None means "no artifact was
+        # wired in" (legacy/diagnostic/synthetic run) — checkpoints saved
+        # this way carry no fingerprint to check against.
+        self.preprocessing_artifact = None
         self.effective_label_mapping:  Optional[Dict] = None
         self.rare_class_policy:        Optional[str] = None
         self.transductive_batch_correction: bool = False
@@ -603,7 +614,31 @@ class Trainer:
         trainer.set_label_mapping(context.label_mapping)
         trainer.transductive_batch_correction = context.transductive_batch_correction
         trainer.rare_class_policy = context.label_mapping.policy
+        # getattr, not context.preprocessing_artifact directly: some
+        # lightweight/fake ExperimentContext test doubles (and any future
+        # minimal context) may not define this attribute at all — treated
+        # the same as "no artifact wired in" (None), matching Trainer's own
+        # default, rather than an AttributeError unrelated to preprocessing.
+        trainer.set_preprocessing_artifact(getattr(context, "preprocessing_artifact", None))
         return trainer
+
+    def set_preprocessing_artifact(self, artifact) -> None:
+        """Wire this Trainer's PreprocessingArtifact in so _save() can embed
+        its scientific_fingerprint() in every checkpoint — see the
+        docstring on self.preprocessing_artifact. Also cross-checks the
+        artifact's selected-gene count against self.model.input_dim
+        (when set), since a checkpoint whose model input width doesn't
+        match its own artifact's gene count is already unusable — better to
+        fail here than after training."""
+        if artifact is not None:
+            model_input_dim = getattr(self.model, "input_dim", None)
+            if model_input_dim is not None and model_input_dim != len(artifact.gene_list):
+                raise ValueError(
+                    f"Trainer.set_preprocessing_artifact: model.input_dim={model_input_dim} "
+                    f"does not match artifact.gene_list length={len(artifact.gene_list)} — "
+                    "this model cannot consume this artifact's output."
+                )
+        self.preprocessing_artifact = artifact
 
     def set_label_mapping(self, mapping: "EffectiveLabelMapping") -> None:
         """
@@ -704,6 +739,22 @@ class Trainer:
             "training_config":    self.cfg,
             "split_manifest_path": self.split_manifest_path,
             "preprocessing_artifact_path": self.preprocessing_artifact_path,
+            # Scientific fingerprint (data/preprocessing.py::
+            # PreprocessingArtifact.scientific_fingerprint) of the artifact
+            # this checkpoint's training data was actually transformed
+            # with, plus its selected-gene count — None when no artifact
+            # was wired in (see set_preprocessing_artifact). A loader
+            # (Predictor.from_config) that finds BOTH this fingerprint and
+            # a preprocessing_artifact.json on disk must verify they match
+            # before trusting the pair together.
+            "preprocessing_artifact_fingerprint": (
+                self.preprocessing_artifact.scientific_fingerprint()
+                if self.preprocessing_artifact is not None else None
+            ),
+            "preprocessing_artifact_gene_count": (
+                len(self.preprocessing_artifact.gene_list)
+                if self.preprocessing_artifact is not None else None
+            ),
             "effective_label_mapping": self.effective_label_mapping,
             "rare_class_policy":  self.rare_class_policy,
             "transductive_batch_correction": self.transductive_batch_correction,
@@ -727,6 +778,54 @@ class Trainer:
         path = self.ckpt_dir / f"phase{phase}_best.pt"
         torch.save(payload, path)
         self._log(f"    ✓ checkpoint saved  ({metric_name}={metric:.4f})")
+
+    def write_bundle(
+        self,
+        phase: int,
+        bundle_dir: Optional[Union[str, Path]] = None,
+        dataset_manifest_fingerprint: Optional[str] = None,
+        split_fingerprint: Optional[str] = None,
+        calibration_state: Optional[Dict] = None,
+        decision_threshold: Optional[float] = None,
+        environment_snapshot: Optional[Dict] = None,
+    ) -> Path:
+        """
+        Write a full model-bundle manifest (benchmarks/bundle.py) for the
+        checkpoint already saved at ckpt_dir/phase{phase}_best.pt, bound to
+        self.preprocessing_artifact (see set_preprocessing_artifact). Raises
+        ValueError if no artifact is wired in — a bundle with no
+        preprocessing artifact reference is not a real Phase 4 bundle, and
+        this method never fabricates a placeholder one.
+        """
+        from benchmarks.bundle import write_model_bundle
+        from benchmarks.reporting import _environment_snapshot
+
+        if self.preprocessing_artifact is None:
+            raise ValueError(
+                "Trainer.write_bundle: no preprocessing artifact is wired in (see "
+                "set_preprocessing_artifact) — cannot build a model bundle without one."
+            )
+        if environment_snapshot is None:
+            environment_snapshot = _environment_snapshot(synthetic=False, seed=self.seed)
+        ckpt_path = self.ckpt_dir / f"phase{phase}_best.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"Trainer.write_bundle: no checkpoint at {ckpt_path} — call _save()/train this "
+                "phase first."
+            )
+        bundle_dir = Path(bundle_dir) if bundle_dir is not None else self.ckpt_dir / f"bundle_phase{phase}"
+        class_vocabulary = self._class_names()
+        species_policy = self.full_cfg.get("data", {}).get("experiment_mode", "human_only")
+        assay_mode = self.full_cfg.get("data", {}).get("assay_mode", "human_single_cell")
+        label_policy = self.rare_class_policy or self.full_cfg.get("data", {}).get("label_policy", "verified_only")
+        return write_model_bundle(
+            bundle_dir, ckpt_path, self.preprocessing_artifact,
+            model_config=self.full_cfg.get("model", {}), class_vocabulary=class_vocabulary,
+            label_policy=label_policy, species_policy=species_policy, assay_mode=assay_mode,
+            dataset_manifest_fingerprint=dataset_manifest_fingerprint, split_fingerprint=split_fingerprint,
+            calibration_state=calibration_state, decision_threshold=decision_threshold,
+            environment_snapshot=environment_snapshot,
+        )
 
     def _load_best(self, phase: int, unsafe_legacy_mode: bool = False) -> Dict:
         """
