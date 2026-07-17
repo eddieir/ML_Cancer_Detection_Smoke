@@ -1600,21 +1600,104 @@ bundle-manifest identity binding) with unit and integration test coverage
 across gene modules, the pathway encoder, hierarchical attention, multitask
 masking, domain conditioning, and checkpoint/bundle identity, plus a
 synthetic end-to-end training loop and a frozen-test-sentinel
-non-access check.
+non-access check. A second pass (§15.8) additionally wires the model into
+`benchmarks/runner.py`'s CLI, the nested cross-validation loop, the
+hyperparameter search, the OOF/final-development-fit protocol, and a
+dedicated ablation runner.
 
-It deliberately does **not** wire this architecture into
-`src/benchmarks/runner.py`'s CLI model-selection surface, the nested
-cross-validation loop (`cross_validation.py`), the hyperparameter-search
-loop (`hyperparameter_search.py`), or a dedicated
-`--pathway-hierarchical-ablation` runner flag alongside the existing
-imbalance-ablation CLI. Those integrations would require touching large,
-already-hardened orchestration modules under real time constraints, and
-doing so shallowly (wiring the CLI flag without the same leakage
-discipline the rest of this file documents) would be worse than leaving it
-undone and documented. An adversarial domain-training head, a
-temperature-scaling calibration fit specific to this model (as opposed to
-reusing the existing generic calibrator), and a full declared
-hyperparameter-search sweep for this architecture are similarly not
-implemented. All of these are natural follow-on work, not silently dropped
-requirements — see the accompanying pull request description for the
-itemized list against the original specification.
+An adversarial domain-training head and a model-specific calibration fit
+(as opposed to reusing the existing generic post-hoc calibrator) remain
+unimplemented — natural follow-on work, not silently dropped requirements.
+See the accompanying pull request description for the itemized list
+against the original specification.
+
+### 15.8 CLI, nested cross-validation, hyperparameter search, and ablation integration
+
+`benchmarks/mil_registry.py` is the one place that maps a Task A/B
+MIL-kind candidate name to its adapter class:
+`NeuralCancerAdapter` for `"neural"`/`"mean_mil"`/`"max_mil"`/
+`"attention_mil"` (unchanged), and the new
+`PathwayHierarchicalAdapter` (`benchmarks/pathway_hierarchical_adapter.py`)
+for `"pathway_hierarchical_mil"`. `PathwayHierarchicalAdapter.fit`/
+`fit_final`/`predict_proba` intentionally mirror `NeuralCancerAdapter`'s
+signatures exactly (including the unused cell-dataset positional arguments
+and the `pretrain_epochs` keyword, which this adapter treats as its single
+AdamW training loop's epoch count — the architecture has no separate
+cell-level pretraining phase, so nothing needs a Phase 1 step), so
+`cross_validation.py` and `final_evaluation.py` dispatch through
+`build_mil_adapter()` at construction time and otherwise call every
+MIL-kind candidate identically. `run_cancer_cv`'s existing `mil_names`
+list, `final_evaluation.py`'s `is_mil_candidate`/`_fit_mil`/
+`fit_final_candidate_on_dev_pool`, and `runner.py`'s
+`_final_dev_pool_hyperparameters` were extended with one branch each
+(`name == "pathway_hierarchical_mil"`) selecting this candidate's own
+declared search space and fit-score function instead of the pooling-based
+`MIL_SEARCH_SPACE`/`_mil_fit_score_fn` — every other candidate's code path
+is untouched.
+
+`run_smoke_cv` previously had no subject-level MIL branch at all (only a
+cell-level `"neural"` special case and a subject-summary baseline path);
+a third branch was added that builds one-cell-minimum MIL bags via
+`fold_preprocessing.bags_from_fold_cell_dataset(..., {}, min_cells_per_subject=1)`
+(no cancer outcomes required — every bag's `cancer_label_known=False` for
+this task) and scores subject-level Macro-F1 restricted to subjects with a
+known majority smoke label.
+
+`check_mil_eligibility` (>=10 known-outcome subjects, >=2 per class) is
+applied explicitly wherever this adapter's cancer-task fit happens — the
+pooling-based adapters get this check for free inside `Trainer.phase2`
+(both train AND val subject sets); since `PathwayHierarchicalAdapter` has
+no `Trainer`, the same two-sided check is called explicitly at every
+matching call site (`_pathway_cancer_fit_score_fn`, the `run_cancer_cv` mil
+loop, `_fit_mil`, and the ablation runner), so a too-small/degenerate fold
+is rejected identically regardless of which MIL-kind candidate is running.
+The one final development-pool fit (`fit_final_candidate_on_dev_pool`) has
+no validation split to check for ANY MIL-kind candidate, matching
+`Trainer.phase2_final_fit`'s own no-internal-validation contract exactly.
+
+The declared search space (`mil_registry.PATHWAY_SEARCH_SPACE`) covers
+`embedding_dim` ([64, 128]), `attention_dim` ([32, 64]), `dropout`
+([0.1, 0.3]), `use_gene_residual` ([True, False]), `smoke_loss_weight`
+([0.5, 1.0]), and `cancer_loss_weight` ([0.5, 1.0]) — selected via the
+same `select_nested_hyperparameters_with_refit` every other candidate
+uses (fold-local inner-CV selection, a fresh `PreprocessingArtifact` refit
+per inner fold, no reuse of one fold's selection inside another fold's
+OOF prediction). A reduced single-candidate grid
+(`pathway_search_space(fast=True)`) exists for synthetic/CI use but is not
+yet wired into a `--fast`-conditional call site — the full grid runs even
+under `--synthetic --fast` today, which is correct but slower than
+necessary; see the honest-limitations list.
+
+OOF prediction records (`generate_subject_oof_predictions`) and per-fold
+CV records now carry `module_fingerprint` alongside the
+`preprocessing_fingerprint`/`model_state_fingerprint` every candidate
+already recorded; `runner.py`'s OOF CSV gained a `module_fingerprint`
+column (empty for every non-pathway candidate).
+
+`benchmarks/pathway_hierarchical_adapter.py::validate_pathway_bundle_identity`
+cross-checks an already-loaded bundle manifest's `model_type` and
+`module_fingerprint` fields against a constructed model instance — the
+same shape of check `bundle.py::validate_bundle_for_model` already performs
+generically for `input_dim`/`num_smoke` — so a bundle built for a different
+architecture, or against a different gene-module set, is rejected before
+its checkpoint is trusted.
+
+`benchmarks/pathway_hierarchical_ablation.py` (CLI flag
+`--pathway-hierarchical-ablation`, following the existing
+`--imbalance-ablation` convention) compares six variants over the SAME
+cancer-task grouped-subject CV folds `run_cancer_cv` would use:
+`existing_attention_mil` (the pre-existing gated-attention MIL baseline,
+via `NeuralCancerAdapter`), `full_multitask`, `no_gene_residual`,
+`no_cell_type_embedding`, `single_task_cancer`
+(`smoke_loss_weight=0.0`), and `single_task_smoke`
+(`cancer_loss_weight=0.0`). Because this architecture produces both a
+cancer prediction and a smoke prediction from one fit, every pathway
+variant's fold record carries BOTH task's metrics (cancer AUROC/AUPRC as
+the primary comparison metric, smoke Macro-F1 as a secondary diagnostic
+restricted to subjects with a known majority smoke label) from the same
+fitted model — `existing_attention_mil` has no subject-level smoke
+prediction surface, so its smoke metric is recorded as not evaluated,
+never fabricated. Variants requiring unimplemented features (an
+adversarial domain-training head) are absent, not faked. Every result is
+explicitly marked `development_only`/`software_only`; the frozen test
+split is never touched.

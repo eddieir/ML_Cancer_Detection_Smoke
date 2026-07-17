@@ -1711,17 +1711,37 @@ masking, optional source/species conditioning, and checkpoint/bundle
 identity, plus a synthetic end-to-end training-loop integration test) with:
 
 ```
-pytest tests/test_pathway_hierarchical_mil.py tests/test_pathway_hierarchical_mil_integration.py
+pytest tests/test_pathway_hierarchical_mil.py tests/test_pathway_hierarchical_mil_integration.py \
+       tests/test_pathway_hierarchical_cv_integration.py
 ```
 
-**Scope note.** This model is not yet wired into `benchmarks/runner.py`'s
-CLI model selection, the nested cross-validation loop, the hyperparameter-
-search loop, or a dedicated ablation-runner flag — see ARCHITECTURE.md §15.7
-for the explicit list of what remains unimplemented and why. All results
-produced against synthetic data anywhere in this repository (including this
-model's tests) are software-correctness checks, not scientific evidence,
-and no result from this model has been produced against real data or the
-frozen test set.
+The model is registered as `pathway_hierarchical_mil` wherever
+`benchmarks/runner.py` selects a model, and participates in the same
+grouped-subject nested cross-validation, out-of-fold prediction, and
+final-development-fit protocol every other candidate uses (see
+ARCHITECTURE.md §15.8):
+
+```
+python -m benchmarks.runner --synthetic --fast --task smoke \
+    --models majority pathway_hierarchical_mil
+python -m benchmarks.runner --synthetic --fast --task cancer \
+    --models prevalence pathway_hierarchical_mil
+python -m benchmarks.runner --synthetic --fast --task smoke \
+    --models majority pathway_hierarchical_mil --pathway-hierarchical-ablation
+```
+
+A real (non-synthetic) run requires a supplied gene-module file
+(`model.pathway_hierarchical_mil.gene_modules.path`) — without one, the
+model refuses to construct with an actionable configuration error rather
+than silently substituting the synthetic diagnostic scheme.
+
+**Scope note.** An adversarial domain-training head and a model-specific
+calibration fit (the existing generic post-hoc calibrator is reused
+unchanged instead) remain unimplemented — see ARCHITECTURE.md §15.7/§15.8
+for the full, explicit list. All results produced against synthetic data
+anywhere in this repository (including this model's tests) are
+software-correctness checks, not scientific evidence, and no result from
+this model has been produced against real data or the frozen test set.
 
 ## Next steps
 
