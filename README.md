@@ -1667,6 +1667,62 @@ matrix, `subject_id` and `cell_type_id` in `.obs`), and a matching
 All model/train/data hyperparameters live in [configs/default.yaml](configs/default.yaml),
 consumed via `MultiSmokeCancerNet.from_config()` and `Trainer.from_config()`.
 
+## Pathway-aware hierarchical MIL (research candidate)
+
+`src/pathway_hierarchical_mil.py` implements an optional second
+architecture, code identifier `pathway_hierarchical_mil`: a pathway/gene-
+module-aware cell encoder feeding a two-level (cell -> cell-type -> subject)
+gated-attention multi-instance model with smoke-type and cancer-risk heads.
+It is a research candidate — not described here or elsewhere in this
+repository as clinically validated, superior to `MultiSmokeCancerNet`, or
+scientifically novel. It is disabled by default
+(`model.pathway_hierarchical_mil.enabled: false`) and does not change
+`MultiSmokeCancerNet`'s behavior.
+
+The pathway/gene-module layer requires an explicit, versioned module
+definition. Supply a GMT-style file (`module<TAB>description<TAB>GENE1<TAB>GENE2...`)
+via `model.pathway_hierarchical_mil.gene_modules.path`; module membership is
+aligned to the same ordered gene list the preprocessing artifact was fit
+with, genes not in that list are dropped from membership (never leaked back
+into preprocessing), and a module falling below
+`minimum_genes_per_module` is dropped or rejected per
+`empty_module_policy`. No pathway resource is downloaded automatically and
+none is committed to this repository. With no file supplied, the model
+refuses to construct outside test/synthetic mode — a deterministic,
+clearly-labelled synthetic module scheme
+(`GeneModuleCollection.synthetic`) is available only when
+`gene_modules.allow_synthetic_modules` is explicitly set for a synthetic
+workflow.
+
+Cell-type-aware hierarchical pooling produces two levels of gated-attention
+diagnostics (per-cell, within cell type; per-cell-type, within subject),
+both masked so padded cells and unobserved cell types contribute exactly
+zero weight. Smoke and cancer labels each carry an explicit known/unknown
+mask; an unknown label never contributes to that task's loss and is never
+treated as a negative outcome. The model integrates with the existing
+Phase 4 bundle system (`benchmarks/bundle.py`): its checkpoint identity is
+bound to both the preprocessing artifact's fingerprint and a separate gene-
+module fingerprint, and loading a bundle built for a different module set
+or preprocessing artifact fails loudly rather than silently.
+
+Run its test suite (unit coverage for the gene-module contract, masked
+pathway encoder, hierarchical attention masking/normalization, multitask
+masking, optional source/species conditioning, and checkpoint/bundle
+identity, plus a synthetic end-to-end training-loop integration test) with:
+
+```
+pytest tests/test_pathway_hierarchical_mil.py tests/test_pathway_hierarchical_mil_integration.py
+```
+
+**Scope note.** This model is not yet wired into `benchmarks/runner.py`'s
+CLI model selection, the nested cross-validation loop, the hyperparameter-
+search loop, or a dedicated ablation-runner flag — see ARCHITECTURE.md §15.7
+for the explicit list of what remains unimplemented and why. All results
+produced against synthetic data anywhere in this repository (including this
+model's tests) are software-correctness checks, not scientific evidence,
+and no result from this model has been produced against real data or the
+frozen test set.
+
 ## Next steps
 
 - Run `python -m benchmarks.runner` against the real merged data (GSE994 +
