@@ -1605,11 +1605,11 @@ non-access check. A second pass (§15.8) additionally wires the model into
 hyperparameter search, the OOF/final-development-fit protocol, and a
 dedicated ablation runner.
 
-An adversarial domain-training head and a model-specific calibration fit
-(as opposed to reusing the existing generic post-hoc calibrator) remain
-unimplemented — natural follow-on work, not silently dropped requirements.
-See the accompanying pull request description for the itemized list
-against the original specification.
+A model-specific calibration fit (as opposed to reusing the existing
+generic post-hoc calibrator) remains unimplemented. An adversarial domain-
+training head was implemented in Phase 6 — see §16.4 — together with
+CORAL/MMD regularizers and the source-held-out evaluation protocol those
+strategies are compared under.
 
 ### 15.8 CLI, nested cross-validation, hyperparameter search, and ablation integration
 
@@ -1697,7 +1697,169 @@ the primary comparison metric, smoke Macro-F1 as a secondary diagnostic
 restricted to subjects with a known majority smoke label) from the same
 fitted model — `existing_attention_mil` has no subject-level smoke
 prediction surface, so its smoke metric is recorded as not evaluated,
-never fabricated. Variants requiring unimplemented features (an
-adversarial domain-training head) are absent, not faked. Every result is
-explicitly marked `development_only`/`software_only`; the frozen test
-split is never touched.
+never fabricated. This ablation predates the domain-adversarial training
+head (§16.4), which is now implemented as a separate, source-held-out-
+specific ablation — see `benchmarks/domain_robustness_ablation.py`. Every
+result is explicitly marked `development_only`/`software_only`; the frozen
+test split is never touched.
+
+## 16. Source-Held-Out Domain Robustness and Biological Stability ("Phase 6")
+
+Phase 6 adds a source-held-out evaluation protocol, optional development-
+only domain-robust training strategies for `pathway_hierarchical_mil`,
+label-free domain-shift and source-predictability diagnostics, and
+synthetic-module-scoped biological-stability diagnostics. It changes
+nothing about `MultiSmokeCancerNet`'s default behavior, the frozen-test
+protocol (§14.7), or any existing candidate's ordinary CV/OOF path unless a
+new Phase 6 flag is explicitly passed.
+
+### 16.1 Source-held-out data flow
+
+`benchmarks/source_held_out.py` implements, for each dataset source present
+in the train+val pool:
+
+```
+All sources in train+val pool
+    -> per source: assess eligibility (source_eligibility.py)
+    -> eligible?
+         no  -> record status + reason, continue to the next source
+         yes -> development_subjects = pool - held_out_source's subjects
+                -> generate_subject_oof_predictions(..., dev_subjects=development_subjects, ...)
+                   (final_evaluation.py, UNMODIFIED — restricting its
+                   dev_subjects argument to development-only subjects is
+                   what makes this a source-safe selection: the function's
+                   own per-OOF-fold nested hyperparameter search never sees
+                   the held-out source at all)
+                -> rank candidates by development-only OOF AUROC/macro-F1
+                -> one nested hyperparameter selection over the FULL
+                   development pool (hyperparameter_search.py, unmodified)
+                -> fit_final_candidate_on_dev_pool(..., dev_subjects=development_subjects, ...)
+                   (final_evaluation.py, UNMODIFIED)
+                -> build_frozen_policy from development OOF predictions
+                   (calibration.py, unmodified)
+                -> evaluate_frozen_test(fitted, context, held_out_subjects, ...)
+                   (final_evaluation.py, UNMODIFIED — despite the name, this
+                   function only transforms+predicts against whatever
+                   subject list it is given; source_held_out.py is the only
+                   caller that gives it a train/val-pool subset instead of
+                   the real frozen test subjects)
+                -> policy.apply_to_test(...) exactly once for this source
+                -> record RobustnessReport (robustness_report.py)
+```
+
+This reuses `final_evaluation.py`'s functions completely unmodified in
+their leakage-relevant behavior (only two new, backward-compatible
+`domain_robustness_config=None` keyword parameters were added, threaded
+through to `build_mil_adapter` — see §16.4) precisely because every one of
+those functions already takes explicit subject-ID-list arguments rather
+than reading `context.train_bags`/`val_bags`/`test_bags` directly. That
+structural property — not a new mechanism — is what makes "development
+sources' subjects" and "held-out source's subjects" safe to substitute for
+"train+val" and "test" here.
+
+### 16.2 Structural separation from the frozen-test guard
+
+`source_held_out.py` never imports `test_guard.py`, never constructs a
+`FrozenTestGuard`, and its public functions take no `run_dir`/
+`output_root`/guard-path argument at all — there is no code path by which
+calling `run_smoke_source_held_out`/`run_cancer_source_held_out` could
+create, acquire, or check a guard file. `evaluate_frozen_test` itself
+(§16.1) carries no guard of its own by design (see its docstring in
+`final_evaluation.py`); `runner.py` is the only call site that pairs it with
+guard acquisition, and it only does so for the real frozen-test stage, not
+for the source-held-out stage. `tests/test_source_held_out.py` verifies
+both the import-graph property (via AST inspection, not just a docstring
+claim) and that no guard directory appears after running either protocol.
+
+### 16.3 Source eligibility and the split manifest
+
+`benchmarks/source_eligibility.py` assigns one of nine statuses per
+(source, task) pair (`eligible`, `not_evaluable`, `diagnostic_only`,
+`excluded_by_policy`, `controlled_access_unavailable`,
+`insufficient_classes`, `insufficient_outcomes`, `species_mismatch`,
+`assay_mismatch`, `gene_contract_mismatch`) — unknown species/label-
+semantics metadata always resolves to `species_mismatch`/
+`excluded_by_policy`, never to assumed-compatible, mirroring §12's
+pre-existing `run_leave_one_source_out` policy. `build_source_held_out_manifest`
+produces a versioned (`schema_version`), fingerprinted manifest
+(`SHA-256` over development/held-out subject-ID lists, never the raw IDs
+themselves) and raises outright if development and held-out subject sets
+are found to overlap — this is a hard precondition, not a soft warning.
+
+### 16.4 Domain-loss placement and the sampler hierarchy
+
+`benchmarks/domain_losses.py`'s CORAL/MMD/domain-adversarial terms attach
+to exactly one point in the architecture:
+`HierarchicalMILOutput.subject_embeddings` (the pooled per-subject
+representation `pathway_hierarchical_mil.py`'s `HierarchicalAttentionPooling`
+already produced before Phase 6). `PathwayHierarchicalAdapter._train_loop`
+(the adapter's single AdamW loop — see §15.8) computes the selected
+strategy's regularizer term after the forward pass and adds it to the
+existing masked multitask loss:
+`total = task_loss + domain_term` (§16.4's `_domain_regularizer`), logged
+separately from `task_loss` via `last_loss_components`. The
+`domain_adversarial` strategy additionally builds a `DomainClassifierHead`
+lazily, once, from whichever development sources appear in the FIRST
+training call (`_maybe_build_domain_head`) — its vocabulary is fixed from
+that point on, and a source name outside it at any later call raises
+`DomainVocabularyError` rather than being silently mapped to an arbitrary
+class. `data/source_sampling.py`'s `SourceBalancedBatchSampler` (the
+`source_balanced` strategy) is a structurally independent sampler from
+`data/sampling.py`'s pre-existing smoke-class-balanced sampler — the two
+solve different imbalance problems and are not composed in this phase.
+
+### 16.5 Fingerprint hierarchy
+
+`RobustnessReport` (`robustness_report.py`) binds together, per held-out-
+source evaluation: `dataset_manifest_fingerprint`,
+`source_split_manifest_fingerprint` (§16.3's manifest), the development
+preprocessing artifact's `preprocessing_fingerprint`
+(`fold_preprocessing.artifact_fingerprint` — the same function every other
+fold/OOF/final-fit record in this repository uses), `module_fingerprint`
+(for `pathway_hierarchical_mil`), `model_fingerprint`
+(`model_state_fingerprint()`, the same helper every adapter/baseline
+already exposes), and `calibration_fingerprint` — the same identity
+hierarchy §7/§14 established, extended with one new manifest type rather
+than a parallel one.
+
+### 16.6 Calibration/uncertainty boundary
+
+Calibration and threshold selection (`calibration.py`, unmodified) see
+development out-of-fold predictions only, exactly as in the real frozen-
+test protocol (§12); `uncertainty.py`'s abstention-threshold selection is
+likewise restricted, by argument signature, to development
+uncertainty/correctness arrays — it has no parameter through which a
+held-out-source label could reach it.
+
+### 16.7 Reporting schema and failure modes
+
+`RobustnessReport`/`build_aggregate_report` (`robustness_report.py`) always
+stamp `development_only: true` and `frozen_test_accessed: false`;
+`validate_robustness_report` rejects a report missing either stamp or
+carrying the wrong value, and `aggregate_source_reports` reports the
+worst-source result as a first-class field (`worst_source`) rather than
+folding it into a single pooled average, with ineligible sources listed
+(with their reason) but excluded from the evaluated-source count.
+
+### 16.8 Honest scope boundaries
+
+- **No real gene-set (GMT) resource ships with this repository.** Every
+  concrete `biological_stability.py` result produced in this phase's tests,
+  CI, and synthetic CLI runs is computed against
+  `GeneModuleCollection.synthetic()` and is a software sensitivity
+  diagnostic, not biological-plausibility evidence —
+  `require_real_modules` refuses to run the real-mode entry point against a
+  synthetic source, so this cannot be silently misreported.
+- Task A (smoke) source-held-out evaluation does not extend to the
+  pooling-based MIL models or to `MultiSmokeCancerNet`'s cell-level
+  `Trainer` curriculum — only classical baselines and
+  `pathway_hierarchical_mil`'s plain-ERM fit. `domain_robustness_ablation.py`
+  records this honestly (`not_evaluable`) rather than silently omitting
+  those rows.
+- With few dataset sources available (2 in the synthetic CI context; a
+  handful in the real dataset manifest), cross-source aggregate statistics
+  have limited statistical power, reported as such rather than suppressed.
+- No cross-species (human/mouse) source-held-out mode was added in this
+  phase — mouse sources remain excluded from the ordinary human-only
+  protocol via the same `species_mismatch` eligibility status §11/§14
+  already established for human/mouse separation elsewhere.
