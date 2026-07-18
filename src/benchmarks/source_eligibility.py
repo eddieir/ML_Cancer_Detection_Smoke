@@ -65,6 +65,59 @@ def _not_eligible(source: str, task: str, status: str, reason: str, counts: Opti
     )
 
 
+class SourcePolicyDriftError(ValueError):
+    """A caller-supplied species_by_source/controlled_access_sources value
+    for a source contradicts the canonical dataset manifest
+    (data/manifest.py::DatasetManifestEntry) for that same source. The
+    manifest is the source of truth for species/access-state metadata for
+    any source it declares — a caller override that disagrees with it is a
+    configuration bug, never silently resolved by picking one value."""
+
+
+def resolve_source_policy(
+    source: str,
+    species_by_source: Optional[Dict[str, str]] = None,
+    controlled_access_sources: Optional[Sequence[str]] = None,
+    manifest_by_source: Optional[Dict[str, object]] = None,
+) -> Dict:
+    """
+    Resolve one source's species/controlled-access policy, preferring the
+    canonical dataset manifest (data/manifest.py::DatasetManifestEntry,
+    keyed by dataset_id or accession) when it declares this source at all.
+    A caller-supplied species_by_source/controlled_access_sources value that
+    CONTRADICTS the manifest raises SourcePolicyDriftError rather than being
+    silently accepted or silently overridden — configuration drift between a
+    caller override and the manifest is a bug to surface, not paper over. A
+    source the manifest does not declare (e.g. a synthetic test source) is
+    resolved purely from the caller-supplied dicts, exactly as before this
+    manifest integration existed.
+    """
+    species_by_source = species_by_source or {}
+    controlled_access_sources = set(controlled_access_sources or [])
+    manifest_by_source = manifest_by_source or {}
+
+    entry = manifest_by_source.get(source)
+    if entry is None:
+        return {
+            "species": species_by_source.get(source), "controlled_access": source in controlled_access_sources,
+            "source_of_truth": "caller_supplied",
+        }
+
+    manifest_species = entry.species
+    manifest_controlled = bool(entry.controlled_access)
+    if source in species_by_source and species_by_source[source] != manifest_species:
+        raise SourcePolicyDriftError(
+            f"source {source!r}: caller-supplied species {species_by_source[source]!r} contradicts "
+            f"the dataset manifest's species {manifest_species!r} for this source."
+        )
+    if source in controlled_access_sources and not manifest_controlled:
+        raise SourcePolicyDriftError(
+            f"source {source!r}: caller listed this source as controlled_access_sources, but the "
+            f"dataset manifest declares controlled_access={manifest_controlled!r} for it."
+        )
+    return {"species": manifest_species, "controlled_access": manifest_controlled, "source_of_truth": "dataset_manifest"}
+
+
 def assess_smoke_source_eligibility(
     source: str,
     held_out_subject_labels: Sequence[int],
@@ -72,6 +125,7 @@ def assess_smoke_source_eligibility(
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
+    manifest_by_source: Optional[Dict[str, object]] = None,
 ) -> SourceEligibilityReport:
     """
     held_out_subject_labels: effective smoke-type label per subject in this
@@ -80,24 +134,23 @@ def assess_smoke_source_eligibility(
     for the same rule applied to training).
     """
     incompatible_sources = set(incompatible_sources or [])
-    species_by_source = species_by_source or {}
-    controlled_access_sources = set(controlled_access_sources or [])
     counts = {"n_subjects": len(held_out_subject_labels),
               "classes_present": sorted(set(int(l) for l in held_out_subject_labels))}
 
-    if source in controlled_access_sources:
+    policy = resolve_source_policy(source, species_by_source, controlled_access_sources, manifest_by_source)
+    if policy["controlled_access"]:
         return _not_eligible(source, "smoke_classification", CONTROLLED_ACCESS_UNAVAILABLE,
                               "source is controlled-access and not available in this environment", counts)
-    if source in incompatible_sources:
+    if source in (incompatible_sources or set()):
         return _not_eligible(source, "smoke_classification", EXCLUDED_BY_POLICY,
                               "explicitly listed as label-semantics incompatible", counts)
-    if source not in species_by_source:
+    if policy["species"] is None:
         return _not_eligible(source, "smoke_classification", SPECIES_MISMATCH,
                               "no species metadata declared for this source — unknown metadata "
                               "defaults to not-comparable, never assumed-compatible", counts)
-    if reference_species is not None and species_by_source[source] != reference_species:
+    if reference_species is not None and policy["species"] != reference_species:
         return _not_eligible(source, "smoke_classification", SPECIES_MISMATCH,
-                              f"species {species_by_source[source]!r} != reference {reference_species!r}", counts)
+                              f"species {policy['species']!r} != reference {reference_species!r}", counts)
     if counts["n_subjects"] < MIN_SUBJECTS_PER_SOURCE_SMOKE:
         return _not_eligible(source, "smoke_classification", NOT_EVALUABLE,
                               f"only {counts['n_subjects']} evaluable subject(s) "
@@ -118,31 +171,31 @@ def assess_cancer_source_eligibility(
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
+    manifest_by_source: Optional[Dict[str, object]] = None,
 ) -> SourceEligibilityReport:
     """held_out_outcomes: one entry per subject in this source; None means
     unknown outcome (never coerced to 0/negative — excluded from counts, not
     from the subject list)."""
     incompatible_sources = set(incompatible_sources or [])
-    species_by_source = species_by_source or {}
-    controlled_access_sources = set(controlled_access_sources or [])
     known = [o for o in held_out_outcomes if o is not None]
     n_pos = sum(1 for o in known if int(o) == 1)
     n_neg = sum(1 for o in known if int(o) == 0)
     counts = {"n_subjects_total": len(held_out_outcomes), "n_known_outcome": len(known),
               "n_positive": n_pos, "n_negative": n_neg}
 
-    if source in controlled_access_sources:
+    policy = resolve_source_policy(source, species_by_source, controlled_access_sources, manifest_by_source)
+    if policy["controlled_access"]:
         return _not_eligible(source, "cancer_prediction", CONTROLLED_ACCESS_UNAVAILABLE,
                               "source is controlled-access and not available in this environment", counts)
     if source in incompatible_sources:
         return _not_eligible(source, "cancer_prediction", EXCLUDED_BY_POLICY,
                               "explicitly listed as label-semantics incompatible", counts)
-    if source not in species_by_source:
+    if policy["species"] is None:
         return _not_eligible(source, "cancer_prediction", SPECIES_MISMATCH,
                               "no species metadata declared for this source", counts)
-    if reference_species is not None and species_by_source[source] != reference_species:
+    if reference_species is not None and policy["species"] != reference_species:
         return _not_eligible(source, "cancer_prediction", SPECIES_MISMATCH,
-                              f"species {species_by_source[source]!r} != reference {reference_species!r}", counts)
+                              f"species {policy['species']!r} != reference {reference_species!r}", counts)
     if len(known) < MIN_SUBJECTS_PER_SOURCE_CANCER:
         return _not_eligible(source, "cancer_prediction", NOT_EVALUABLE,
                               f"only {len(known)} known-outcome subject(s) "

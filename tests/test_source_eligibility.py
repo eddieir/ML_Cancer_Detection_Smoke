@@ -14,10 +14,22 @@ from benchmarks.source_eligibility import (
     INSUFFICIENT_OUTCOMES,
     NOT_EVALUABLE,
     SPECIES_MISMATCH,
+    SourcePolicyDriftError,
     assess_cancer_source_eligibility,
     assess_smoke_source_eligibility,
     build_source_held_out_manifest,
+    resolve_source_policy,
 )
+from data.manifest import DatasetManifestEntry
+
+
+def _manifest_entry(dataset_id="GSE_TEST", species="human", controlled_access=False):
+    return DatasetManifestEntry(
+        dataset_id=dataset_id, accession=dataset_id, source_url="http://example.invalid",
+        official_record_url="http://example.invalid", species=species, assay_type="scRNA-seq",
+        matrix_representation="counts", subject_identifier_field="subject_id",
+        license_or_access_level="open", controlled_access=controlled_access, synthetic_or_real="synthetic_fixture",
+    )
 
 
 def test_smoke_source_eligible_with_enough_subjects_and_classes():
@@ -143,3 +155,45 @@ def test_manifest_rejects_development_held_out_overlap():
             development_subjects=["a1", "b1"], held_out_subjects=["a1", "a2"],
             known_label_counts={}, class_distribution={}, eligibility=elig, seed=1,
         )
+
+
+def test_resolve_source_policy_prefers_manifest_over_caller_when_present():
+    entry = _manifest_entry("GSE_TEST", species="human")
+    policy = resolve_source_policy(
+        "GSE_TEST", species_by_source={}, controlled_access_sources=[],
+        manifest_by_source={"GSE_TEST": entry},
+    )
+    assert policy == {"species": "human", "controlled_access": False, "source_of_truth": "dataset_manifest"}
+
+
+def test_resolve_source_policy_falls_back_to_caller_when_source_not_in_manifest():
+    policy = resolve_source_policy(
+        "sourceA", species_by_source={"sourceA": "human"}, controlled_access_sources=[], manifest_by_source={},
+    )
+    assert policy == {"species": "human", "controlled_access": False, "source_of_truth": "caller_supplied"}
+
+
+def test_resolve_source_policy_rejects_species_drift_from_manifest():
+    entry = _manifest_entry("GSE_TEST", species="mouse")
+    with pytest.raises(SourcePolicyDriftError):
+        resolve_source_policy(
+            "GSE_TEST", species_by_source={"GSE_TEST": "human"}, controlled_access_sources=[],
+            manifest_by_source={"GSE_TEST": entry},
+        )
+
+
+def test_resolve_source_policy_rejects_controlled_access_drift_from_manifest():
+    entry = _manifest_entry("GSE_TEST", species="human", controlled_access=False)
+    with pytest.raises(SourcePolicyDriftError):
+        resolve_source_policy(
+            "GSE_TEST", species_by_source={}, controlled_access_sources=["GSE_TEST"],
+            manifest_by_source={"GSE_TEST": entry},
+        )
+
+
+def test_assess_cancer_source_eligibility_uses_manifest_species():
+    entry = _manifest_entry("GSE_TEST", species="human")
+    elig = assess_cancer_source_eligibility(
+        "GSE_TEST", [1, 0, 1, 0], reference_species="human", manifest_by_source={"GSE_TEST": entry},
+    )
+    assert elig.eligible

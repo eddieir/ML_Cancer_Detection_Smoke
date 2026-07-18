@@ -30,8 +30,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from data.manifest import DatasetManifestEntry, manifest_fingerprint
 from data.splitting import grouped_kfold
-from train import SubjectLevelDataset
+from train import MILEligibilityError, SubjectLevelDataset
 
 from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, SMOKE_SEARCH_SPACE, positive_class_proba
 from .calibration import build_frozen_policy
@@ -39,7 +40,7 @@ from .cross_validation import (
     DEFAULT_INNER_FOLDS, MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn,
     _pathway_cancer_fit_score_fn, _pathway_smoke_fit_score_fn, _smoke_baseline_fit_score_fn,
 )
-from .domain_losses import resolve_domain_robustness_config
+from .domain_losses import DomainLossConfigurationError, resolve_domain_robustness_config
 from .features import build_cancer_subject_features, build_smoke_subject_summary_features
 from .final_evaluation import (
     fit_final_candidate_on_dev_pool,
@@ -59,10 +60,17 @@ from .metrics import full_smoke_metrics_report
 from .mil_registry import build_mil_adapter, pathway_search_space
 from .pathway_hierarchical_adapter import MODEL_NAME as PATHWAY_MODEL_NAME
 from .robustness_report import build_robustness_report
+from .source_held_out_diagnostics import (
+    cancer_biological_stability_report,
+    cancer_domain_shift_report,
+    cancer_uncertainty_report,
+    smoke_domain_shift_report,
+)
 from .source_eligibility import (
     assess_cancer_source_eligibility,
     assess_smoke_source_eligibility,
     build_source_held_out_manifest,
+    resolve_source_policy,
 )
 
 DEFAULT_OOF_FOLDS = 3
@@ -165,6 +173,33 @@ def _pool_subjects_and_sources(context) -> Dict[str, str]:
 
 # ─── Task B: cancer prediction ─────────────────────────────────────────────
 
+def _sha256_json(payload) -> str:
+    import json as _json
+    return __import__("hashlib").sha256(_json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _domain_head_fingerprint(adapter) -> Optional[str]:
+    """SHA-256 of the domain-adversarial head's weights + fixed source
+    vocabulary, or None when this adapter has no domain head (ERM/
+    source_balanced/coral/mmd, or an adapter that was never built with
+    strategy='domain_adversarial')."""
+    if getattr(adapter, "domain_head", None) is None:
+        return None
+    import torch
+    state = adapter.domain_head.state_dict()
+    blob = b"".join(t.detach().cpu().numpy().tobytes() for t in state.values())
+    vocab_blob = _sha256_json(sorted(adapter.domain_source_vocabulary or [])).encode("utf-8")
+    return __import__("hashlib").sha256(blob + vocab_blob).hexdigest()
+
+
+def _environment_fingerprint() -> Optional[str]:
+    try:
+        from .env_versions import collect_core_package_versions
+        return _sha256_json(collect_core_package_versions(required=False))
+    except Exception:  # pragma: no cover — never let an environment probe abort a report
+        return None
+
+
 def run_cancer_source_held_out(
     context, model_names: Sequence[str], device: str = "cpu",
     domain_robustness_config: Optional[Dict] = None,
@@ -173,6 +208,7 @@ def run_cancer_source_held_out(
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
     seed: int = 42, n_oof_folds: int = DEFAULT_OOF_FOLDS,
+    dataset_manifest_entries: Optional[Sequence[DatasetManifestEntry]] = None,
 ) -> Dict:
     """
     For every source present in the train+val pool: assess eligibility,
@@ -181,6 +217,12 @@ def run_cancer_source_held_out(
     subjects, fit that candidate once on the full development pool, and
     apply the frozen result to the held-out source's subjects exactly once.
     Returns {source: RobustnessReport dict}.
+
+    dataset_manifest_entries, if supplied, makes source_eligibility.py
+    prefer the canonical dataset manifest (data/manifest.py) over caller-
+    supplied species_by_source/controlled_access_sources for any source it
+    declares, and raises SourcePolicyDriftError if the caller-supplied value
+    contradicts it (see source_eligibility.py::resolve_source_policy).
     """
     domain_cfg = resolve_domain_robustness_config(domain_robustness_config)
     subject_to_source = _pool_subjects_and_sources(context)
@@ -189,6 +231,15 @@ def run_cancer_source_held_out(
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
     n_hvgs = context.preprocessing_artifact.n_hvgs
     min_cells = context.config.get("data", {}).get("min_cells_per_subject", 50)
+
+    manifest_by_source: Dict[str, DatasetManifestEntry] = {}
+    dataset_manifest_fp: Optional[str] = None
+    if dataset_manifest_entries:
+        for e in dataset_manifest_entries:
+            manifest_by_source[e.dataset_id] = e
+            manifest_by_source[e.accession] = e
+        dataset_manifest_fp = manifest_fingerprint(list(dataset_manifest_entries))
+    environment_fp = _environment_fingerprint()
 
     sources = sorted(set(subject_to_source.values()))
     reports: Dict[str, Dict] = {}
@@ -200,8 +251,11 @@ def run_cancer_source_held_out(
         elig = assess_cancer_source_eligibility(
             held_out_source, held_out_outcomes, incompatible_sources=incompatible_sources,
             species_by_source=species_by_source, reference_species=reference_species,
-            controlled_access_sources=controlled_access_sources,
+            controlled_access_sources=controlled_access_sources, manifest_by_source=manifest_by_source,
         )
+        source_policy_fp = _sha256_json(resolve_source_policy(
+            held_out_source, species_by_source, controlled_access_sources, manifest_by_source,
+        ))
         dev_sources = [s for s in sources if s != held_out_source]
         dev_subjects_all = sorted(s for s, src in subject_to_source.items() if src != held_out_source)
 
@@ -210,11 +264,14 @@ def run_cancer_source_held_out(
                 task="cancer_prediction", held_out_source=held_out_source, development_sources=dev_sources,
                 development_subjects=dev_subjects_all, held_out_subjects=held_out_subjects,
                 known_label_counts=elig.counts, class_distribution={}, eligibility=elig, seed=seed,
+                dataset_manifest_fingerprint=dataset_manifest_fp,
             )
             reports[held_out_source] = build_robustness_report(
                 task="cancer_prediction", model=None, strategy=domain_cfg["strategy"],
                 held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
                 source_split_manifest_fingerprint=manifest.fingerprint(),
+                dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                environment_fingerprint=environment_fp, seed=seed,
                 limitations=["source ineligible — no model was trained or evaluated for this source"],
             ).to_dict()
             continue
@@ -229,9 +286,29 @@ def run_cancer_source_held_out(
                     pooling="attention", device=device, seed=seed, n_folds=n_oof_folds,
                     domain_robustness_config=domain_cfg if name == PATHWAY_MODEL_NAME else None,
                 )
-            except Exception as e:  # noqa: BLE001 — record and continue, never crash the whole sweep
+            except MILEligibilityError as e:
+                candidate_scores[name] = {"auroc": None, "error": f"MIL ineligible: {e}"}
+                continue
+            except DomainLossConfigurationError:
+                raise  # a configuration error is never a per-candidate ineligibility outcome
+            except ValueError as e:
+                # Expected candidate-ineligibility outcomes only (e.g. "fewer than 2 known-outcome
+                # development subjects") — never RuntimeError (leakage/duplicate-prediction bugs),
+                # never a configuration/provenance/label-integrity error, all of which must abort
+                # the whole sweep rather than being recorded as a candidate score.
                 candidate_scores[name] = {"auroc": None, "error": str(e)}
                 continue
+            except RuntimeError as e:
+                # generate_subject_oof_predictions raises RuntimeError for two structurally
+                # different situations: (a) a dev subject never received an OOF prediction because
+                # every fold containing it was skipped — an expected small-dev-pool-for-this-
+                # candidate outcome, recorded as a candidate ineligibility; (b) a subject predicted
+                # by a fold that also trained on it — genuine in-fold leakage, which must always
+                # abort the sweep rather than being silently recorded as a low score.
+                if "never received an OOF prediction" in str(e):
+                    candidate_scores[name] = {"auroc": None, "error": str(e)}
+                    continue
+                raise
             y = np.array([outcomes_by_subject[s] for s in oof["dev_subjects"]])
             p = np.array([oof["oof_by_subject"][s] for s in oof["dev_subjects"]])
             if len(set(y.tolist())) < 2:
@@ -249,6 +326,8 @@ def run_cancer_source_held_out(
                 held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
                 limitations=["no candidate model produced a defined development-only OOF AUROC"],
                 comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                environment_fingerprint=environment_fp, seed=seed,
             ).to_dict()
             continue
 
@@ -300,11 +379,13 @@ def run_cancer_source_held_out(
                 held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
                 limitations=["held-out source had no subject with >= min_cells_per_subject cells "
                              "after the frozen preprocessing transform"],
+                dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                environment_fingerprint=environment_fp, seed=seed,
+                preprocessing_fingerprint=fitted.preprocessing_artifact_fingerprint,
             ).to_dict()
             continue
 
         if fitted.kind == "mil":
-            from train import SubjectLevelDataset
             held_out_sd = SubjectLevelDataset(held_out_bags)
             held_out_proba_raw = fitted.predictor.predict_proba(held_out_sd)
             held_out_order = [str(b["subject_id"]) for b in held_out_sd.bags]
@@ -314,6 +395,28 @@ def run_cancer_source_held_out(
 
         y_held_out = np.array([outcomes_by_subject[s] for s in held_out_order])
         metrics_result = policy.apply_to_test(y_held_out, held_out_proba_raw)
+        calibration_fp = _sha256_json(metrics_result.get("policy", {}))
+
+        dev_ds_for_diag = build_fold_cell_dataset(normalized_adata, fitted.preprocessing_artifact, dev_subjects)
+        dev_bags_for_diag = bags_from_fold_cell_dataset(dev_ds_for_diag, outcomes_by_subject, min_cells)
+        domain_shift = cancer_domain_shift_report(
+            dev_bags_for_diag, held_out_bags, num_cell_types, subject_to_source, seed=seed,
+        )
+        uncertainty = cancer_uncertainty_report(
+            y_oof, prob_oof, y_held_out, held_out_proba_raw, fitted=fitted, held_out_bags=held_out_bags,
+        )
+        biological_stability = cancer_biological_stability_report(
+            context, fitted, dev_bags_for_diag, held_out_bags, outcomes_by_subject, num_cell_types, min_cells,
+            seed=seed,
+        )
+
+        gene_list_fp = _sha256_json(list(fitted.preprocessing_artifact.gene_list))
+        if fitted.kind == "mil" and best_name == PATHWAY_MODEL_NAME:
+            domain_vocab_fp = _sha256_json(sorted(fitted.model_metadata.get("domain_source_vocabulary") or []))
+            domain_head_fp = _domain_head_fingerprint(fitted.predictor)
+        else:
+            domain_vocab_fp = "not_applicable"
+            domain_head_fp = "not_applicable"
 
         manifest = build_source_held_out_manifest(
             task="cancer_prediction", held_out_source=held_out_source, development_sources=dev_sources,
@@ -322,6 +425,7 @@ def run_cancer_source_held_out(
                                                                    "n_negative": elig.counts.get("n_negative")},
             eligibility=elig, seed=seed, preprocessing_policy_fingerprint=fitted.preprocessing_artifact_fingerprint,
             module_fingerprint=fitted.model_metadata.get("module_fingerprint"),
+            dataset_manifest_fingerprint=dataset_manifest_fp,
         )
 
         reports[held_out_source] = build_robustness_report(
@@ -329,10 +433,16 @@ def run_cancer_source_held_out(
             held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
             metrics={k: v for k, v in metrics_result.items() if k != "policy"},
             calibration=metrics_result.get("policy", {}),
+            uncertainty=uncertainty, domain_shift=domain_shift, biological_stability=biological_stability,
             comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
             source_split_manifest_fingerprint=manifest.fingerprint(),
             preprocessing_fingerprint=fitted.preprocessing_artifact_fingerprint,
+            module_fingerprint=fitted.model_metadata.get("module_fingerprint"),
             model_fingerprint=fitted.model_state_fingerprint,
+            calibration_fingerprint=calibration_fp, dataset_manifest_fingerprint=dataset_manifest_fp,
+            source_policy_fingerprint=source_policy_fp, environment_fingerprint=environment_fp,
+            gene_list_fingerprint=gene_list_fp, domain_vocabulary_fingerprint=domain_vocab_fp,
+            domain_head_fingerprint=domain_head_fp, seed=seed,
         ).to_dict()
 
     return reports
@@ -448,6 +558,7 @@ def run_smoke_source_held_out(
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
     seed: int = 42, n_dev_cv_folds: int = DEFAULT_SMOKE_DEV_CV_FOLDS, n_inner_folds: int = DEFAULT_INNER_FOLDS,
+    dataset_manifest_entries: Optional[Sequence[DatasetManifestEntry]] = None,
 ) -> Dict:
     """
     Task A source-held-out evaluation. Only ERM is supported (see
@@ -492,6 +603,15 @@ def run_smoke_source_held_out(
     n_hvgs = context.preprocessing_artifact.n_hvgs
     weak_labels_enabled = bool(context.config.get("data", {}).get("weak_labels", {}).get("enabled", False))
 
+    manifest_by_source: Dict[str, DatasetManifestEntry] = {}
+    dataset_manifest_fp: Optional[str] = None
+    if dataset_manifest_entries:
+        for e in dataset_manifest_entries:
+            manifest_by_source[e.dataset_id] = e
+            manifest_by_source[e.accession] = e
+        dataset_manifest_fp = manifest_fingerprint(list(dataset_manifest_entries))
+    environment_fp = _environment_fingerprint()
+
     subject_to_source = _pool_subjects_and_sources(context)
     sources = sorted(set(subject_to_source.values()))
     reports: Dict[str, Dict] = {}
@@ -506,8 +626,11 @@ def run_smoke_source_held_out(
         elig = assess_smoke_source_eligibility(
             held_out_source, held_out_labels, incompatible_sources=incompatible_sources,
             species_by_source=species_by_source, reference_species=reference_species,
-            controlled_access_sources=controlled_access_sources,
+            controlled_access_sources=controlled_access_sources, manifest_by_source=manifest_by_source,
         )
+        source_policy_fp = _sha256_json(resolve_source_policy(
+            held_out_source, species_by_source, controlled_access_sources, manifest_by_source,
+        ))
         dev_sources = [s for s in sources if s != held_out_source]
         dev_subjects = sorted(s for s, src in subject_to_source.items() if src != held_out_source)
 
@@ -517,6 +640,8 @@ def run_smoke_source_held_out(
                 eligibility=elig.to_dict(), development_sources=dev_sources,
                 limitations=["source ineligible — no model was trained or evaluated for this source"],
                 label_state={"held_out": held_out_label_diagnostics, "weak_labels_enabled": weak_labels_enabled},
+                dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                environment_fingerprint=environment_fp, seed=seed,
             ).to_dict()
             continue
 
@@ -626,11 +751,17 @@ def run_smoke_source_held_out(
             report = full_smoke_metrics_report(labels[known], preds[known], num_classes)
             model_state_fp = adapter.model_state_fingerprint()
 
+        domain_shift = smoke_domain_shift_report(
+            dev_ds, held_out_ds, num_cell_types, num_classes, subject_to_source, seed=seed,
+        )
+        gene_list_fp = _sha256_json(list(final_artifact.gene_list))
+
         manifest = build_source_held_out_manifest(
             task="smoke_classification", held_out_source=held_out_source, development_sources=dev_sources,
             development_subjects=dev_subjects, held_out_subjects=held_out_subjects,
             known_label_counts={"n": len(held_out_labels)}, class_distribution=elig.counts,
             eligibility=elig, seed=seed, preprocessing_policy_fingerprint=artifact_fingerprint(final_artifact),
+            dataset_manifest_fingerprint=dataset_manifest_fp,
         )
         reports[held_out_source] = build_robustness_report(
             task="smoke_classification", model=best_name, strategy="erm",
@@ -638,12 +769,15 @@ def run_smoke_source_held_out(
             metrics={"macro_f1": report["macro_f1"], "weighted_f1": report["weighted_f1"],
                      "balanced_accuracy": report.get("balanced_accuracy"), "per_class": report.get("per_class"),
                      "classes_absent_from_held_out_source": report["classes_absent_from_targets"]},
+            domain_shift=domain_shift,
             comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
             source_split_manifest_fingerprint=manifest.fingerprint(),
             preprocessing_fingerprint=artifact_fingerprint(final_artifact),
             model_fingerprint=model_state_fp,
             label_state={"development": dev_label_diagnostics, "held_out": held_out_label_diagnostics,
                          "weak_labels_enabled": weak_labels_enabled},
+            dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+            environment_fingerprint=environment_fp, gene_list_fingerprint=gene_list_fp, seed=seed,
         ).to_dict()
 
     return reports

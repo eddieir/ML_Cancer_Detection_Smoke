@@ -1785,6 +1785,13 @@ produces a versioned (`schema_version`), fingerprinted manifest
 (`SHA-256` over development/held-out subject-ID lists, never the raw IDs
 themselves) and raises outright if development and held-out subject sets
 are found to overlap — this is a hard precondition, not a soft warning.
+`resolve_source_policy` prefers the canonical dataset manifest
+(`data/manifest.py::DatasetManifestEntry`, keyed by `dataset_id`/
+`accession`) over caller-supplied `species_by_source`/
+`controlled_access_sources` for any source the manifest declares, and
+raises `SourcePolicyDriftError` if a caller override contradicts it — a
+source the manifest does not declare (e.g. a synthetic fixture source)
+still resolves from the caller-supplied dicts unchanged.
 
 ### 16.4 Domain-loss placement and the sampler hierarchy
 
@@ -1820,7 +1827,15 @@ fold/OOF/final-fit record in this repository uses), `module_fingerprint`
 (`model_state_fingerprint()`, the same helper every adapter/baseline
 already exposes), and `calibration_fingerprint` — the same identity
 hierarchy §7/§14 established, extended with one new manifest type rather
-than a parallel one.
+than a parallel one. It additionally binds `gene_list_fingerprint`
+(the frozen development artifact's ordered gene list), `seed`,
+`source_policy_fingerprint` (§16.3's resolved species/access policy for
+this source), `environment_fingerprint` (`env_versions.py`'s core package
+versions), and, for `pathway_hierarchical_mil`,
+`domain_vocabulary_fingerprint`/`domain_head_fingerprint` — both stamped
+the literal string `"not_applicable"` (never a bare `None`) for a
+non-pathway candidate or a strategy with no domain head, so a report never
+silently omits an identity that only applies conditionally.
 
 ### 16.6 Calibration/uncertainty boundary
 
@@ -1863,3 +1878,35 @@ folding it into a single pooled average, with ineligible sources listed
   phase — mouse sources remain excluded from the ordinary human-only
   protocol via the same `species_mismatch` eligibility status §11/§14
   already established for human/mouse separation elsewhere.
+
+### 16.9 Diagnostic wiring, bundle persistence, and multi-seed comparison
+
+`benchmarks/source_held_out_diagnostics.py` is the one place domain-shift
+(`domain_shift.py`), uncertainty/abstention (`uncertainty.py`), and
+biological-stability (`biological_stability.py`) functions are actually
+called from the source-held-out protocol — each is invoked once per
+eligible held-out source with the frozen development-fitted preprocessing
+artifact's own transform (never a refit), and every result lands in the
+matching `RobustnessReport` field rather than being computed and discarded.
+Biological-stability diagnostics additionally run a genuinely
+separately-fitted label-permutation null (a second `fit_final_candidate_
+on_dev_pool` call on label-permuted development outcomes) and a
+cell-type-label permutation check, alongside the pre-existing matched-
+size-random-module control and attention-vs-abundance permutation null.
+
+`PathwayHierarchicalAdapter.save_bundle`/`load_bundle` reuse
+`benchmarks/bundle.py`'s existing `write_model_bundle`/
+`load_and_validate_bundle` machinery, folding this adapter's own state
+(gene modules, domain-robustness config, domain head weights, and fixed
+source vocabulary) into the bundle manifest's `extra` field — the same
+hash/fingerprint re-derivation `bundle.py` already performs for every other
+bundle catches a corrupted model checkpoint before this module's own
+additional checks (module fingerprint, domain-head checksum,
+`model_state_fingerprint` recomputation) run.
+
+`domain_robustness_ablation.py`'s `run_domain_robustness_ablation` accepts
+a `seeds` sequence (backward-compatible default: the single `seed`) and
+`_paired_comparison_multi_seed` treats each (source, seed) pair as one
+independent unit — never a cell — reporting mean/median difference,
+win/tie/loss counts, and `insufficient_evidence` below
+`MIN_SOURCE_SEED_PAIRS_FOR_EVIDENCE` common pairs.

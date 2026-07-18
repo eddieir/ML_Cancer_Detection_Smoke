@@ -16,8 +16,10 @@ separate cell-level pretraining phase, so there is nothing for a Phase 1
 step to do here.
 """
 
+import dataclasses
 import time
-from typing import Dict, List, Optional, Sequence
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -30,8 +32,10 @@ from pathway_hierarchical_mil import (
     PathwayHierarchicalMILConfig,
     collate_subject_bags,
 )
+from data.manifest import sha256_of_file
 from data.source_sampling import SourceBalancedBatchSampler, SourceSubjectIndex
 
+from .bundle import BundleValidationError, load_and_validate_bundle, write_model_bundle
 from .domain_losses import (
     DomainClassifierHead,
     DomainLossConfigurationError,
@@ -429,6 +433,135 @@ class PathwayHierarchicalAdapter:
         final-fit records carry a fingerprint in exactly the same shape."""
         from .model_fingerprint import torch_state_dict_fingerprint
         return torch_state_dict_fingerprint(self.model)
+
+    def save_bundle(
+        self, bundle_dir: Union[str, Path], artifact,
+        dataset_manifest_fingerprint: Optional[str] = None, split_fingerprint: Optional[str] = None,
+    ) -> Path:
+        """
+        Persist this fitted adapter as a Phase-4-style bundle (benchmarks/
+        bundle.py::write_model_bundle, reused unchanged) — model weights,
+        gene modules, and this adapter's FULL domain-robustness state
+        (config, fixed development-source vocabulary, and the domain-
+        adversarial head's own weights when one was built) all folded into
+        one bundle_manifest.json via `extra`, so a domain_adversarial run's
+        state round-trips completely through load_bundle, not just the
+        primary task head.
+        """
+        if self.model is None:
+            raise ValueError("PathwayHierarchicalAdapter.save_bundle: adapter has not been fit yet.")
+        bundle_dir = Path(bundle_dir)
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = bundle_dir / "model_checkpoint.pt"
+        torch.save(self.model.state_dict(), checkpoint_path)
+
+        gene_modules_path = bundle_dir / "gene_modules.json"
+        self.modules.save(gene_modules_path)
+
+        domain_head_checkpoint = None
+        if self.domain_head is not None:
+            domain_head_path = bundle_dir / "domain_head_checkpoint.pt"
+            torch.save(self.domain_head.state_dict(), domain_head_path)
+            domain_head_checkpoint = {"path": domain_head_path.name, "sha256": sha256_of_file(domain_head_path)}
+
+        extra = {
+            "model_type": MODEL_NAME,
+            "module_fingerprint": self.modules.fingerprint(),
+            "gene_modules_path": gene_modules_path.name,
+            "num_smoke": int(self.model.num_smoke),
+            "domain_robustness": self.domain_robustness,
+            "domain_source_vocabulary": self.domain_source_vocabulary,
+            "domain_head_checkpoint": domain_head_checkpoint,
+            "model_state_fingerprint": self.model_state_fingerprint(),
+        }
+        return write_model_bundle(
+            bundle_dir, checkpoint_path, artifact, dataclasses.asdict(self.config),
+            class_vocabulary=[str(i) for i in range(int(self.model.num_smoke))],
+            label_policy="phase6_source_held_out", species_policy="unspecified", assay_mode="single_cell",
+            dataset_manifest_fingerprint=dataset_manifest_fingerprint, split_fingerprint=split_fingerprint,
+            extra=extra,
+        )
+
+    @classmethod
+    def load_bundle(cls, bundle_dir: Union[str, Path], device: str = "cpu") -> "PathwayHierarchicalAdapter":
+        """
+        Inverse of save_bundle — re-derives every hash load_and_validate_
+        bundle already checks (checkpoint/artifact integrity, bundle_
+        fingerprint), additionally verifies the gene-module fingerprint and
+        the reloaded model's own model_state_fingerprint against what was
+        recorded at save time (never proceeds with a silently-altered
+        checkpoint), and reconstructs the domain-adversarial head (with its
+        OWN weights and the exact fixed source vocabulary) when the bundle
+        recorded one. Raises BundleValidationError for any missing/
+        corrupted/altered component.
+        """
+        bundle_dir = Path(bundle_dir)
+        manifest = load_and_validate_bundle(bundle_dir)
+
+        gene_modules_path = bundle_dir / manifest["gene_modules_path"]
+        modules = GeneModuleCollection.load(gene_modules_path)
+        if modules.fingerprint() != manifest["module_fingerprint"]:
+            raise BundleValidationError(
+                f"PathwayHierarchicalAdapter.load_bundle: gene-module fingerprint at {gene_modules_path} "
+                "does not match the bundle manifest's recorded module_fingerprint."
+            )
+
+        domain_robustness_config = manifest["domain_robustness"]
+        adapter = cls(device=device, domain_robustness_config=domain_robustness_config)
+        adapter.modules = modules
+        adapter.config = PathwayHierarchicalMILConfig.from_dict(manifest["model_config"])
+        adapter.model = PathwayHierarchicalMIL(modules, adapter.config, num_smoke=manifest["num_smoke"]).to(device)
+
+        checkpoint_path = bundle_dir / manifest["model_checkpoint"]["path"]
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        try:
+            adapter.model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            raise BundleValidationError(
+                f"PathwayHierarchicalAdapter.load_bundle: model checkpoint at {checkpoint_path} does "
+                f"not match the reconstructed architecture — {e}"
+            ) from e
+
+        domain_head_checkpoint = manifest.get("domain_head_checkpoint")
+        vocabulary = manifest.get("domain_source_vocabulary")
+        if domain_head_checkpoint:
+            if not vocabulary:
+                raise BundleValidationError(
+                    "PathwayHierarchicalAdapter.load_bundle: bundle recorded a domain_head_checkpoint "
+                    "but no domain_source_vocabulary — a domain head cannot be reconstructed without "
+                    "its fixed vocabulary."
+                )
+            domain_head_path = bundle_dir / domain_head_checkpoint["path"]
+            if sha256_of_file(domain_head_path) != domain_head_checkpoint["sha256"]:
+                raise BundleValidationError(
+                    f"PathwayHierarchicalAdapter.load_bundle: domain-head checkpoint at "
+                    f"{domain_head_path} does not match the bundle manifest's recorded checksum."
+                )
+            adapter.domain_head = DomainClassifierHead(adapter.config.embedding_dim, vocabulary).to(device)
+            domain_head_state = torch.load(domain_head_path, map_location=device)
+            try:
+                adapter.domain_head.load_state_dict(domain_head_state)
+            except RuntimeError as e:
+                raise BundleValidationError(
+                    f"PathwayHierarchicalAdapter.load_bundle: domain-head checkpoint does not match "
+                    f"the reconstructed domain-head architecture (vocabulary size mismatch?) — {e}"
+                ) from e
+            adapter.domain_source_vocabulary = list(vocabulary)
+        elif domain_robustness_config.get("strategy") == "domain_adversarial":
+            raise BundleValidationError(
+                "PathwayHierarchicalAdapter.load_bundle: domain_robustness.strategy='domain_adversarial' "
+                "but the bundle has no domain_head_checkpoint recorded — a domain-adversarial bundle "
+                "must never load without its domain head."
+            )
+
+        if adapter.model_state_fingerprint() != manifest["model_state_fingerprint"]:
+            raise BundleValidationError(
+                "PathwayHierarchicalAdapter.load_bundle: reloaded model_state_fingerprint does not "
+                "match the bundle manifest's recorded value — the checkpoint or manifest was altered "
+                "since save_bundle wrote it."
+            )
+        return adapter
 
 
 def validate_pathway_bundle_identity(manifest: Dict, model: "PathwayHierarchicalMIL") -> None:

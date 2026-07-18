@@ -1545,7 +1545,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (1032 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py` |
+| `tests/*` | All modules covered (1061 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py` |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -1915,6 +1915,20 @@ biological importance, and a performance drop after removing a module is
 reported as a model-sensitivity finding, never as evidence that module is
 biologically causal.
 
+All three diagnostic families above (domain-shift, uncertainty/abstention,
+and biological stability) are wired directly into every applicable
+per-source robustness report, not just implemented as standalone functions
+— `report.domain_shift`/`report.uncertainty`/`report.biological_stability`
+are populated for every held-out source a candidate was actually fit and
+evaluated for, and stamped `not_applicable`/`not_evaluable` with an explicit
+reason when a diagnostic genuinely does not apply (e.g. biological-stability
+diagnostics for a non-pathway candidate, MC-dropout for a non-neural one).
+The biological-stability section additionally runs a genuinely
+separately-fitted label-permutation null (a second full development-pool
+fit on label-permuted outcomes, never a relabeled copy of the real ranking)
+and a cell-type-label permutation check alongside the existing matched-
+size-random-module control and attention-vs-abundance permutation null.
+
 ### Reading the robustness report
 
 `benchmarks/robustness_report.py` defines a versioned JSON schema
@@ -1954,6 +1968,27 @@ the aggregate's source count.
   state-of-the-art performance is made anywhere for this phase's work — see
   ARCHITECTURE.md §16 for the full scientific-claims policy this repository
   follows.
+- Source eligibility prefers the canonical dataset manifest
+  (`data/manifest.py`) for species/controlled-access metadata whenever a
+  source is declared there, and raises `SourcePolicyDriftError`
+  (`benchmarks/source_eligibility.py::resolve_source_policy`) if a
+  caller-supplied `species_by_source`/`controlled_access_sources` override
+  contradicts it; a source the manifest does not declare (e.g. a synthetic
+  test source) still resolves from the caller-supplied dicts unchanged.
+- `PathwayHierarchicalAdapter.save_bundle`/`load_bundle` persist and
+  restore a fitted candidate's complete state through a Phase-4-style
+  bundle (`benchmarks/bundle.py`) — model weights, gene modules, the
+  domain-robustness configuration, and (when built) the domain-adversarial
+  head's own weights and fixed development-source vocabulary all round-trip
+  and are cross-checked on load; an altered checkpoint, a missing domain
+  head where the recorded strategy requires one, or a vocabulary mismatch
+  all raise rather than silently loading a partial or inconsistent state.
+- The domain-robustness ablation runner accepts multiple seeds
+  (`run_domain_robustness_ablation(..., seeds=[...])`) and reports a
+  paired comparison against ERM per (source, seed) pair — mean/median
+  difference, win/tie/loss counts, and an explicit `insufficient_evidence`
+  status when fewer than two common (source, seed) pairs were evaluated,
+  never a point estimate presented without its sample size.
 - Task A's smoke-type ground truth for source-held-out evaluation and
   candidate selection is restricted to `smoke_type_known=True` cells only
   (unknown and, unless `data.weak_labels.enabled=true`, weak-proxy cells

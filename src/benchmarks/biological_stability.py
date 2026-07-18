@@ -271,6 +271,50 @@ def cell_order_permutation_invariance_check(adapter, bags: Sequence[dict], seed:
     return {"max_abs_cancer_logit_difference": max_diff, "n_bags": len(bags)}
 
 
+# ─── Cell-type-label permutation null ──────────────────────────────────────
+
+def cell_type_label_permutation_check(adapter, bags: Sequence[dict], seed: int = 0) -> Dict:
+    """
+    Shuffles cell_type_ids WITHIN each bag (same per-bag cell-type count
+    distribution, different cell-to-type assignment) and compares the
+    ALREADY-FITTED model's cancer-logit output against the unshuffled
+    baseline. Unlike cell_order_permutation_invariance_check (which must
+    show NO change, by architectural construction), this null is expected TO
+    change the prediction if the model's cell-type-attention pooling
+    genuinely depends on which cells carry which cell-type label — a small
+    change here would indicate the model is largely ignoring cell-type
+    identity. This is a sensitivity diagnostic, not a biological claim."""
+    import torch
+    from .pathway_hierarchical_adapter import bags_to_pathway_batch
+
+    rng = np.random.RandomState(seed)
+    model = adapter.model
+    model.eval()
+    batch = bags_to_pathway_batch(bags)
+    with torch.no_grad():
+        base = model(batch["expression"], batch["cell_type_ids"], batch["cell_mask"])
+
+    shuffled_bags = []
+    for b in bags:
+        n = len(b["gene_matrix"])
+        perm = rng.permutation(n)
+        shuffled = dict(b)
+        shuffled["cell_type_ids"] = np.asarray(b["cell_type_ids"])[perm]
+        shuffled_bags.append(shuffled)
+    shuffled_batch = bags_to_pathway_batch(shuffled_bags)
+    with torch.no_grad():
+        shuffled_out = model(shuffled_batch["expression"], shuffled_batch["cell_type_ids"], shuffled_batch["cell_mask"])
+
+    mean_abs_diff = float((base.cancer_logits - shuffled_out.cancer_logits).abs().mean().item())
+    return {
+        "mean_abs_cancer_logit_difference": mean_abs_diff, "n_bags": len(bags),
+        "note": "cell-type-label permutation null — a large difference here (unlike the cell-order "
+                "invariance check, which must show ~zero difference) indicates the model's cell-type "
+                "attention pooling is sensitive to cell-type identity, not merely to which cells are "
+                "present; a sensitivity finding, not a biological claim.",
+    }
+
+
 # ─── Label-permutation null for module ranking ─────────────────────────────
 
 def label_permutation_null_record(real_ranking: Dict[str, float], permuted_ranking: Dict[str, float]) -> Dict:
