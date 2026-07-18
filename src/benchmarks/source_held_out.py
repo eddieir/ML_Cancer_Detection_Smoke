@@ -24,13 +24,21 @@ evaluation can run any number of times across any number of sources without
 ever consuming the one-shot real test guard.
 """
 
+import dataclasses
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, positive_class_proba
+from data.splitting import grouped_kfold
+from train import SubjectLevelDataset
+
+from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, SMOKE_SEARCH_SPACE, positive_class_proba
 from .calibration import build_frozen_policy
+from .cross_validation import (
+    DEFAULT_INNER_FOLDS, MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn,
+    _pathway_cancer_fit_score_fn, _pathway_smoke_fit_score_fn, _smoke_baseline_fit_score_fn,
+)
 from .domain_losses import resolve_domain_robustness_config
 from .features import build_cancer_subject_features, build_smoke_subject_summary_features
 from .final_evaluation import (
@@ -42,11 +50,13 @@ from .fold_preprocessing import (
     artifact_fingerprint,
     bags_from_fold_cell_dataset,
     build_fold_cell_dataset,
+    fold_train_val_datasets,
     refit_artifact_for_fold,
     require_normalized_adata,
 )
+from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
 from .metrics import full_smoke_metrics_report
-from .mil_registry import build_mil_adapter
+from .mil_registry import build_mil_adapter, pathway_search_space
 from .pathway_hierarchical_adapter import MODEL_NAME as PATHWAY_MODEL_NAME
 from .robustness_report import build_robustness_report
 from .source_eligibility import (
@@ -56,6 +66,73 @@ from .source_eligibility import (
 )
 
 DEFAULT_OOF_FOLDS = 3
+DEFAULT_SMOKE_DEV_CV_FOLDS = 3
+
+
+class ConflictingSmokeLabelError(ValueError):
+    """A subject's own VERIFIED (smoke_type_known=True) cells do not agree on
+    a single smoke_type value — never silently resolved by majority vote
+    across conflicting verified evidence (distinct from a subject simply
+    having no verified cells at all, which is reported as unknown, not a
+    conflict)."""
+
+
+def _verified_smoke_subject_labels(
+    normalized_adata, subjects: Sequence[str],
+) -> Tuple[Dict[str, int], Dict]:
+    """
+    Subject -> smoke_type label, restricted to subjects whose smoke_type_known
+    cells agree on exactly one value. A subject with zero verified cells (all
+    unknown, or all weak-proxy cells with weak-proxy promotion disabled) is
+    reported as unknown and excluded from the returned mapping rather than
+    silently defaulting to whatever the majority raw smoke_type happens to be
+    — see data/label_state.py and data/labellers.py's smoke_type_known gate,
+    which this function reads rather than reimplements.
+    """
+    obs = normalized_adata.obs
+    subj_series = obs["subject_id"].astype(str)
+    smoke_series = obs["smoke_type"].astype(int)
+    known_arr = (
+        obs["smoke_type_known"].astype(bool).values
+        if "smoke_type_known" in obs.columns
+        else np.ones(len(obs), dtype=bool)
+    )
+
+    label_by_subject: Dict[str, int] = {}
+    n_unknown = 0
+    conflicts: Dict[str, List[int]] = {}
+    for sid in subjects:
+        sid = str(sid)
+        subj_mask = (subj_series == sid).values
+        verified_mask = subj_mask & known_arr
+        if not verified_mask.any():
+            n_unknown += 1
+            continue
+        vals = sorted(set(smoke_series.values[verified_mask].tolist()))
+        if len(vals) > 1:
+            conflicts[sid] = vals
+            continue
+        label_by_subject[sid] = vals[0]
+
+    if conflicts:
+        raise ConflictingSmokeLabelError(
+            f"{len(conflicts)} subject(s) have conflicting VERIFIED smoke_type labels across "
+            f"their own cells (e.g. {dict(list(conflicts.items())[:3])}) — never resolved by "
+            "majority vote."
+        )
+
+    class_distribution: Dict[str, int] = {}
+    for v in label_by_subject.values():
+        class_distribution[str(v)] = class_distribution.get(str(v), 0) + 1
+
+    diagnostics = {
+        "total_subjects": len(subjects),
+        "verified_labels": len(label_by_subject),
+        "unknown_labels": n_unknown,
+        "conflicting_labels": len(conflicts),
+        "class_distribution": class_distribution,
+    }
+    return label_by_subject, diagnostics
 
 
 class CrossSourceSubjectConflictError(ValueError):
@@ -263,52 +340,168 @@ def run_cancer_source_held_out(
 
 # ─── Task A: smoke-type classification ─────────────────────────────────────
 
+class UnsupportedSmokeCandidateError(ValueError):
+    """Raised for a requested Task A source-held-out candidate that is
+    neither a classical SMOKE_BASELINES entry nor pathway_hierarchical_mil.
+    Task A source-held-out deliberately does not cover the pooling-based MIL
+    models ("neural", "mean_mil", "max_mil", "attention_mil") or the
+    cell-level MultiSmokeCancerNet Trainer curriculum (see this module's
+    docstring and README.md's honest-limitations section) — an unsupported
+    name must fail loudly, never be silently skipped."""
+
+
+class UnsupportedSmokeDomainStrategyError(ValueError):
+    """Task A source-held-out supports ERM only. CORAL/MMD/domain-adversarial/
+    source-balanced training is cancer-only (Task B) in this repository — see
+    README.md's task/strategy support matrix. A caller requesting a
+    non-"erm" strategy for the smoke task must be rejected explicitly rather
+    than silently downgraded to ERM."""
+
+
+_SUPPORTED_SMOKE_CANDIDATES = frozenset(set(SMOKE_BASELINES) | {PATHWAY_MODEL_NAME})
+
+
+def _smoke_candidate_dev_score(
+    context, name: str, dev_subjects: Sequence[str], label_by_subject: Dict[str, int],
+    num_cell_types: int, num_classes: int, n_hvgs: int, device: str, seed: int,
+    n_dev_folds: int, n_inner_folds: int,
+) -> Tuple[Optional[float], Dict]:
+    """
+    Development-only grouped-CV mean macro-F1 for one candidate, computed
+    ENTIRELY from dev_subjects (never held-out-source subjects). Each fold's
+    hyperparameters are selected by a fresh inner-CV run restricted to that
+    fold's own training subjects (select_nested_hyperparameters_with_refit),
+    mirroring cross_validation.run_smoke_cv's per-fold nested-selection
+    pattern but scoped to this held-out source's development pool only.
+    Returns (mean_macro_f1_or_None, evidence_dict).
+    """
+    labeled_dev_subjects = sorted(s for s in dev_subjects if s in label_by_subject)
+    if len(labeled_dev_subjects) < 2:
+        return None, {"error": "fewer than 2 verified-label development subjects"}
+    y_full = np.array([label_by_subject[s] for s in labeled_dev_subjects])
+    if len(set(y_full.tolist())) < 2:
+        return None, {"error": "development pool has only one verified smoke class"}
+
+    folds = grouped_kfold(np.array(labeled_dev_subjects), y_full, n_folds=n_dev_folds, seed=seed)
+    fold_scores, fold_records = [], []
+    for fold_idx, fold in enumerate(folds):
+        artifact, train_ds, val_ds = fold_train_val_datasets(
+            context, fold["train"], fold["val"], n_hvgs=n_hvgs,
+        )
+        if name in SMOKE_BASELINES:
+            hp_search = select_nested_hyperparameters_with_refit(
+                context, fold["train"], label_by_subject, build_param_grid(SMOKE_SEARCH_SPACE.get(name, {})),
+                fit_score_fn=_smoke_baseline_fit_score_fn(SMOKE_BASELINES[name], num_cell_types, num_classes),
+                seed=seed, n_inner_folds=n_inner_folds, n_hvgs=n_hvgs,
+            )
+            _, _, subj_tr, _ = build_smoke_subject_summary_features(train_ds, num_cell_types, num_classes)
+            Xva_raw, _, subj_va, _ = build_smoke_subject_summary_features(val_ds, num_cell_types, num_classes)
+            tr_mask = [s in label_by_subject for s in subj_tr]
+            va_mask = np.array([s in label_by_subject for s in subj_va])
+            if not any(tr_mask) or not va_mask.any():
+                continue
+            Xtr_full, _, _, _ = build_smoke_subject_summary_features(train_ds, num_cell_types, num_classes)
+            Xtr = Xtr_full[tr_mask]
+            ytr = np.array([label_by_subject[s] for s, keep in zip(subj_tr, tr_mask) if keep])
+            model = SMOKE_BASELINES[name](**hp_search["selected_params"]).fit(Xtr, ytr, seed=seed)
+            preds = model.predict(Xva_raw[va_mask])
+            yva = np.array([label_by_subject[s] for s, keep in zip(subj_va, va_mask) if keep])
+            report = full_smoke_metrics_report(yva, preds, num_classes)
+        elif name == PATHWAY_MODEL_NAME:
+            train_bags = bags_from_fold_cell_dataset(train_ds, {}, min_cells_per_subject=1)
+            val_bags = bags_from_fold_cell_dataset(val_ds, {}, min_cells_per_subject=1)
+            if not train_bags or not val_bags:
+                continue
+            hp_search = select_nested_hyperparameters_with_refit(
+                context, fold["train"], label_by_subject, build_param_grid(pathway_search_space(fast=False)),
+                fit_score_fn=_pathway_smoke_fit_score_fn(context, device, num_classes),
+                seed=seed, n_inner_folds=n_inner_folds, n_hvgs=n_hvgs,
+            )
+            train_sd = SubjectLevelDataset(train_bags, require_known_outcome=False)
+            val_sd = SubjectLevelDataset(val_bags, require_known_outcome=False)
+            fold_ctx = dataclasses.replace(context, preprocessing_artifact=artifact)
+            adapter = build_mil_adapter(PATHWAY_MODEL_NAME, None, device, config_overrides=hp_search["selected_params"])
+            adapter.fit(fold_ctx, train_ds, val_ds, train_sd, val_sd, seed=seed)
+            preds = adapter.predict_smoke(val_sd)
+            y_val, known = adapter.known_smoke_labels(val_sd)
+            if not known.any():
+                continue
+            report = full_smoke_metrics_report(y_val[known], preds[known], num_classes)
+        else:
+            raise UnsupportedSmokeCandidateError(
+                f"{name!r} is not a supported Task A source-held-out candidate — "
+                f"supported names are {sorted(_SUPPORTED_SMOKE_CANDIDATES)}."
+            )
+        fold_scores.append(report["macro_f1"])
+        fold_records.append({"fold": fold_idx, "macro_f1": report["macro_f1"], "hyperparameter_search": hp_search})
+
+    if not fold_scores:
+        return None, {"error": "no development fold produced a defined macro-F1", "folds": fold_records}
+    return float(np.mean(fold_scores)), {"folds": fold_records, "n_folds_scored": len(fold_scores)}
+
+
 def run_smoke_source_held_out(
     context, model_names: Sequence[str], device: str = "cpu",
+    domain_robustness_config: Optional[Dict] = None,
     incompatible_sources: Optional[Sequence[str]] = None,
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
-    seed: int = 42,
+    seed: int = 42, n_dev_cv_folds: int = DEFAULT_SMOKE_DEV_CV_FOLDS, n_inner_folds: int = DEFAULT_INNER_FOLDS,
 ) -> Dict:
     """
-    Task A source-held-out evaluation. Classical baselines (SMOKE_BASELINES)
-    are fit on subject-summary features exactly like the pre-existing
-    ood.py::run_leave_one_source_out. pathway_hierarchical_mil, if requested,
-    is additionally fit directly on development-source cell-level bags via
-    PathwayHierarchicalAdapter and evaluated on the held-out source's
-    subject-level majority-vote smoke label. The pooling-based MIL models
-    ("neural", "mean_mil", "max_mil", "attention_mil") and the cell-level
-    MultiSmokeCancerNet Trainer curriculum are NOT covered by this function
-    — see the module-level limitation this is documented against in
-    README.md — extending Task A's LOSO to the full Trainer curriculum
-    would require a materially larger rework of the per-source refit flow
-    than is safe to attempt within this scope.
+    Task A source-held-out evaluation. Only ERM is supported (see
+    UnsupportedSmokeDomainStrategyError) — CORAL/MMD/domain-adversarial/
+    source-balanced training is Task B (cancer) only in this repository.
+
+    For every source: model/hyperparameter selection is a development-only
+    grouped-CV ranking computed EXCLUSIVELY from the remaining (development)
+    sources' verified-label subjects (_smoke_candidate_dev_score); the
+    selected candidate's hyperparameters are then reselected once more from
+    the FULL development pool (never the held-out source), the model is
+    refit once on the full development pool with no internal validation
+    carve-out (adapter.fit_final for pathway_hierarchical_mil; a plain
+    baseline .fit has no validation concept to begin with), and the frozen
+    result is applied to the held-out source's subjects exactly once. The
+    pooling-based MIL models ("neural", "mean_mil", "max_mil",
+    "attention_mil") and the cell-level MultiSmokeCancerNet Trainer
+    curriculum remain out of scope for this function — see README.md.
+
+    Smoke labels are VERIFIED-only (smoke_type_known=True cells, see
+    _verified_smoke_subject_labels) — unknown and (unless explicitly
+    enabled) weak-proxy cells never contribute to a subject's ground-truth
+    label, and a subject whose verified cells disagree raises
+    ConflictingSmokeLabelError rather than being resolved by majority vote.
     """
+    domain_cfg = resolve_domain_robustness_config(domain_robustness_config)
+    if domain_cfg["strategy"] != "erm":
+        raise UnsupportedSmokeDomainStrategyError(
+            f"run_smoke_source_held_out: strategy={domain_cfg['strategy']!r} is not supported for "
+            "Task A — domain-robust training strategies are cancer-only in this repository."
+        )
+    unsupported = sorted(set(model_names) - _SUPPORTED_SMOKE_CANDIDATES)
+    if unsupported:
+        raise UnsupportedSmokeCandidateError(
+            f"run_smoke_source_held_out: unsupported candidate name(s) {unsupported} — "
+            f"supported names are {sorted(_SUPPORTED_SMOKE_CANDIDATES)}."
+        )
+
     normalized_adata = require_normalized_adata(context)
     num_classes = context.num_smoke_classes
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
     n_hvgs = context.preprocessing_artifact.n_hvgs
+    weak_labels_enabled = bool(context.config.get("data", {}).get("weak_labels", {}).get("enabled", False))
 
     subject_to_source = _pool_subjects_and_sources(context)
-    obs = normalized_adata.obs
-    subj_series = obs["subject_id"].astype(str)
-
-    def _subject_label(sid: str) -> Optional[int]:
-        mask = (subj_series == sid).values
-        vals = obs["smoke_type"].values[mask]
-        if len(vals) == 0:
-            return None
-        v, c = np.unique(vals, return_counts=True)
-        return int(v[np.argmax(c)])
-
     sources = sorted(set(subject_to_source.values()))
     reports: Dict[str, Dict] = {}
 
     for held_out_source in sources:
         held_out_subjects = sorted(s for s, src in subject_to_source.items() if src == held_out_source)
-        held_out_labels = [_subject_label(s) for s in held_out_subjects]
-        held_out_labels = [l for l in held_out_labels if l is not None]
+        held_out_label_by_subject, held_out_label_diagnostics = _verified_smoke_subject_labels(
+            normalized_adata, held_out_subjects,
+        )
+        held_out_labels = list(held_out_label_by_subject.values())
 
         elig = assess_smoke_source_eligibility(
             held_out_source, held_out_labels, incompatible_sources=incompatible_sources,
@@ -323,76 +516,134 @@ def run_smoke_source_held_out(
                 task="smoke_classification", model=None, strategy="erm", held_out_source=held_out_source,
                 eligibility=elig.to_dict(), development_sources=dev_sources,
                 limitations=["source ineligible — no model was trained or evaluated for this source"],
+                label_state={"held_out": held_out_label_diagnostics, "weak_labels_enabled": weak_labels_enabled},
             ).to_dict()
             continue
 
-        try:
-            artifact = refit_artifact_for_fold(normalized_adata, dev_subjects, n_hvgs)
-            train_ds = build_fold_cell_dataset(normalized_adata, artifact, dev_subjects)
-            held_out_ds = build_fold_cell_dataset(normalized_adata, artifact, held_out_subjects)
-        except ValueError as e:
+        dev_label_by_subject, dev_label_diagnostics = _verified_smoke_subject_labels(
+            normalized_adata, dev_subjects,
+        )
+
+        candidate_scores: Dict[str, Dict] = {}
+        best_name, best_score = None, -np.inf
+        for name in model_names:
+            score, evidence = _smoke_candidate_dev_score(
+                context, name, dev_subjects, dev_label_by_subject, num_cell_types, num_classes,
+                n_hvgs, device, seed, n_dev_cv_folds, n_inner_folds,
+            )
+            candidate_scores[name] = {"development_macro_f1": score, **evidence}
+            if score is not None and score > best_score:
+                best_name, best_score = name, score
+
+        if best_name is None:
             reports[held_out_source] = build_robustness_report(
                 task="smoke_classification", model=None, strategy="erm", held_out_source=held_out_source,
                 eligibility=elig.to_dict(), development_sources=dev_sources,
-                limitations=[f"held-out source's genes could not be transformed with the "
-                             f"development-only artifact: {e}"],
+                limitations=["no candidate produced a defined development-only macro-F1"],
+                comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                label_state={"development": dev_label_diagnostics, "held_out": held_out_label_diagnostics,
+                             "weak_labels_enabled": weak_labels_enabled},
             ).to_dict()
             continue
 
-        comparisons = []
-        Xtr, ytr, _, _ = build_smoke_subject_summary_features(train_ds, num_cell_types, num_classes)
-        Xte, yte, _, _ = build_smoke_subject_summary_features(held_out_ds, num_cell_types, num_classes)
-        for name in model_names:
-            if name in SMOKE_BASELINES:
-                model = SMOKE_BASELINES[name]()
-                model.fit(Xtr, ytr, seed=seed)
-                preds = model.predict(Xte)
-                report = full_smoke_metrics_report(yte, preds, num_classes)
-                comparisons.append({"name": name, "kind": "baseline",
-                                     "subject_weighted_macro_f1": report["macro_f1"],
-                                     "classes_absent_from_held_out_source": report["classes_absent_from_targets"]})
-            elif name == PATHWAY_MODEL_NAME:
-                train_bags = bags_from_fold_cell_dataset(train_ds, {}, min_cells_per_subject=1)
-                held_out_bags = bags_from_fold_cell_dataset(held_out_ds, {}, min_cells_per_subject=1)
-                if not train_bags or not held_out_bags:
-                    comparisons.append({"name": name, "kind": "mil", "subject_weighted_macro_f1": None,
-                                         "error": "no subject met min_cells_per_subject for smoke bags"})
-                    continue
-                from train import SubjectLevelDataset
-                adapter = build_mil_adapter(name, "attention", device)
-                fold_ctx_train = SubjectLevelDataset(train_bags, require_known_outcome=False)
-                fold_ctx_val = SubjectLevelDataset(held_out_bags, require_known_outcome=False)
-                import dataclasses as _dc
-                fold_ctx = _dc.replace(context, preprocessing_artifact=artifact)
-                adapter.fit(fold_ctx, train_ds, held_out_ds, fold_ctx_train, fold_ctx_val, seed=seed,
-                            pretrain_epochs=3)
-                preds = adapter.predict_smoke(fold_ctx_val)
-                labels, known = adapter.known_smoke_labels(fold_ctx_val)
-                if known.any():
-                    report = full_smoke_metrics_report(labels[known], preds[known], num_classes)
-                    comparisons.append({"name": name, "kind": "mil",
-                                         "subject_weighted_macro_f1": report["macro_f1"],
-                                         "classes_absent_from_held_out_source": report["classes_absent_from_targets"]})
-                else:
-                    comparisons.append({"name": name, "kind": "mil", "subject_weighted_macro_f1": None,
-                                         "error": "no held-out subject had a verified smoke label"})
+        # One more, clearly-declared nested hyperparameter selection over the
+        # FULL development pool for the final fit (mirrors
+        # run_cancer_source_held_out's identical "hp_for_final" pattern) —
+        # never re-selected using any per-fold subset or held-out data.
+        if best_name in SMOKE_BASELINES:
+            fit_score_fn = _smoke_baseline_fit_score_fn(SMOKE_BASELINES[best_name], num_cell_types, num_classes)
+            candidates = build_param_grid(SMOKE_SEARCH_SPACE.get(best_name, {}))
+        else:
+            fit_score_fn = _pathway_smoke_fit_score_fn(context, device, num_classes)
+            candidates = build_param_grid(pathway_search_space(fast=False))
+        labeled_dev_subjects = sorted(dev_label_by_subject)
+        final_hp_search = select_nested_hyperparameters_with_refit(
+            context, labeled_dev_subjects, dev_label_by_subject, candidates, fit_score_fn=fit_score_fn,
+            seed=seed, n_inner_folds=n_inner_folds, n_hvgs=n_hvgs,
+        )
+        selected_params = final_hp_search["selected_params"]
+
+        try:
+            final_artifact = refit_artifact_for_fold(normalized_adata, dev_subjects, n_hvgs)
+            dev_ds = build_fold_cell_dataset(normalized_adata, final_artifact, dev_subjects)
+            held_out_ds = build_fold_cell_dataset(normalized_adata, final_artifact, held_out_subjects)
+        except ValueError as e:
+            reports[held_out_source] = build_robustness_report(
+                task="smoke_classification", model=best_name, strategy="erm", held_out_source=held_out_source,
+                eligibility=elig.to_dict(), development_sources=dev_sources,
+                limitations=[f"held-out source's genes could not be transformed with the "
+                             f"development-only artifact: {e}"],
+                comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+            ).to_dict()
+            continue
+
+        if best_name in SMOKE_BASELINES:
+            Xdev_full, _, subj_dev, _ = build_smoke_subject_summary_features(dev_ds, num_cell_types, num_classes)
+            dev_mask = [s in dev_label_by_subject for s in subj_dev]
+            Xdev = Xdev_full[dev_mask]
+            ydev = np.array([dev_label_by_subject[s] for s, keep in zip(subj_dev, dev_mask) if keep])
+            model = SMOKE_BASELINES[best_name](**selected_params).fit(Xdev, ydev, seed=seed)
+            Xte_full, _, subj_te, _ = build_smoke_subject_summary_features(held_out_ds, num_cell_types, num_classes)
+            te_mask = np.array([s in held_out_label_by_subject for s in subj_te])
+            if not te_mask.any():
+                reports[held_out_source] = build_robustness_report(
+                    task="smoke_classification", model=best_name, strategy="erm", held_out_source=held_out_source,
+                    eligibility=elig.to_dict(), development_sources=dev_sources,
+                    limitations=["no held-out subject had a verified smoke label"],
+                    comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                ).to_dict()
+                continue
+            preds = model.predict(Xte_full[te_mask])
+            yte = np.array([held_out_label_by_subject[s] for s, keep in zip(subj_te, te_mask) if keep])
+            report = full_smoke_metrics_report(yte, preds, num_classes)
+            model_state_fp = model.model_state_fingerprint()
+        else:
+            dev_bags = bags_from_fold_cell_dataset(dev_ds, {}, min_cells_per_subject=1)
+            held_out_bags = bags_from_fold_cell_dataset(held_out_ds, {}, min_cells_per_subject=1)
+            if not dev_bags or not held_out_bags:
+                reports[held_out_source] = build_robustness_report(
+                    task="smoke_classification", model=best_name, strategy="erm", held_out_source=held_out_source,
+                    eligibility=elig.to_dict(), development_sources=dev_sources,
+                    limitations=["no subject met min_cells_per_subject for smoke bags"],
+                    comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                ).to_dict()
+                continue
+            dev_sd = SubjectLevelDataset(dev_bags, require_known_outcome=False)
+            held_out_sd = SubjectLevelDataset(held_out_bags, require_known_outcome=False)
+            fold_ctx = dataclasses.replace(context, preprocessing_artifact=final_artifact)
+            adapter = build_mil_adapter(PATHWAY_MODEL_NAME, None, device, config_overrides=selected_params)
+            adapter.fit_final(fold_ctx, dev_ds, dev_sd, seed=seed)
+            preds = adapter.predict_smoke(held_out_sd)
+            labels, known = adapter.known_smoke_labels(held_out_sd)
+            if not known.any():
+                reports[held_out_source] = build_robustness_report(
+                    task="smoke_classification", model=best_name, strategy="erm", held_out_source=held_out_source,
+                    eligibility=elig.to_dict(), development_sources=dev_sources,
+                    limitations=["no held-out subject had a verified smoke label"],
+                    comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                ).to_dict()
+                continue
+            report = full_smoke_metrics_report(labels[known], preds[known], num_classes)
+            model_state_fp = adapter.model_state_fingerprint()
 
         manifest = build_source_held_out_manifest(
             task="smoke_classification", held_out_source=held_out_source, development_sources=dev_sources,
             development_subjects=dev_subjects, held_out_subjects=held_out_subjects,
             known_label_counts={"n": len(held_out_labels)}, class_distribution=elig.counts,
-            eligibility=elig, seed=seed, preprocessing_policy_fingerprint=artifact_fingerprint(artifact),
+            eligibility=elig, seed=seed, preprocessing_policy_fingerprint=artifact_fingerprint(final_artifact),
         )
-        scored = [c for c in comparisons if c.get("subject_weighted_macro_f1") is not None]
-        best = max(scored, key=lambda c: c["subject_weighted_macro_f1"]) if scored else None
         reports[held_out_source] = build_robustness_report(
-            task="smoke_classification", model=best["name"] if best else None, strategy="erm",
+            task="smoke_classification", model=best_name, strategy="erm",
             held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
-            metrics={"per_model": comparisons,
-                     "macro_f1": best["subject_weighted_macro_f1"] if best else None},
-            comparisons=comparisons,
+            metrics={"macro_f1": report["macro_f1"], "weighted_f1": report["weighted_f1"],
+                     "balanced_accuracy": report.get("balanced_accuracy"), "per_class": report.get("per_class"),
+                     "classes_absent_from_held_out_source": report["classes_absent_from_targets"]},
+            comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
             source_split_manifest_fingerprint=manifest.fingerprint(),
-            preprocessing_fingerprint=artifact_fingerprint(artifact),
+            preprocessing_fingerprint=artifact_fingerprint(final_artifact),
+            model_fingerprint=model_state_fp,
+            label_state={"development": dev_label_diagnostics, "held_out": held_out_label_diagnostics,
+                         "weak_labels_enabled": weak_labels_enabled},
         ).to_dict()
 
     return reports

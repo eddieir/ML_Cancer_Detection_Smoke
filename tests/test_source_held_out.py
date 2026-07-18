@@ -15,7 +15,10 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from benchmarks.runner import build_synthetic_context
 from benchmarks.source_held_out import (
+    ConflictingSmokeLabelError,
     CrossSourceSubjectConflictError,
+    UnsupportedSmokeCandidateError,
+    UnsupportedSmokeDomainStrategyError,
     run_cancer_source_held_out,
     run_smoke_source_held_out,
 )
@@ -117,6 +120,68 @@ def test_mouse_source_excluded_from_human_only_protocol():
         species_by_source={"sourceA": "human", "sourceB": "mouse"}, reference_species="human",
     )
     assert reports["sourceB"]["eligibility"]["status"] == "species_mismatch"
+
+
+def test_smoke_conflicting_verified_labels_rejected():
+    """A subject whose own smoke_type_known=True cells disagree on
+    smoke_type must raise, never be silently resolved by majority vote."""
+    ctx4 = build_synthetic_context(seed=4, fast=True)
+    normalized_adata = ctx4.normalized_adata_for_refit
+    obs = normalized_adata.obs.copy()
+    obs["smoke_type_known"] = True
+    train_mask = (obs["subject_id"] == "train_0").values
+    idx = obs.index[train_mask]
+    half = idx[: max(1, len(idx) // 2)]
+    obs.loc[half, "smoke_type"] = (obs.loc[half, "smoke_type"].astype(int) + 1) % 3
+    normalized_adata.obs = obs
+    with pytest.raises(ConflictingSmokeLabelError):
+        run_smoke_source_held_out(ctx4, ["majority"], device="cpu", **_BENCH_CFG)
+
+
+def test_smoke_unknown_cells_excluded_from_verified_label():
+    """A subject whose ONLY known cells were flipped to unknown must be
+    excluded from the verified-label pool (not the same as a conflict)."""
+    ctx5 = build_synthetic_context(seed=5, fast=True)
+    normalized_adata = ctx5.normalized_adata_for_refit
+    obs = normalized_adata.obs.copy()
+    obs["smoke_type_known"] = True
+    obs.loc[(obs["subject_id"] == "train_0").values, "smoke_type_known"] = False
+    normalized_adata.obs = obs
+    reports = run_smoke_source_held_out(ctx5, ["majority"], device="cpu", **_BENCH_CFG)
+    dev_diag = reports["sourceB"]["label_state"]["development"]
+    assert dev_diag["unknown_labels"] >= 1
+
+
+def test_smoke_unsupported_candidate_rejected(ctx):
+    with pytest.raises(UnsupportedSmokeCandidateError):
+        run_smoke_source_held_out(ctx, ["neural"], device="cpu", **_BENCH_CFG)
+
+
+def test_smoke_domain_strategy_other_than_erm_rejected(ctx):
+    with pytest.raises(UnsupportedSmokeDomainStrategyError):
+        run_smoke_source_held_out(
+            ctx, ["majority"], device="cpu", domain_robustness_config={"strategy": "coral"}, **_BENCH_CFG,
+        )
+
+
+def test_smoke_held_out_label_corruption_does_not_change_selected_model_or_preprocessing():
+    """Corrupting the held-out source's own labels must never change which
+    candidate was selected, its development evidence, or the frozen
+    preprocessing artifact — only the final held-out metrics may move."""
+    ctx6 = build_synthetic_context(seed=6, fast=True)
+    reports_before = run_smoke_source_held_out(ctx6, ["majority", "logistic"], device="cpu", **_BENCH_CFG)
+
+    normalized_adata = ctx6.normalized_adata_for_refit
+    obs = normalized_adata.obs.copy()
+    held_out_mask = (obs["source"] == "sourceB").values
+    obs.loc[held_out_mask, "smoke_type"] = (obs.loc[held_out_mask, "smoke_type"].astype(int) + 1) % 3
+    normalized_adata.obs = obs
+    reports_after = run_smoke_source_held_out(ctx6, ["majority", "logistic"], device="cpu", **_BENCH_CFG)
+
+    before, after = reports_before["sourceB"], reports_after["sourceB"]
+    assert before["model"] == after["model"]
+    assert before["preprocessing_fingerprint"] == after["preprocessing_fingerprint"]
+    assert before["comparisons"] == after["comparisons"]
 
 
 @pytest.fixture(autouse=True)

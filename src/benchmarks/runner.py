@@ -59,7 +59,7 @@ from data.transforms import assert_batch_correction_safe
 from .domain_losses import resolve_domain_robustness_config
 from .domain_robustness_ablation import run_domain_robustness_ablation
 from .robustness_report import aggregate_source_reports, build_aggregate_report
-from .source_held_out import run_cancer_source_held_out, run_smoke_source_held_out
+from .source_held_out import UnsupportedSmokeDomainStrategyError, run_cancer_source_held_out, run_smoke_source_held_out
 
 
 def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentContext:
@@ -283,6 +283,14 @@ def run_smoke_task(context, args, run_dir) -> dict:
                 context, "smoke", args.models, device=args.device, seed=args.seeds[0], **loso_kwargs,
             )
         else:
+            requested_strategy = _domain_robustness_config_from_args(context, args)["strategy"]
+            if requested_strategy != "erm":
+                raise UnsupportedSmokeDomainStrategyError(
+                    f"--domain-strategy {requested_strategy!r} was requested for --task smoke, but Task A "
+                    "source-held-out evaluation supports ERM only — domain-robust training strategies "
+                    "(source_balanced/coral/mmd/domain_adversarial) are cancer-only in this repository. "
+                    "Use --task cancer, or omit --domain-strategy (defaults to erm) for smoke."
+                )
             per_source = run_smoke_source_held_out(context, args.models, device=args.device, seed=args.seeds[0],
                                                      **loso_kwargs)
             domain_robustness_report = build_aggregate_report(
@@ -685,6 +693,51 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             "domain_robustness_report": domain_robustness_report}
 
 
+class DomainRobustnessCLIConfigurationError(ValueError):
+    """A Phase 6 domain-robustness CLI flag was supplied in a combination
+    that would otherwise have no effect on the resolved configuration or
+    execution path — e.g. --coral-weight without --domain-strategy coral.
+    Rejected explicitly rather than silently accepted and ignored (see
+    _domain_robustness_config_from_args' own docstring for the one
+    deliberate exception: --domain-robustness-ablation runs every strategy
+    regardless of --domain-strategy)."""
+
+
+def _validate_domain_robustness_cli_flags(args) -> None:
+    ablation = getattr(args, "domain_robustness_ablation", False)
+    strategy = getattr(args, "domain_strategy", None)
+    if getattr(args, "coral_weight", None) is not None and not ablation and strategy != "coral":
+        raise DomainRobustnessCLIConfigurationError(
+            "--coral-weight has no effect without --domain-strategy coral (or --domain-robustness-ablation)."
+        )
+    if getattr(args, "mmd_weight", None) is not None and not ablation and strategy != "mmd":
+        raise DomainRobustnessCLIConfigurationError(
+            "--mmd-weight has no effect without --domain-strategy mmd (or --domain-robustness-ablation)."
+        )
+    if (getattr(args, "domain_loss_weight", None) is not None
+            and not ablation and strategy != "domain_adversarial"):
+        raise DomainRobustnessCLIConfigurationError(
+            "--domain-loss-weight has no effect without --domain-strategy domain_adversarial "
+            "(or --domain-robustness-ablation)."
+        )
+    if (getattr(args, "gradient_reversal_lambda", None) is not None
+            and not ablation and strategy != "domain_adversarial"):
+        raise DomainRobustnessCLIConfigurationError(
+            "--gradient-reversal-lambda has no effect without --domain-strategy domain_adversarial "
+            "(or --domain-robustness-ablation)."
+        )
+    if getattr(args, "source_balanced", False) and not ablation and strategy != "source_balanced":
+        raise DomainRobustnessCLIConfigurationError(
+            "--source-balanced has no effect without --domain-strategy source_balanced "
+            "(or --domain-robustness-ablation)."
+        )
+    if getattr(args, "robustness_report", None) is not None and strategy is None and not ablation:
+        raise DomainRobustnessCLIConfigurationError(
+            "--robustness-report has no effect without --domain-strategy or --domain-robustness-ablation "
+            "— there is no robustness workflow active to write a report for."
+        )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
@@ -743,6 +796,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--robustness-report", type=str, default=None,
                          help="Path to write the aggregate cross-source robustness report JSON.")
     args = parser.parse_args(argv)
+    _validate_domain_robustness_cli_flags(args)
 
     if args.synthetic:
         if args.task is None:

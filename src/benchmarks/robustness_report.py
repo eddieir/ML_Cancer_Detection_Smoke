@@ -56,6 +56,7 @@ class RobustnessReport:
     biological_stability: Dict = field(default_factory=dict)
     comparisons: List[Dict] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
+    label_state: Dict = field(default_factory=dict)
 
     def fingerprint(self) -> str:
         return _sha256_json(self.to_dict(include_fingerprint=False))
@@ -95,7 +96,7 @@ def build_robustness_report(
     limitations: Optional[List[str]] = None, dataset_manifest_fingerprint: Optional[str] = None,
     source_split_manifest_fingerprint: Optional[str] = None, preprocessing_fingerprint: Optional[str] = None,
     module_fingerprint: Optional[str] = None, model_fingerprint: Optional[str] = None,
-    calibration_fingerprint: Optional[str] = None,
+    calibration_fingerprint: Optional[str] = None, label_state: Optional[Dict] = None,
 ) -> RobustnessReport:
     return RobustnessReport(
         schema_version=ROBUSTNESS_REPORT_SCHEMA_VERSION, development_only=True, frozen_test_accessed=False,
@@ -106,7 +107,7 @@ def build_robustness_report(
         held_out_source=held_out_source, eligibility=eligibility, development_sources=list(development_sources),
         metrics=metrics or {}, calibration=calibration or {}, uncertainty=uncertainty or {},
         domain_shift=domain_shift or {}, biological_stability=biological_stability or {},
-        comparisons=comparisons or [], limitations=limitations or [],
+        comparisons=comparisons or [], limitations=limitations or [], label_state=label_state or {},
     )
 
 

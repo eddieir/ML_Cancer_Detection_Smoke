@@ -21,7 +21,9 @@ References (formulas only, not literature claims about biological validity):
     Adaptation" — squared Frobenius norm between per-domain feature
     covariance matrices, normalized by 4*D^2.
   - MMD: Gretton et al., "A Kernel Two-Sample Test" — squared maximum mean
-    discrepancy with an RBF kernel, computed via the unbiased U-statistic.
+    discrepancy with an RBF kernel, computed via the biased V-statistic
+    (diagonal kernel terms included; see mmd_loss's own docstring for why
+    the unbiased U-statistic is not used here).
   - Gradient reversal: Ganin & Lempitsky, "Unsupervised Domain Adaptation by
     Backpropagation" — identity in the forward pass, negated (and scaled by
     lambda) gradient in the backward pass.
@@ -257,7 +259,7 @@ DOMAIN_STRATEGIES = ("erm", "source_balanced", "coral", "mmd", "domain_adversari
 
 DEFAULT_DOMAIN_ROBUSTNESS_CONFIG = {
     "strategy": "erm",
-    "source_balancing": {"enabled": False},
+    "source_balancing": {"enabled": False, "batch_size": None, "samples_per_epoch": None},
     "coral": {"enabled": False, "weight": 0.0},
     "mmd": {"enabled": False, "weight": 0.0, "kernel": "rbf"},
     "adversarial": {
@@ -310,5 +312,19 @@ def resolve_domain_robustness_config(cfg: Optional[dict]) -> dict:
     if resolved["adversarial"]["gradient_reversal_lambda"] < 0:
         raise DomainLossConfigurationError(
             "domain_robustness.adversarial.gradient_reversal_lambda must be >= 0."
+        )
+    bs = resolved["source_balancing"].get("batch_size")
+    if bs is not None and bs <= 0:
+        raise DomainLossConfigurationError(f"domain_robustness.source_balancing.batch_size must be > 0, got {bs}.")
+    spe = resolved["source_balancing"].get("samples_per_epoch")
+    if spe is not None and spe <= 0:
+        raise DomainLossConfigurationError(
+            f"domain_robustness.source_balancing.samples_per_epoch must be > 0, got {spe}."
+        )
+    if resolved["strategy"] == "source_balanced" and not resolved["source_balancing"]["enabled"]:
+        raise DomainLossConfigurationError(
+            "domain_robustness.strategy='source_balanced' requires "
+            "domain_robustness.source_balancing.enabled=true — a strategy name alone does not "
+            "implicitly enable source-balanced sampling."
         )
     return resolved

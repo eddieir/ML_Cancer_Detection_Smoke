@@ -5,9 +5,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from benchmarks.runner import main
+from benchmarks.runner import DomainRobustnessCLIConfigurationError, main
+from benchmarks.source_held_out import UnsupportedSmokeDomainStrategyError
 
 
 def _run(args):
@@ -48,9 +51,51 @@ def test_synthetic_smoke_task_with_leave_one_source_out():
 
 
 def test_run_id_collision_raises_not_overwrites():
-    import pytest
     with tempfile.TemporaryDirectory() as tmp:
         _run(["--synthetic", "--fast", "--task", "smoke", "--output", tmp, "--run-id", "dup"])
         with pytest.raises(FileExistsError):
             main(["--synthetic", "--fast", "--task", "smoke", "--output", tmp, "--run-id", "dup"])
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_coral_weight_without_coral_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--coral-weight", "0.1"])
+
+
+def test_mmd_weight_with_non_mmd_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--domain-strategy", "coral", "--mmd-weight", "0.1"])
+
+
+def test_gradient_reversal_lambda_without_adversarial_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--gradient-reversal-lambda", "1.0"])
+
+
+def test_source_balanced_without_source_balanced_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--domain-strategy", "coral", "--coral-weight", "0.1", "--source-balanced"])
+
+
+def test_robustness_report_without_active_workflow_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--robustness-report", str(Path(tmp) / "r.json")])
+
+
+def test_smoke_task_rejects_non_erm_domain_strategy():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(UnsupportedSmokeDomainStrategyError):
+            main(["--synthetic", "--fast", "--task", "smoke", "--output", tmp,
+                  "--domain-strategy", "coral", "--coral-weight", "0.1"])
     shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)

@@ -30,6 +30,8 @@ from pathway_hierarchical_mil import (
     PathwayHierarchicalMILConfig,
     collate_subject_bags,
 )
+from data.source_sampling import SourceBalancedBatchSampler, SourceSubjectIndex
+
 from .domain_losses import (
     DomainClassifierHead,
     DomainLossConfigurationError,
@@ -180,6 +182,10 @@ class PathwayHierarchicalAdapter:
         self.domain_head: Optional[DomainClassifierHead] = None
         self.domain_source_vocabulary: Optional[List[str]] = None
         self.last_loss_components: Dict[str, float] = {}
+        # Per-epoch realized source-exposure diagnostics, populated only when
+        # strategy == "source_balanced" (see _build_source_sampler) — None
+        # for every other strategy, never a fabricated empty-looking dict.
+        self.source_sampling_diagnostics: Optional[List[Dict]] = None
 
     def _build(self, context, num_smoke: int) -> None:
         gene_list = list(context.preprocessing_artifact.gene_list)
@@ -267,11 +273,33 @@ class PathwayHierarchicalAdapter:
 
         raise DomainLossConfigurationError(f"Unhandled domain_robustness.strategy={strategy!r}")
 
+    def _build_source_sampler(self, bags: Sequence[dict], seed: int) -> Optional[SourceBalancedBatchSampler]:
+        """
+        Only constructed for strategy == 'source_balanced' (already validated
+        enabled=true by resolve_domain_robustness_config). Each bag IS one
+        subject (this adapter's unit of gradient-update input), so
+        SourceSubjectIndex is built with exactly one "cell" per subject —
+        source -> subject sampling with no further cell-level draw, which is
+        the correct degenerate case of the same source -> subject -> cell
+        sampler used elsewhere for cell-level training (data/source_sampling.py).
+        """
+        if self.domain_robustness["strategy"] != "source_balanced":
+            return None
+        subject_ids = np.array([str(b["subject_id"]) for b in bags])
+        sources = np.array([str(b.get("source") or "unknown") for b in bags])
+        index = SourceSubjectIndex(subject_ids=subject_ids, sources=sources)
+        cfg = self.domain_robustness["source_balancing"]
+        batch_size = cfg.get("batch_size") or min(len(bags), 8)
+        samples_per_epoch = cfg.get("samples_per_epoch") or len(bags)
+        return SourceBalancedBatchSampler(
+            index, batch_size=batch_size, seed=seed, samples_per_epoch=samples_per_epoch,
+        )
+
     def _train_loop(self, bags: Sequence[dict], epochs: int, seed: int) -> None:
         torch.manual_seed(seed)
-        batch = bags_to_pathway_batch(bags)
-        sources = batch["source"]
-        self._maybe_build_domain_head(sources)
+        full_batch = bags_to_pathway_batch(bags)
+        sources_all = full_batch["source"]
+        self._maybe_build_domain_head(sources_all)
         loss_fn = MultitaskMaskedLoss(
             smoke_loss_weight=self.config.smoke_loss_weight,
             cancer_loss_weight=self.config.cancer_loss_weight,
@@ -282,10 +310,13 @@ class PathwayHierarchicalAdapter:
             params += list(self.domain_head.parameters())
         optimizer = torch.optim.AdamW(params, lr=DEFAULT_LR)
         self.model.train()
-        expression = batch["expression"].to(self.device)
-        cell_type_ids = batch["cell_type_ids"].to(self.device)
-        cell_mask = batch["cell_mask"].to(self.device)
-        for epoch in range(max(epochs, 1)):
+
+        def _step(sub_bags: Sequence[dict], epoch: int) -> None:
+            batch = bags_to_pathway_batch(sub_bags)
+            sources = batch["source"]
+            expression = batch["expression"].to(self.device)
+            cell_type_ids = batch["cell_type_ids"].to(self.device)
+            cell_mask = batch["cell_mask"].to(self.device)
             optimizer.zero_grad()
             out = self.model(expression, cell_type_ids, cell_mask)
             task_loss, _ = loss_fn(
@@ -299,6 +330,21 @@ class PathwayHierarchicalAdapter:
             total.backward()
             torch.nn.utils.clip_grad_norm_(params, DEFAULT_GRAD_CLIP)
             optimizer.step()
+
+        sampler = self._build_source_sampler(bags, seed)
+        if sampler is None:
+            # Unchanged ERM/coral/mmd/domain_adversarial behavior: one
+            # full-batch gradient step per epoch over every supplied bag.
+            for epoch in range(max(epochs, 1)):
+                _step(bags, epoch)
+        else:
+            per_epoch_diagnostics = []
+            for epoch in range(max(epochs, 1)):
+                for index_batch in sampler:
+                    _step([bags[i] for i in index_batch], epoch)
+                if sampler.last_realized_diagnostics is not None:
+                    per_epoch_diagnostics.append(sampler.last_realized_diagnostics.to_dict())
+            self.source_sampling_diagnostics = per_epoch_diagnostics
 
     def fit(
         self, context, train_cell_dataset, val_cell_dataset,
@@ -374,6 +420,7 @@ class PathwayHierarchicalAdapter:
             "domain_robustness": self.domain_robustness,
             "domain_source_vocabulary": self.domain_source_vocabulary,
             "last_loss_components": dict(self.last_loss_components),
+            "source_sampling_diagnostics": self.source_sampling_diagnostics,
         }
 
     def model_state_fingerprint(self) -> str:

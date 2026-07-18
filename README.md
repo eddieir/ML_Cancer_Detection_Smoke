@@ -1954,6 +1954,13 @@ the aggregate's source count.
   state-of-the-art performance is made anywhere for this phase's work — see
   ARCHITECTURE.md §16 for the full scientific-claims policy this repository
   follows.
+- Task A's smoke-type ground truth for source-held-out evaluation and
+  candidate selection is restricted to `smoke_type_known=True` cells only
+  (unknown and, unless `data.weak_labels.enabled=true`, weak-proxy cells
+  never contribute); a subject whose own verified cells disagree on
+  `smoke_type` raises rather than being resolved by majority vote. Each
+  source-held-out report's `label_state` field records how many subjects
+  were verified, unknown, or conflicting.
 
 ## Next steps
 
