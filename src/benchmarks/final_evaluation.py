@@ -128,7 +128,8 @@ def _predict_baseline(model, X: np.ndarray) -> np.ndarray:
 
 
 def _fit_mil(context, candidate_name: str, artifact, pooling: str, device: str, train_ds, val_ds,
-             train_bags: List[dict], val_bags: List[dict], hp_params: Dict, seed: int):
+             train_bags: List[dict], val_bags: List[dict], hp_params: Dict, seed: int,
+             domain_robustness_config: Optional[Dict] = None):
     """Used for OOF-fold fits only (each OOF fold still uses a real,
     subject-disjoint validation split for Trainer's own checkpoint
     selection, exactly like CV) — the final dev-pool refit uses
@@ -153,6 +154,7 @@ def _fit_mil(context, candidate_name: str, artifact, pooling: str, device: str, 
                                     train_cell_dataset=train_ds, val_cell_dataset=val_ds)
     adapter = build_mil_adapter(
         candidate_name, pooling, device, config_overrides=hp_params if is_pathway else None,
+        domain_robustness_config=domain_robustness_config if is_pathway else None,
     )
     adapter.fit(fold_ctx, train_ds, val_ds, train_sd, val_sd, seed=seed,
                 pretrain_epochs=None if is_pathway else hp_params.get("pretrain_epochs", 2))
@@ -193,7 +195,7 @@ def generate_subject_oof_predictions(
     context, candidate_name: str, dev_subjects: Sequence[str], outcomes_by_subject: Dict[str, int],
     num_cell_types: int, min_cells_per_subject: int, n_hvgs: int,
     pooling: str = "attention", device: str = "cpu", seed: int = 42, n_folds: int = 5,
-    n_inner_folds: int = DEFAULT_OOF_INNER_FOLDS,
+    n_inner_folds: int = DEFAULT_OOF_INNER_FOLDS, domain_robustness_config: Optional[Dict] = None,
 ) -> Dict:
     """
     Subject-grouped, SELECTION-CLEAN out-of-fold probabilities for
@@ -259,7 +261,8 @@ def generate_subject_oof_predictions(
         if is_mil_candidate(candidate_name):
             try:
                 adapter = _fit_mil(context, candidate_name, artifact, pooling, device, train_ds, val_ds,
-                                    train_bags, val_bags, selected_params, seed)
+                                    train_bags, val_bags, selected_params, seed,
+                                    domain_robustness_config=domain_robustness_config)
                 val_sd = SubjectLevelDataset(val_bags)
                 proba = adapter.predict_proba(val_sd)
                 subj_order = [str(b["subject_id"]) for b in val_sd.bags]
@@ -333,6 +336,7 @@ def fit_final_candidate_on_dev_pool(
     context, candidate_name: str, dev_subjects: Sequence[str], outcomes_by_subject: Dict[str, int],
     selected_params: Dict, num_cell_types: int, min_cells_per_subject: int, n_hvgs: int,
     pooling: str = "attention", device: str = "cpu", seed: int = 42,
+    domain_robustness_config: Optional[Dict] = None,
 ) -> FittedFinalCandidate:
     """
     Development-only final fit (blocker 1's stage A / blocker 3): ONE
@@ -369,6 +373,7 @@ def fit_final_candidate_on_dev_pool(
         fold_ctx = dataclasses.replace(context, preprocessing_artifact=final_artifact)
         adapter = build_mil_adapter(
             candidate_name, pooling, device, config_overrides=selected_params if is_pathway else None,
+            domain_robustness_config=domain_robustness_config if is_pathway else None,
         )
         adapter.fit_final(fold_ctx, dev_ds, dev_sd, seed=seed,
                            pretrain_epochs=None if is_pathway else selected_params.get("pretrain_epochs"))
