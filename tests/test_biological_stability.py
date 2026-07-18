@@ -20,11 +20,13 @@ from benchmarks.biological_stability import (
     attention_vs_abundance,
     cell_order_permutation_invariance_check,
     cell_type_attention_by_subject,
+    gene_module_permutation_null,
     module_ablation_scores,
     module_ranking_stability,
     require_real_modules,
     spearman_rank_correlation,
     top_k_overlap,
+    within_gene_expression_permutation_null,
 )
 from benchmarks.pathway_hierarchical_adapter import PathwayHierarchicalAdapter
 from benchmarks.runner import build_synthetic_context
@@ -110,3 +112,65 @@ def test_real_module_required_error_rejects_synthetic_modules(fitted_adapter):
     adapter, _ = fitted_adapter
     with pytest.raises(RealModuleRequiredError):
         require_real_modules(adapter.modules)
+
+
+def test_gene_module_permutation_null_preserves_module_sizes(fitted_adapter):
+    adapter, ctx = fitted_adapter
+    real_sizes = adapter.modules.membership_mask.sum(dim=1).tolist()
+    result = gene_module_permutation_null(adapter, ctx.val_bags, seed=0)
+    assert result["status"] == "null_record"
+    assert "permuted_gene_mapping_fingerprint" in result
+    scores = result["ablation_scores_under_permuted_module_assignment"]
+    assert set(scores) == set(adapter.modules.module_names)
+
+
+def test_gene_module_permutation_null_is_deterministic_given_seed(fitted_adapter):
+    adapter, ctx = fitted_adapter
+    r1 = gene_module_permutation_null(adapter, ctx.val_bags, seed=3)
+    r2 = gene_module_permutation_null(adapter, ctx.val_bags, seed=3)
+    assert r1["permuted_gene_mapping_fingerprint"] == r2["permuted_gene_mapping_fingerprint"]
+    assert r1["ablation_scores_under_permuted_module_assignment"] == r2["ablation_scores_under_permuted_module_assignment"]
+
+
+def test_gene_module_permutation_null_different_seeds_differ(fitted_adapter):
+    adapter, ctx = fitted_adapter
+    r1 = gene_module_permutation_null(adapter, ctx.val_bags, seed=1)
+    r2 = gene_module_permutation_null(adapter, ctx.val_bags, seed=2)
+    assert r1["permuted_gene_mapping_fingerprint"] != r2["permuted_gene_mapping_fingerprint"]
+
+
+def test_within_gene_expression_permutation_null_returns_sensitivity_diagnostic(fitted_adapter):
+    adapter, ctx = fitted_adapter
+    result = within_gene_expression_permutation_null(adapter, ctx.val_bags, seed=0)
+    assert result["status"] == "null_record"
+    assert result["n_valid_cells_permuted_over"] > 0
+    assert result["mean_abs_target_logit_difference"] >= 0.0
+
+
+def test_within_gene_expression_permutation_null_preserves_gene_marginal_distribution(fitted_adapter):
+    """The permutation must be a reshuffle, not a resample — the exact
+    multiset of values for each gene across valid cells is unchanged."""
+    import torch
+
+    from benchmarks.pathway_hierarchical_adapter import bags_to_pathway_batch
+
+    adapter, ctx = fitted_adapter
+    sample = ctx.val_bags
+    batch = bags_to_pathway_batch(sample)
+    valid = batch["cell_mask"].bool()
+    expression = batch["expression"]
+
+    rng = np.random.RandomState(0)
+    n_genes = expression.shape[-1]
+    valid_idx = valid.nonzero(as_tuple=False)
+    n_valid = valid_idx.shape[0]
+    permuted = expression.clone()
+    for g in range(n_genes):
+        perm = rng.permutation(n_valid)
+        values = expression[valid_idx[:, 0], valid_idx[:, 1], g]
+        permuted[valid_idx[:, 0], valid_idx[:, 1], g] = values[perm]
+
+    for g in range(n_genes):
+        before = sorted(expression[valid_idx[:, 0], valid_idx[:, 1], g].tolist())
+        after = sorted(permuted[valid_idx[:, 0], valid_idx[:, 1], g].tolist())
+        assert before == pytest.approx(after)

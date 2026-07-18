@@ -1833,9 +1833,10 @@ than a parallel one. It additionally binds `gene_list_fingerprint`
 this source), `environment_fingerprint` (`env_versions.py`'s core package
 versions), and, for `pathway_hierarchical_mil`,
 `domain_vocabulary_fingerprint`/`domain_head_fingerprint` — both stamped
-the literal string `"not_applicable"` (never a bare `None`) for a
-non-pathway candidate or a strategy with no domain head, so a report never
-silently omits an identity that only applies conditionally.
+the structured `not_applicable(reason)` value (never a bare string, never
+a bare `None`) for a non-pathway candidate or a strategy with no domain
+head, so a report never silently omits an identity that only applies
+conditionally. See §16.10 for the v2 schema this section now describes.
 
 ### 16.6 Calibration/uncertainty boundary
 
@@ -1910,3 +1911,110 @@ a `seeds` sequence (backward-compatible default: the single `seed`) and
 independent unit — never a cell — reporting mean/median difference,
 win/tie/loss counts, and `insufficient_evidence` below
 `MIN_SOURCE_SEED_PAIRS_FOR_EVIDENCE` common pairs.
+
+### 16.10 Schema v2, source provenance, null controls, and cross-run stability
+
+Following an independent review of the diff underlying §16.1–16.9, the
+report schema and several diagnostics were strengthened further:
+
+- **Schema v2** (`ROBUSTNESS_REPORT_SCHEMA_VERSION = "2.0"`): every report,
+  including every ineligible/not-evaluated branch, now carries all twelve
+  identity fields (see §16.5) plus `seed`, `threshold_policy_fingerprint`
+  (split out from `calibration_fingerprint` — the two halves of
+  `FrozenThresholdPolicy.to_dict()`), and an `evaluated: bool` stamp.
+  `validate_robustness_report` rejects a bare `None` for any identity field,
+  a malformed (non-64-hex-char) hash, an `evaluated=True` report whose
+  model/preprocessing/gene identities are `not_applicable`, a
+  `domain_adversarial` report missing its domain-head/vocabulary identities,
+  or a report with a non-empty `calibration` block but `not_applicable`
+  calibration/threshold identities. `validate_report_fingerprint_unchanged`
+  re-derives `report_fingerprint` from every other field and rejects
+  post-write tampering.
+- **`_environment_fingerprint()`** now calls
+  `collect_core_package_versions(required=True)` and lets a missing core
+  package raise `EnvironmentSnapshotError` (a `RuntimeError` subclass)
+  rather than catching a broad `Exception` and recording `None` — an
+  evaluated report can no longer carry an unknown environment identity.
+- **Verified smoke label contract**: `_verified_smoke_subject_labels` now
+  raises `LabelSchemaError` if `normalized_adata.obs` lacks
+  `smoke_type_known` at all (previously defaulted every cell to
+  "verified"), and separately tracks `unknown_subjects`,
+  `weak_proxy_only_subjects`, and `excluded_by_policy_subjects` (a
+  weak-proxy-only subject is excluded by policy unless
+  `weak_labels_enabled=True`), plus a `weak_label_policy_fingerprint`.
+- **Source provenance**: `_pool_subjects_and_sources` and
+  `domain_losses.validate_source_provenance` (called from
+  `pathway_hierarchical_adapter.py`'s CORAL/MMD/domain-adversarial/
+  source-balanced code paths and from `source_held_out_diagnostics.py`'s
+  `source_predictability_diagnostic` call site) reject a blank or
+  placeholder (`""`, `"unknown"`, `"none"`, `"nan"`, `"null"`, `"n/a"`,
+  `"na"`, case-insensitively) `dataset_source` with
+  `MissingSourceProvenanceError` — a source-aware strategy or diagnostic
+  can no longer silently coerce an unprovenanced subject into a literal
+  `"unknown"` bucket.
+- **Source policy expansion**: `resolve_source_policy`'s returned dict (the
+  SAME dict every caller already fingerprints in full as
+  `source_policy_fingerprint`) now additionally carries `assay_mode`,
+  `label_semantics_version`, `weak_label_status`, `cohort_role`
+  (`synthetic_or_real`), and `exclusion_policy` (`known_limitations`) from
+  the manifest entry when one is declared.
+  `assess_smoke_source_eligibility`/`assess_cancer_source_eligibility`
+  gained `reference_assay_mode`, which rejects an assay-mode mismatch via
+  the (previously unused) `ASSAY_MISMATCH` status — e.g. bulk TCGA data can
+  never enter this single-cell protocol, and `configs/datasets.yaml`
+  already declares TCGA's `assay_type: bulk_rna_seq` distinctly from the
+  single-cell sources' `assay_type: single_cell_rna_seq`.
+- **Domain-shift coverage**: `cancer_domain_shift_report`/
+  `smoke_domain_shift_report` now additionally report
+  `gene_space_compatibility` (self-vs-self by construction — this pipeline
+  unifies every source onto one shared gene space before any per-source
+  split exists, so the field documents that fact rather than reconciling
+  independent raw panels) and `module_coverage` (empty/below-minimum
+  modules) alongside the pre-existing centroid/energy/CORAL/MMD distances
+  and source-predictability diagnostic.
+- **Two additional null controls** in `biological_stability.py`:
+  `gene_module_permutation_null` (the SAME random gene-index permutation
+  applied to every module row of the membership mask — preserves module
+  sizes and the ordered gene universe exactly by construction, destroys the
+  real gene<->module association) and
+  `within_gene_expression_permutation_null` (each gene's expression
+  independently reshuffled across every valid cell in the diagnostic bag
+  set — preserves that gene's own empirical marginal distribution exactly,
+  reads no subject_id or label so it cannot leak subject/held-out-label
+  identity). Both report a mean-absolute-target-logit-difference
+  sensitivity statistic, refactored through a shared
+  `_ablation_scores_with_mask` helper so the null and the real
+  `module_ablation_scores` call share identical forward-pass mechanics.
+- **Cross-run stability**: `cancer_biological_stability_report` gained an
+  `extra_seeds` parameter (threaded from `run_cancer_source_held_out`'s
+  `stability_extra_seeds` and the CLI's `--stability-extra-seeds`, default
+  empty). With no extra seeds, `cross_run_stability` reports
+  `insufficient_evidence` explicitly — never a fabricated "stability" from
+  repeated deterministic calls to the one already-fitted model. With extra
+  seeds, each triggers a GENUINE independent `fit_final_candidate_on_dev_pool`
+  refit on the same development pool at that seed (real, non-permuted
+  labels), and `module_ranking_stability` aggregates the resulting
+  per-run `module_ablation_scores` (Spearman rank correlation, top-k
+  overlap, module selection frequency) across all runs including the
+  primary fit.
+- **Task A multi-class uncertainty**: `PathwayHierarchicalAdapter.
+  predict_smoke_proba` (softmax over `smoke_logits`) and
+  `uncertainty.multiclass_predictive_uncertainty` (entropy, max class
+  probability) feed `source_held_out_diagnostics.smoke_uncertainty_report`,
+  which selects its abstention threshold from the dev-pool-fitted model's
+  own development predictions only (disclosed as in-sample, not
+  out-of-fold, in the report's own `note` field — this protocol does not
+  carry a per-fold OOF probability array through to this point) and reports
+  retained-subset macro-F1 as a secondary statistic; held-out-source labels
+  never influence the threshold.
+- **Terminology audit**: a repository-wide grep for
+  biomarker/mechanistic/causal/"clinical validation"/"biological
+  validation" language found no unguarded claim outside the existing,
+  correct disclaimers. `GeneModuleCollection` still records only
+  `source_name`/`source_version`/a content fingerprint — a full real-module
+  provenance schema (organism, namespace, mapping policy, license,
+  checksum) was NOT added in this pass: no real GMT resource ships with or
+  is referenced by this repository to validate such a schema against, and
+  expanding a core model dataclass without one to test against was judged
+  higher-risk than the benefit for this phase. Every concrete module-based
+  result therefore remains `is_synthetic_modules=True`.

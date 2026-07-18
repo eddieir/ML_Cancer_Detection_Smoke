@@ -255,6 +255,31 @@ def group_embeddings_by_source(
     return out
 
 
+class MissingSourceProvenanceError(ValueError):
+    """A subject fed into a source-aware strategy (anything other than
+    'erm') has a blank, placeholder, or absent dataset_source — never
+    silently mapped to a literal "unknown" bucket, which would let an
+    unprovenanced subject quietly participate in CORAL/MMD/source-balanced
+    sampling/domain-adversarial training."""
+
+
+_PLACEHOLDER_SOURCE_VALUES = frozenset({"", "unknown", "none", "nan", "null", "n/a", "na"})
+
+
+def validate_source_provenance(sources: Sequence[str]) -> None:
+    """Raises MissingSourceProvenanceError if any element of `sources` is
+    blank or a known placeholder value. Called only by strategies other
+    than 'erm' — ERM never reads source at all, so it has nothing to
+    validate."""
+    bad_idx = [i for i, s in enumerate(sources) if str(s).strip().lower() in _PLACEHOLDER_SOURCE_VALUES]
+    if bad_idx:
+        raise MissingSourceProvenanceError(
+            f"{len(bad_idx)} subject(s) passed to a source-aware strategy have a blank or "
+            f"placeholder dataset_source value (indices {bad_idx[:10]}) — a source-aware strategy "
+            "requires a real source identity for every subject."
+        )
+
+
 DOMAIN_STRATEGIES = ("erm", "source_balanced", "coral", "mmd", "domain_adversarial")
 
 DEFAULT_DOMAIN_ROBUSTNESS_CONFIG = {

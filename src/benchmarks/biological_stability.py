@@ -22,9 +22,15 @@ and CI is therefore a synthetic-module software diagnostic, not a
 biological-plausibility finding, and must not be described as one.
 """
 
+import hashlib
+import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+def _sha256_json(payload) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 class RealModuleRequiredError(ValueError):
@@ -47,21 +53,20 @@ def require_real_modules(modules) -> None:
 
 # ─── Module ablation / importance ──────────────────────────────────────────
 
-def module_ablation_scores(adapter, bags: Sequence[dict], target: str = "cancer") -> Dict[str, float]:
-    """
-    Model-weighted contribution of each gene module: for every module, zero
-    that module's genes across every cell in every bag, run the ALREADY
-    -FITTED adapter's forward pass, and record the mean absolute change in
-    the target logit relative to the unablated baseline. Deterministic given
-    a fixed fitted model and fixed input bags — no retraining happens here.
-    This is a sensitivity/contribution diagnostic ("model-weighted
-    contribution"), never described as biological importance.
-    """
+def _ablation_scores_with_mask(
+    adapter, bags: Sequence[dict], module_names: Sequence[str], membership_mask, target: str = "cancer",
+) -> Dict[str, float]:
+    """Shared forward-pass ablation loop — zero each module's genes (per the
+    SUPPLIED membership_mask/module_names, not necessarily adapter.modules'
+    own) and record the mean absolute change in the target logit. Used both
+    by module_ablation_scores (the real mask) and
+    gene_module_permutation_null (a permuted mask) so the two share
+    identical forward-pass mechanics and differ only in which mask is
+    applied."""
     import torch
     from .pathway_hierarchical_adapter import bags_to_pathway_batch
 
     model = adapter.model
-    modules = adapter.modules
     model.eval()
     batch = bags_to_pathway_batch(bags)
     expression = batch["expression"]
@@ -73,8 +78,8 @@ def module_ablation_scores(adapter, bags: Sequence[dict], target: str = "cancer"
         base_logits = base_out.cancer_logits if target == "cancer" else base_out.smoke_logits.argmax(-1).float()
 
     scores = {}
-    for i, module_name in enumerate(modules.module_names):
-        gene_mask = modules.membership_mask[i].bool()
+    for i, module_name in enumerate(module_names):
+        gene_mask = membership_mask[i].bool()
         ablated = expression.clone()
         ablated[..., gene_mask] = 0.0
         with torch.no_grad():
@@ -82,6 +87,106 @@ def module_ablation_scores(adapter, bags: Sequence[dict], target: str = "cancer"
             logits = out.cancer_logits if target == "cancer" else out.smoke_logits.argmax(-1).float()
         scores[module_name] = float((logits - base_logits).abs().mean().item())
     return scores
+
+
+def module_ablation_scores(adapter, bags: Sequence[dict], target: str = "cancer") -> Dict[str, float]:
+    """
+    Model-weighted contribution of each gene module: for every module, zero
+    that module's genes across every cell in every bag, run the ALREADY
+    -FITTED adapter's forward pass, and record the mean absolute change in
+    the target logit relative to the unablated baseline. Deterministic given
+    a fixed fitted model and fixed input bags — no retraining happens here.
+    This is a sensitivity/contribution diagnostic ("model-weighted
+    contribution"), never described as biological importance.
+    """
+    modules = adapter.modules
+    return _ablation_scores_with_mask(adapter, bags, modules.module_names, modules.membership_mask, target=target)
+
+
+def gene_module_permutation_null(adapter, bags: Sequence[dict], target: str = "cancer", seed: int = 0) -> Dict:
+    """
+    Null control (Step 7A): apply the SAME random permutation to every
+    module row's gene-axis (membership_mask columns) — this preserves every
+    module's size exactly (a row's permutation is just a relabeling of
+    which column index counts as "in" the module) and preserves the ordered
+    gene universe (no gene is added, removed, or duplicated), while
+    destroying the real gene<->module association: a gene's ablation
+    membership now follows a different module than the one it actually
+    belongs to. If the model's module-ablation sensitivity (see
+    module_ablation_scores) is a real structural signal rather than an
+    artifact of ablating a fixed FRACTION of genes regardless of which ones,
+    the permuted-null ablation scores should look different — the caller
+    compares the two via spearman_rank_correlation.
+    """
+    modules = adapter.modules
+    rng = np.random.RandomState(seed)
+    n_genes = modules.membership_mask.shape[1]
+    gene_permutation = rng.permutation(n_genes)
+    permuted_mask = modules.membership_mask[:, gene_permutation]
+    scores = _ablation_scores_with_mask(adapter, bags, modules.module_names, permuted_mask, target=target)
+    return {
+        "status": "null_record", "seed": seed,
+        "permuted_gene_mapping_fingerprint": _sha256_json(gene_permutation.tolist()),
+        "ablation_scores_under_permuted_module_assignment": scores,
+        "note": "module sizes and the ordered gene universe are preserved exactly; only which genes "
+                "are grouped into which module has been randomly permuted — a null control for "
+                "module_ablation_scores, not a biological finding.",
+    }
+
+
+def within_gene_expression_permutation_null(adapter, bags: Sequence[dict], target: str = "cancer", seed: int = 0) -> Dict:
+    """
+    Null control (Step 7B): independently, for each gene, shuffle that
+    gene's expression values across every VALID (non-padding) cell in the
+    supplied bag set — preserving each gene's own empirical marginal
+    distribution over these cells EXACTLY (it is a permutation, not a
+    resample), while destroying the real per-cell joint structure across
+    genes (cross-gene correlations, cell-type-conditional co-expression).
+    Operates only on already-supplied bags' own expression values — reads
+    no subject_id, no label, no held-out-source data, so it cannot leak
+    subject or label identity across bags. Reports the mean absolute change
+    in the target logit, the same sensitivity statistic
+    cell_type_label_permutation_check reports for its own (different)
+    perturbation.
+    """
+    import torch
+    from .pathway_hierarchical_adapter import bags_to_pathway_batch
+
+    rng = np.random.RandomState(seed)
+    model = adapter.model
+    model.eval()
+    batch = bags_to_pathway_batch(bags)
+    expression = batch["expression"]
+    cell_type_ids = batch["cell_type_ids"]
+    cell_mask = batch["cell_mask"]
+
+    with torch.no_grad():
+        base_out = model(expression, cell_type_ids, cell_mask)
+        base_logits = base_out.cancer_logits if target == "cancer" else base_out.smoke_logits.argmax(-1).float()
+
+    valid = cell_mask.bool()
+    permuted_expression = expression.clone()
+    n_genes = expression.shape[-1]
+    valid_idx = valid.nonzero(as_tuple=False)  # [n_valid_cells, 2] (bag_idx, cell_idx)
+    n_valid = valid_idx.shape[0]
+    for g in range(n_genes):
+        perm = rng.permutation(n_valid)
+        values = expression[valid_idx[:, 0], valid_idx[:, 1], g]
+        permuted_expression[valid_idx[:, 0], valid_idx[:, 1], g] = values[perm]
+
+    with torch.no_grad():
+        out = model(permuted_expression, cell_type_ids, cell_mask)
+        logits = out.cancer_logits if target == "cancer" else out.smoke_logits.argmax(-1).float()
+    mean_abs_diff = float((logits - base_logits).abs().mean().item())
+    return {
+        "status": "null_record", "seed": seed, "n_valid_cells_permuted_over": int(n_valid),
+        "mean_abs_target_logit_difference": mean_abs_diff,
+        "note": "each gene's expression was independently shuffled across every valid cell in this "
+                "bag set — its own marginal distribution over these cells is preserved exactly; only "
+                "cross-gene per-cell structure is destroyed. No subject_id or label was read, so this "
+                "cannot leak subject or held-out-label identity across bags. A sensitivity diagnostic, "
+                "not a biological claim.",
+    }
 
 
 def matched_size_random_module_scores(

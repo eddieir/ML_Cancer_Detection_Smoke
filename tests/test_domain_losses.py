@@ -15,13 +15,25 @@ from benchmarks.domain_losses import (
     DomainClassifierHead,
     DomainLossConfigurationError,
     DomainVocabularyError,
+    MissingSourceProvenanceError,
     coral_loss,
     domain_adversarial_loss,
     gradient_reversal,
     group_embeddings_by_source,
     mmd_loss,
     resolve_domain_robustness_config,
+    validate_source_provenance,
 )
+
+
+@pytest.mark.parametrize("bad", ["", "unknown", "Unknown", "None", "nan", "  ", "N/A"])
+def test_validate_source_provenance_rejects_placeholder_values(bad):
+    with pytest.raises(MissingSourceProvenanceError):
+        validate_source_provenance(["sourceA", bad, "sourceB"])
+
+
+def test_validate_source_provenance_accepts_real_sources():
+    validate_source_provenance(["sourceA", "sourceB", "sourceA"])
 
 
 def test_coral_identical_distributions_near_zero():

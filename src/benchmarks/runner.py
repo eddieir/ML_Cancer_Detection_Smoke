@@ -164,7 +164,7 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
     all_src = np.concatenate([srctr, srcva, srcte])
     all_ct = rng.randint(0, n_ct, len(all_y))
     obs = pd.DataFrame({
-        "subject_id": all_subj, "smoke_type": all_y, "cell_type_id": all_ct,
+        "subject_id": all_subj, "smoke_type": all_y, "smoke_type_known": True, "cell_type_id": all_ct,
         "malignancy": 0.0, "malignancy_known": False,
         "exposure_dose": -1.0, "source": all_src,
     })
@@ -277,6 +277,7 @@ def run_smoke_task(context, args, run_dir) -> dict:
             incompatible_sources=bench_cfg.get("incompatible_sources"),
             species_by_source=bench_cfg.get("species_by_source"),
             reference_species=bench_cfg.get("reference_species"),
+            reference_assay_mode=bench_cfg.get("reference_assay_mode"),
         )
         if getattr(args, "domain_robustness_ablation", False):
             domain_robustness_report = run_domain_robustness_ablation(
@@ -483,6 +484,7 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             incompatible_sources=bench_cfg.get("incompatible_sources"),
             species_by_source=bench_cfg.get("species_by_source"),
             reference_species=bench_cfg.get("reference_species"),
+            reference_assay_mode=bench_cfg.get("reference_assay_mode"),
         )
         if getattr(args, "domain_robustness_ablation", False):
             domain_robustness_report = run_domain_robustness_ablation(
@@ -492,7 +494,8 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             domain_cfg = _domain_robustness_config_from_args(context, args)
             per_source = run_cancer_source_held_out(
                 context, args.models, device=args.device, domain_robustness_config=domain_cfg,
-                seed=args.seeds[0], **loso_kwargs,
+                seed=args.seeds[0], stability_extra_seeds=getattr(args, "stability_extra_seeds", None) or (),
+                **loso_kwargs,
             )
             domain_robustness_report = build_aggregate_report(
                 "cancer_prediction", args.models[0], domain_cfg["strategy"],
@@ -795,6 +798,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--gradient-reversal-lambda", type=float, default=None)
     parser.add_argument("--robustness-report", type=str, default=None,
                          help="Path to write the aggregate cross-source robustness report JSON.")
+    parser.add_argument("--stability-extra-seeds", nargs="+", type=int, default=None,
+                         help="Extra seeds for GENUINE independent pathway_hierarchical_mil refits "
+                              "used to compute biological_stability.cross_run_stability. Left empty "
+                              "by default — each extra seed is a full extra model fit — in which case "
+                              "cross_run_stability reports insufficient_evidence.")
     args = parser.parse_args(argv)
     _validate_domain_robustness_cli_flags(args)
 

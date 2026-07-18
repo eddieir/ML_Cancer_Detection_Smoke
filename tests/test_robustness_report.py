@@ -14,17 +14,25 @@ from benchmarks.robustness_report import (
     aggregate_source_reports,
     build_aggregate_report,
     build_robustness_report,
+    is_not_applicable,
+    not_applicable,
+    validate_report_fingerprint_unchanged,
     validate_robustness_report,
     write_robustness_report,
 )
 
+_HASH_A = "a" * 64
+_HASH_B = "b" * 64
 
-def _report(source, auroc):
-    return build_robustness_report(
+
+def _report(source, auroc, **overrides):
+    kwargs = dict(
         task="cancer_prediction", model="pathway_hierarchical_mil", strategy="erm",
         held_out_source=source, eligibility={"status": "eligible"}, development_sources=["x", "y"],
-        metrics={"auroc": auroc} if auroc is not None else {},
-    ).to_dict()
+        metrics={"auroc": auroc} if auroc is not None else {}, seed=1,
+    )
+    kwargs.update(overrides)
+    return build_robustness_report(**kwargs).to_dict()
 
 
 def test_schema_has_required_stamps():
@@ -60,7 +68,7 @@ def test_report_fingerprint_deterministic_round_trip():
     with tempfile.TemporaryDirectory() as tmp:
         report = build_robustness_report(
             task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
-            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5},
+            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5}, seed=7,
         )
         path = Path(tmp) / "r.json"
         fp1 = write_robustness_report(path, report)
@@ -68,6 +76,109 @@ def test_report_fingerprint_deterministic_round_trip():
         reloaded = json.loads(path.read_text())
         assert reloaded["report_fingerprint"] == fp1 or True  # fp1 is the file's own sha256, not the report fingerprint
         assert reloaded["development_only"] is True
+
+
+def test_schema_version_bumped_to_v2():
+    d = _report("sourceA", 0.8)
+    assert d["schema_version"] == "2.0"
+
+
+def test_identity_fields_default_to_structured_not_applicable_not_bare_none():
+    d = _report("sourceA", 0.8)
+    for f in ("dataset_manifest_fingerprint", "source_policy_fingerprint", "module_fingerprint",
+              "domain_head_fingerprint", "domain_vocabulary_fingerprint", "calibration_fingerprint",
+              "threshold_policy_fingerprint", "environment_fingerprint"):
+        assert d[f] is not None
+        assert is_not_applicable(d[f])
+    validate_robustness_report(d)
+
+
+def test_schema_rejects_bare_none_identity():
+    d = _report("sourceA", 0.8)
+    d["module_fingerprint"] = None
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_schema_rejects_malformed_hash():
+    d = _report("sourceA", 0.8, module_fingerprint="not-a-real-hash")
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_schema_rejects_missing_seed():
+    d = _report("sourceA", 0.8)
+    d["seed"] = None
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_report_missing_model_identity_rejected():
+    d = _report("sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A,
+                gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A)
+    # model_fingerprint left as the default not_applicable — an evaluated
+    # neural/classical report must record a real model identity.
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_report_with_all_required_identities_passes():
+    d = _report("sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+                module_fingerprint=_HASH_A, model_fingerprint=_HASH_B)
+    validate_robustness_report(d)
+
+
+def test_adversarial_report_missing_domain_head_identity_rejected():
+    d = _report(
+        "sourceA", 0.8, strategy="domain_adversarial", evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B,
+    )
+    # domain_head_fingerprint/domain_vocabulary_fingerprint left as the
+    # default not_applicable — a domain_adversarial report must record both.
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_calibrated_report_missing_calibration_identity_rejected():
+    d = _report(
+        "sourceA", 0.8, evaluated=True, calibration={"threshold": 0.5},
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B,
+    )
+    # calibration_fingerprint/threshold_policy_fingerprint left as the
+    # default not_applicable while a calibration block is present.
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_not_applicable_requires_a_reason():
+    d = _report("sourceA", 0.8)
+    d["module_fingerprint"] = {"status": "not_applicable"}
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_not_applicable_helper_round_trips():
+    na = not_applicable("no gene-module structure")
+    assert is_not_applicable(na)
+    assert na["reason"] == "no gene-module structure"
+
+
+def test_corrupted_report_fingerprint_detected():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = build_robustness_report(
+            task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
+            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5}, seed=7,
+        )
+        path = Path(tmp) / "r.json"
+        write_robustness_report(path, report)
+        import json
+        d = json.loads(path.read_text())
+        validate_report_fingerprint_unchanged(d)  # unmodified — passes
+        d["metrics"]["macro_f1"] = 0.99  # tamper with a field after the fact
+        with pytest.raises(RobustnessReportValidationError):
+            validate_report_fingerprint_unchanged(d)
 
 
 def test_aggregate_worst_source_is_visible_not_hidden_in_pooled_average():

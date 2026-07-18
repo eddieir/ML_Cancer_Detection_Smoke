@@ -43,6 +43,7 @@ def run_domain_robustness_ablation(
     incompatible_sources: Optional[Sequence[str]] = None,
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
+    reference_assay_mode: Optional[str] = None,
 ) -> Dict:
     """
     Runs the SAME source-held-out protocol once per domain-robustness
@@ -70,7 +71,7 @@ def run_domain_robustness_ablation(
                 per_source = run_cancer_source_held_out(
                     context, model_names, device=device, domain_robustness_config=cfg, seed=s,
                     incompatible_sources=incompatible_sources, species_by_source=species_by_source,
-                    reference_species=reference_species,
+                    reference_species=reference_species, reference_assay_mode=reference_assay_mode,
                 )
             else:
                 # Task A's source-held-out protocol (source_held_out.py)
@@ -88,7 +89,7 @@ def run_domain_robustness_ablation(
                 per_source = run_smoke_source_held_out(
                     context, model_names, device=device, seed=s,
                     incompatible_sources=incompatible_sources, species_by_source=species_by_source,
-                    reference_species=reference_species,
+                    reference_species=reference_species, reference_assay_mode=reference_assay_mode,
                 )
             reports_list = list(per_source.values())
             agg = aggregate_source_reports(reports_list, primary_metric)

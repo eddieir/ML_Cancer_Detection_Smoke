@@ -59,12 +59,13 @@ from .hyperparameter_search import build_param_grid, select_nested_hyperparamete
 from .metrics import full_smoke_metrics_report
 from .mil_registry import build_mil_adapter, pathway_search_space
 from .pathway_hierarchical_adapter import MODEL_NAME as PATHWAY_MODEL_NAME
-from .robustness_report import build_robustness_report
+from .robustness_report import build_robustness_report, not_applicable
 from .source_held_out_diagnostics import (
     cancer_biological_stability_report,
     cancer_domain_shift_report,
     cancer_uncertainty_report,
     smoke_domain_shift_report,
+    smoke_uncertainty_report,
 )
 from .source_eligibility import (
     assess_cancer_source_eligibility,
@@ -85,8 +86,16 @@ class ConflictingSmokeLabelError(ValueError):
     conflict)."""
 
 
+class LabelSchemaError(ValueError):
+    """Raised when normalized_adata.obs is missing the smoke_type_known
+    column this protocol depends on — the absence of a verified-label gate
+    must never be silently treated as "every label is verified"; see
+    data/label_state.py's known/unknown vocabulary, which this function
+    reads rather than reimplements."""
+
+
 def _verified_smoke_subject_labels(
-    normalized_adata, subjects: Sequence[str],
+    normalized_adata, subjects: Sequence[str], weak_labels_enabled: bool = False,
 ) -> Tuple[Dict[str, int], Dict]:
     """
     Subject -> smoke_type label, restricted to subjects whose smoke_type_known
@@ -95,26 +104,41 @@ def _verified_smoke_subject_labels(
     reported as unknown and excluded from the returned mapping rather than
     silently defaulting to whatever the majority raw smoke_type happens to be
     — see data/label_state.py and data/labellers.py's smoke_type_known gate,
-    which this function reads rather than reimplements.
+    which this function reads rather than reimplements. Raises
+    LabelSchemaError if smoke_type_known is absent — never defaults to
+    "every label is verified".
     """
     obs = normalized_adata.obs
+    if "smoke_type_known" not in obs.columns:
+        raise LabelSchemaError(
+            "normalized_adata.obs has no 'smoke_type_known' column — this protocol requires an "
+            "explicit verified-label gate and never assumes every smoke_type value is verified."
+        )
     subj_series = obs["subject_id"].astype(str)
     smoke_series = obs["smoke_type"].astype(int)
-    known_arr = (
-        obs["smoke_type_known"].astype(bool).values
-        if "smoke_type_known" in obs.columns
-        else np.ones(len(obs), dtype=bool)
+    known_arr = obs["smoke_type_known"].astype(bool).values
+    weak_proxy_arr = (
+        obs["weak_smoke_proxy_known"].astype(bool).values
+        if "weak_smoke_proxy_known" in obs.columns
+        else np.zeros(len(obs), dtype=bool)
     )
 
     label_by_subject: Dict[str, int] = {}
-    n_unknown = 0
+    unknown_subjects: List[str] = []
+    weak_proxy_only_subjects: List[str] = []
+    excluded_by_policy_subjects: List[str] = []
     conflicts: Dict[str, List[int]] = {}
     for sid in subjects:
         sid = str(sid)
         subj_mask = (subj_series == sid).values
         verified_mask = subj_mask & known_arr
         if not verified_mask.any():
-            n_unknown += 1
+            if (subj_mask & weak_proxy_arr).any():
+                weak_proxy_only_subjects.append(sid)
+                if not weak_labels_enabled:
+                    excluded_by_policy_subjects.append(sid)
+            else:
+                unknown_subjects.append(sid)
             continue
         vals = sorted(set(smoke_series.values[verified_mask].tolist()))
         if len(vals) > 1:
@@ -135,10 +159,16 @@ def _verified_smoke_subject_labels(
 
     diagnostics = {
         "total_subjects": len(subjects),
+        "verified_subjects": sorted(label_by_subject),
+        "unknown_subjects": sorted(unknown_subjects),
+        "weak_proxy_only_subjects": sorted(weak_proxy_only_subjects),
+        "excluded_by_policy_subjects": sorted(excluded_by_policy_subjects),
         "verified_labels": len(label_by_subject),
-        "unknown_labels": n_unknown,
+        "unknown_labels": len(unknown_subjects),
         "conflicting_labels": len(conflicts),
-        "class_distribution": class_distribution,
+        "verified_class_distribution": class_distribution,
+        "weak_labels_enabled": weak_labels_enabled,
+        "weak_label_policy_fingerprint": _sha256_json({"weak_labels_enabled": weak_labels_enabled}),
     }
     return label_by_subject, diagnostics
 
@@ -150,8 +180,34 @@ class CrossSourceSubjectConflictError(ValueError):
     check for the pre-existing Task A LOSO path)."""
 
 
+class MissingSourceProvenanceError(ValueError):
+    """A subject's dataset_source is blank, a placeholder value, or absent
+    entirely — a source-aware protocol must reject this outright rather than
+    silently mapping it to a literal "unknown" bucket, which would let an
+    unprovenanced subject quietly participate in source-held-out selection,
+    CORAL/MMD, source-balanced sampling, or domain-adversarial training."""
+
+
+_PLACEHOLDER_SOURCE_VALUES = frozenset({"", "unknown", "none", "nan", "null", "n/a", "na"})
+
+
+def _reject_placeholder_sources(by_subject: Dict[str, str]) -> None:
+    bad = {sid: src for sid, src in by_subject.items() if src.strip().lower() in _PLACEHOLDER_SOURCE_VALUES}
+    if bad:
+        raise MissingSourceProvenanceError(
+            f"{len(bad)} subject(s) have a blank or placeholder dataset_source value (e.g. "
+            f"{dict(list(bad.items())[:5])}) — a source-aware protocol requires a real source "
+            "identity for every subject, never a placeholder silently treated as a source."
+        )
+
+
 def _pool_subjects_and_sources(context) -> Dict[str, str]:
     normalized_adata = require_normalized_adata(context)
+    if "source" not in normalized_adata.obs.columns:
+        raise MissingSourceProvenanceError(
+            "normalized_adata.obs has no 'source' column — a source-aware protocol cannot run "
+            "without per-cell dataset-source provenance."
+        )
     pool_subjects = sorted(set(context.subjects_for("train")) | set(context.subjects_for("val")))
     obs = normalized_adata.obs
     subj_series = obs["subject_id"].astype(str)
@@ -168,7 +224,9 @@ def _pool_subjects_and_sources(context) -> Dict[str, str]:
             f"{len(conflicts)} subject(s) assigned to more than one dataset_source in the "
             f"train+val pool — e.g. {dict(list(conflicts.items())[:3])}."
         )
-    return {sid: next(iter(srcs)) for sid, srcs in by_subject.items()}
+    resolved = {sid: next(iter(srcs)) for sid, srcs in by_subject.items()}
+    _reject_placeholder_sources(resolved)
+    return resolved
 
 
 # ─── Task B: cancer prediction ─────────────────────────────────────────────
@@ -192,12 +250,21 @@ def _domain_head_fingerprint(adapter) -> Optional[str]:
     return __import__("hashlib").sha256(blob + vocab_blob).hexdigest()
 
 
-def _environment_fingerprint() -> Optional[str]:
+class EnvironmentSnapshotError(RuntimeError):
+    """Raised when the running environment's core package versions cannot be
+    collected in full — an evaluated report must never silently record an
+    unknown/None environment identity."""
+
+
+def _environment_fingerprint() -> str:
+    from .env_versions import collect_core_package_versions
     try:
-        from .env_versions import collect_core_package_versions
-        return _sha256_json(collect_core_package_versions(required=False))
-    except Exception:  # pragma: no cover — never let an environment probe abort a report
-        return None
+        versions = collect_core_package_versions(required=True)
+    except RuntimeError as e:
+        raise EnvironmentSnapshotError(
+            f"cannot build a validated environment fingerprint: {e}"
+        ) from e
+    return _sha256_json(versions)
 
 
 def run_cancer_source_held_out(
@@ -207,8 +274,10 @@ def run_cancer_source_held_out(
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
+    reference_assay_mode: Optional[str] = None,
     seed: int = 42, n_oof_folds: int = DEFAULT_OOF_FOLDS,
     dataset_manifest_entries: Optional[Sequence[DatasetManifestEntry]] = None,
+    stability_extra_seeds: Sequence[int] = (),
 ) -> Dict:
     """
     For every source present in the train+val pool: assess eligibility,
@@ -223,6 +292,13 @@ def run_cancer_source_held_out(
     supplied species_by_source/controlled_access_sources for any source it
     declares, and raises SourcePolicyDriftError if the caller-supplied value
     contradicts it (see source_eligibility.py::resolve_source_policy).
+
+    stability_extra_seeds, if supplied, opts every pathway_hierarchical_mil
+    candidate's biological_stability.cross_run_stability field into GENUINE
+    independent multi-seed refits (see cancer_biological_stability_report) —
+    left empty (the default) because each extra seed is a full extra model
+    fit; cross_run_stability reports insufficient_evidence rather than a
+    fabricated single-run "stability" when left empty.
     """
     domain_cfg = resolve_domain_robustness_config(domain_robustness_config)
     subject_to_source = _pool_subjects_and_sources(context)
@@ -251,6 +327,7 @@ def run_cancer_source_held_out(
         elig = assess_cancer_source_eligibility(
             held_out_source, held_out_outcomes, incompatible_sources=incompatible_sources,
             species_by_source=species_by_source, reference_species=reference_species,
+            reference_assay_mode=reference_assay_mode,
             controlled_access_sources=controlled_access_sources, manifest_by_source=manifest_by_source,
         )
         source_policy_fp = _sha256_json(resolve_source_policy(
@@ -395,28 +472,39 @@ def run_cancer_source_held_out(
 
         y_held_out = np.array([outcomes_by_subject[s] for s in held_out_order])
         metrics_result = policy.apply_to_test(y_held_out, held_out_proba_raw)
-        calibration_fp = _sha256_json(metrics_result.get("policy", {}))
+        policy_dict = metrics_result.get("policy", {})
+        calibration_fp = _sha256_json(policy_dict.get("calibration", {}))
+        threshold_policy_fp = _sha256_json({
+            "threshold": policy_dict.get("threshold"), "threshold_strategy": policy_dict.get("threshold_strategy"),
+            "threshold_reason": policy_dict.get("threshold_reason"),
+        })
 
         dev_ds_for_diag = build_fold_cell_dataset(normalized_adata, fitted.preprocessing_artifact, dev_subjects)
         dev_bags_for_diag = bags_from_fold_cell_dataset(dev_ds_for_diag, outcomes_by_subject, min_cells)
+        module_info = None
+        if fitted.kind == "mil" and best_name == PATHWAY_MODEL_NAME:
+            module_info = fitted.predictor.modules
         domain_shift = cancer_domain_shift_report(
             dev_bags_for_diag, held_out_bags, num_cell_types, subject_to_source, seed=seed,
+            required_gene_list=list(fitted.preprocessing_artifact.gene_list), modules=module_info,
         )
         uncertainty = cancer_uncertainty_report(
             y_oof, prob_oof, y_held_out, held_out_proba_raw, fitted=fitted, held_out_bags=held_out_bags,
         )
         biological_stability = cancer_biological_stability_report(
             context, fitted, dev_bags_for_diag, held_out_bags, outcomes_by_subject, num_cell_types, min_cells,
-            seed=seed,
+            seed=seed, extra_seeds=stability_extra_seeds,
         )
 
         gene_list_fp = _sha256_json(list(fitted.preprocessing_artifact.gene_list))
         if fitted.kind == "mil" and best_name == PATHWAY_MODEL_NAME:
             domain_vocab_fp = _sha256_json(sorted(fitted.model_metadata.get("domain_source_vocabulary") or []))
             domain_head_fp = _domain_head_fingerprint(fitted.predictor)
+            if domain_head_fp is None:
+                domain_head_fp = not_applicable("this candidate was not built with strategy='domain_adversarial'")
         else:
-            domain_vocab_fp = "not_applicable"
-            domain_head_fp = "not_applicable"
+            domain_vocab_fp = not_applicable(f"{best_name} has no domain-source vocabulary")
+            domain_head_fp = not_applicable(f"{best_name} has no domain-adversarial head")
 
         manifest = build_source_held_out_manifest(
             task="cancer_prediction", held_out_source=held_out_source, development_sources=dev_sources,
@@ -428,6 +516,10 @@ def run_cancer_source_held_out(
             dataset_manifest_fingerprint=dataset_manifest_fp,
         )
 
+        module_fp = fitted.model_metadata.get("module_fingerprint")
+        if module_fp is None:
+            module_fp = not_applicable(f"{best_name} has no gene-module structure")
+
         reports[held_out_source] = build_robustness_report(
             task="cancer_prediction", model=best_name, strategy=domain_cfg["strategy"],
             held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
@@ -437,12 +529,13 @@ def run_cancer_source_held_out(
             comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
             source_split_manifest_fingerprint=manifest.fingerprint(),
             preprocessing_fingerprint=fitted.preprocessing_artifact_fingerprint,
-            module_fingerprint=fitted.model_metadata.get("module_fingerprint"),
+            module_fingerprint=module_fp,
             model_fingerprint=fitted.model_state_fingerprint,
-            calibration_fingerprint=calibration_fp, dataset_manifest_fingerprint=dataset_manifest_fp,
+            calibration_fingerprint=calibration_fp, threshold_policy_fingerprint=threshold_policy_fp,
+            dataset_manifest_fingerprint=dataset_manifest_fp,
             source_policy_fingerprint=source_policy_fp, environment_fingerprint=environment_fp,
             gene_list_fingerprint=gene_list_fp, domain_vocabulary_fingerprint=domain_vocab_fp,
-            domain_head_fingerprint=domain_head_fp, seed=seed,
+            domain_head_fingerprint=domain_head_fp, seed=seed, evaluated=True,
         ).to_dict()
 
     return reports
@@ -557,6 +650,7 @@ def run_smoke_source_held_out(
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
+    reference_assay_mode: Optional[str] = None,
     seed: int = 42, n_dev_cv_folds: int = DEFAULT_SMOKE_DEV_CV_FOLDS, n_inner_folds: int = DEFAULT_INNER_FOLDS,
     dataset_manifest_entries: Optional[Sequence[DatasetManifestEntry]] = None,
 ) -> Dict:
@@ -619,13 +713,14 @@ def run_smoke_source_held_out(
     for held_out_source in sources:
         held_out_subjects = sorted(s for s, src in subject_to_source.items() if src == held_out_source)
         held_out_label_by_subject, held_out_label_diagnostics = _verified_smoke_subject_labels(
-            normalized_adata, held_out_subjects,
+            normalized_adata, held_out_subjects, weak_labels_enabled=weak_labels_enabled,
         )
         held_out_labels = list(held_out_label_by_subject.values())
 
         elig = assess_smoke_source_eligibility(
             held_out_source, held_out_labels, incompatible_sources=incompatible_sources,
             species_by_source=species_by_source, reference_species=reference_species,
+            reference_assay_mode=reference_assay_mode,
             controlled_access_sources=controlled_access_sources, manifest_by_source=manifest_by_source,
         )
         source_policy_fp = _sha256_json(resolve_source_policy(
@@ -646,7 +741,7 @@ def run_smoke_source_held_out(
             continue
 
         dev_label_by_subject, dev_label_diagnostics = _verified_smoke_subject_labels(
-            normalized_adata, dev_subjects,
+            normalized_adata, dev_subjects, weak_labels_enabled=weak_labels_enabled,
         )
 
         candidate_scores: Dict[str, Dict] = {}
@@ -668,6 +763,8 @@ def run_smoke_source_held_out(
                 comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
                 label_state={"development": dev_label_diagnostics, "held_out": held_out_label_diagnostics,
                              "weak_labels_enabled": weak_labels_enabled},
+                dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                environment_fingerprint=environment_fp, seed=seed,
             ).to_dict()
             continue
 
@@ -699,6 +796,8 @@ def run_smoke_source_held_out(
                 limitations=[f"held-out source's genes could not be transformed with the "
                              f"development-only artifact: {e}"],
                 comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                environment_fingerprint=environment_fp, seed=seed,
             ).to_dict()
             continue
 
@@ -716,12 +815,16 @@ def run_smoke_source_held_out(
                     eligibility=elig.to_dict(), development_sources=dev_sources,
                     limitations=["no held-out subject had a verified smoke label"],
                     comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                    dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                    environment_fingerprint=environment_fp, seed=seed,
                 ).to_dict()
                 continue
             preds = model.predict(Xte_full[te_mask])
             yte = np.array([held_out_label_by_subject[s] for s, keep in zip(subj_te, te_mask) if keep])
             report = full_smoke_metrics_report(yte, preds, num_classes)
             model_state_fp = model.model_state_fingerprint()
+            dev_proba, held_out_proba = model.predict_proba(Xdev), model.predict_proba(Xte_full[te_mask])
+            dev_labels_for_uncertainty, held_out_labels_for_uncertainty = ydev, yte
         else:
             dev_bags = bags_from_fold_cell_dataset(dev_ds, {}, min_cells_per_subject=1)
             held_out_bags = bags_from_fold_cell_dataset(held_out_ds, {}, min_cells_per_subject=1)
@@ -731,6 +834,8 @@ def run_smoke_source_held_out(
                     eligibility=elig.to_dict(), development_sources=dev_sources,
                     limitations=["no subject met min_cells_per_subject for smoke bags"],
                     comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                    dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                    environment_fingerprint=environment_fp, seed=seed,
                 ).to_dict()
                 continue
             dev_sd = SubjectLevelDataset(dev_bags, require_known_outcome=False)
@@ -746,15 +851,34 @@ def run_smoke_source_held_out(
                     eligibility=elig.to_dict(), development_sources=dev_sources,
                     limitations=["no held-out subject had a verified smoke label"],
                     comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
+                    dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
+                    environment_fingerprint=environment_fp, seed=seed,
                 ).to_dict()
                 continue
             report = full_smoke_metrics_report(labels[known], preds[known], num_classes)
             model_state_fp = adapter.model_state_fingerprint()
+            dev_labels_raw, dev_known = adapter.known_smoke_labels(dev_sd)
+            dev_proba_full = adapter.predict_smoke_proba(dev_sd)
+            held_out_proba_full = adapter.predict_smoke_proba(held_out_sd)
+            dev_proba, held_out_proba = dev_proba_full[dev_known], held_out_proba_full[known]
+            dev_labels_for_uncertainty, held_out_labels_for_uncertainty = dev_labels_raw[dev_known], labels[known]
 
+        module_info = None
+        if best_name == PATHWAY_MODEL_NAME:
+            module_info = adapter.modules
         domain_shift = smoke_domain_shift_report(
             dev_ds, held_out_ds, num_cell_types, num_classes, subject_to_source, seed=seed,
+            required_gene_list=list(final_artifact.gene_list), modules=module_info,
         )
         gene_list_fp = _sha256_json(list(final_artifact.gene_list))
+        if best_name == PATHWAY_MODEL_NAME:
+            module_fp = adapter.modules.fingerprint()
+        else:
+            module_fp = not_applicable(f"{best_name} has no gene-module structure")
+
+        smoke_uncertainty = smoke_uncertainty_report(
+            dev_proba, dev_labels_for_uncertainty, held_out_proba, held_out_labels_for_uncertainty, num_classes,
+        )
 
         manifest = build_source_held_out_manifest(
             task="smoke_classification", held_out_source=held_out_source, development_sources=dev_sources,
@@ -769,15 +893,17 @@ def run_smoke_source_held_out(
             metrics={"macro_f1": report["macro_f1"], "weighted_f1": report["weighted_f1"],
                      "balanced_accuracy": report.get("balanced_accuracy"), "per_class": report.get("per_class"),
                      "classes_absent_from_held_out_source": report["classes_absent_from_targets"]},
-            domain_shift=domain_shift,
+            domain_shift=domain_shift, uncertainty=smoke_uncertainty,
             comparisons=[{"name": n, **s} for n, s in candidate_scores.items()],
             source_split_manifest_fingerprint=manifest.fingerprint(),
             preprocessing_fingerprint=artifact_fingerprint(final_artifact),
+            module_fingerprint=module_fp,
             model_fingerprint=model_state_fp,
             label_state={"development": dev_label_diagnostics, "held_out": held_out_label_diagnostics,
                          "weak_labels_enabled": weak_labels_enabled},
             dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
             environment_fingerprint=environment_fp, gene_list_fingerprint=gene_list_fp, seed=seed,
+            evaluated=True,
         ).to_dict()
 
     return reports

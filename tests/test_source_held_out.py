@@ -17,6 +17,7 @@ from benchmarks.runner import build_synthetic_context
 from benchmarks.source_held_out import (
     ConflictingSmokeLabelError,
     CrossSourceSubjectConflictError,
+    LabelSchemaError,
     UnsupportedSmokeCandidateError,
     UnsupportedSmokeDomainStrategyError,
     run_cancer_source_held_out,
@@ -150,6 +151,40 @@ def test_smoke_unknown_cells_excluded_from_verified_label():
     reports = run_smoke_source_held_out(ctx5, ["majority"], device="cpu", **_BENCH_CFG)
     dev_diag = reports["sourceB"]["label_state"]["development"]
     assert dev_diag["unknown_labels"] >= 1
+    assert "train_0" in dev_diag["unknown_subjects"]
+    assert "train_0" not in dev_diag["verified_subjects"]
+    assert "weak_label_policy_fingerprint" in dev_diag
+    assert dev_diag["weak_labels_enabled"] is False
+
+
+def test_smoke_missing_smoke_type_known_column_rejected():
+    """normalized_adata.obs missing smoke_type_known entirely must raise a
+    typed schema error, never silently assume every label is verified."""
+    ctx6 = build_synthetic_context(seed=6, fast=True)
+    normalized_adata = ctx6.normalized_adata_for_refit
+    obs = normalized_adata.obs.drop(columns=["smoke_type_known"])
+    normalized_adata.obs = obs
+    with pytest.raises(LabelSchemaError):
+        run_smoke_source_held_out(ctx6, ["majority"], device="cpu", **_BENCH_CFG)
+
+
+def test_smoke_weak_proxy_only_subject_excluded_by_default_policy():
+    """A subject whose only cells are weak-proxy (not smoke_type_known) is
+    reported separately from a plain-unknown subject, and is excluded from
+    the verified pool by default (weak_labels_enabled=False)."""
+    ctx7 = build_synthetic_context(seed=7, fast=True)
+    normalized_adata = ctx7.normalized_adata_for_refit
+    obs = normalized_adata.obs.copy()
+    train0_mask = (obs["subject_id"] == "train_0").values
+    obs["weak_smoke_proxy_known"] = False
+    obs.loc[train0_mask, "smoke_type_known"] = False
+    obs.loc[train0_mask, "weak_smoke_proxy_known"] = True
+    normalized_adata.obs = obs
+    reports = run_smoke_source_held_out(ctx7, ["majority"], device="cpu", **_BENCH_CFG)
+    dev_diag = reports["sourceB"]["label_state"]["development"]
+    assert "train_0" in dev_diag["weak_proxy_only_subjects"]
+    assert "train_0" in dev_diag["excluded_by_policy_subjects"]
+    assert "train_0" not in dev_diag["verified_subjects"]
 
 
 def test_smoke_unsupported_candidate_rejected(ctx):

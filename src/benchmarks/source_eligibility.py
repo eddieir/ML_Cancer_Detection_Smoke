@@ -101,6 +101,8 @@ def resolve_source_policy(
         return {
             "species": species_by_source.get(source), "controlled_access": source in controlled_access_sources,
             "source_of_truth": "caller_supplied",
+            "assay_mode": None, "label_semantics_version": None, "weak_label_status": None,
+            "cohort_role": None, "exclusion_policy": None,
         }
 
     manifest_species = entry.species
@@ -115,7 +117,18 @@ def resolve_source_policy(
             f"source {source!r}: caller listed this source as controlled_access_sources, but the "
             f"dataset manifest declares controlled_access={manifest_controlled!r} for it."
         )
-    return {"species": manifest_species, "controlled_access": manifest_controlled, "source_of_truth": "dataset_manifest"}
+    return {
+        "species": manifest_species, "controlled_access": manifest_controlled, "source_of_truth": "dataset_manifest",
+        # Additional canonical-manifest-sourced policy facts folded into the
+        # SAME resolved-policy dict every caller already fingerprints in
+        # full (source_policy_fingerprint = sha256(resolve_source_policy(...)))
+        # — expanding this dict is what expands what that fingerprint binds.
+        "assay_mode": entry.assay_type,
+        "label_semantics_version": entry.label_policy_version,
+        "weak_label_status": "weak_proxy_fields_declared" if entry.malignancy_metadata_fields else "no_weak_proxy_fields_declared",
+        "cohort_role": entry.synthetic_or_real,
+        "exclusion_policy": list(entry.known_limitations),
+    }
 
 
 def assess_smoke_source_eligibility(
@@ -126,12 +139,16 @@ def assess_smoke_source_eligibility(
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
     manifest_by_source: Optional[Dict[str, object]] = None,
+    reference_assay_mode: Optional[str] = None,
 ) -> SourceEligibilityReport:
     """
     held_out_subject_labels: effective smoke-type label per subject in this
     source (already restricted to subjects with a VERIFIED, non-weak-proxy
     label by the caller — see data/sampling.py's own known_mask exclusion
-    for the same rule applied to training).
+    for the same rule applied to training). reference_assay_mode, when
+    supplied, rejects a source whose manifest-declared assay_type disagrees
+    (e.g. bulk TCGA data can never enter a single-cell protocol) — a source
+    absent from the manifest (assay_mode=None) is never assumed compatible.
     """
     incompatible_sources = set(incompatible_sources or [])
     counts = {"n_subjects": len(held_out_subject_labels),
@@ -144,6 +161,10 @@ def assess_smoke_source_eligibility(
     if source in (incompatible_sources or set()):
         return _not_eligible(source, "smoke_classification", EXCLUDED_BY_POLICY,
                               "explicitly listed as label-semantics incompatible", counts)
+    if reference_assay_mode is not None and policy["assay_mode"] != reference_assay_mode:
+        return _not_eligible(source, "smoke_classification", ASSAY_MISMATCH,
+                              f"assay_mode {policy['assay_mode']!r} != reference {reference_assay_mode!r} — "
+                              "e.g. bulk assay data can never enter a single-cell protocol", counts)
     if policy["species"] is None:
         return _not_eligible(source, "smoke_classification", SPECIES_MISMATCH,
                               "no species metadata declared for this source — unknown metadata "
@@ -172,10 +193,13 @@ def assess_cancer_source_eligibility(
     reference_species: Optional[str] = None,
     controlled_access_sources: Optional[Sequence[str]] = None,
     manifest_by_source: Optional[Dict[str, object]] = None,
+    reference_assay_mode: Optional[str] = None,
 ) -> SourceEligibilityReport:
     """held_out_outcomes: one entry per subject in this source; None means
     unknown outcome (never coerced to 0/negative — excluded from counts, not
-    from the subject list)."""
+    from the subject list). reference_assay_mode, when supplied, rejects a
+    source whose manifest-declared assay_type disagrees (e.g. bulk TCGA data
+    can never enter this single-cell MIL protocol)."""
     incompatible_sources = set(incompatible_sources or [])
     known = [o for o in held_out_outcomes if o is not None]
     n_pos = sum(1 for o in known if int(o) == 1)
@@ -190,6 +214,10 @@ def assess_cancer_source_eligibility(
     if source in incompatible_sources:
         return _not_eligible(source, "cancer_prediction", EXCLUDED_BY_POLICY,
                               "explicitly listed as label-semantics incompatible", counts)
+    if reference_assay_mode is not None and policy["assay_mode"] != reference_assay_mode:
+        return _not_eligible(source, "cancer_prediction", ASSAY_MISMATCH,
+                              f"assay_mode {policy['assay_mode']!r} != reference {reference_assay_mode!r} — "
+                              "e.g. bulk assay data can never enter a single-cell protocol", counts)
     if policy["species"] is None:
         return _not_eligible(source, "cancer_prediction", SPECIES_MISMATCH,
                               "no species metadata declared for this source", counts)

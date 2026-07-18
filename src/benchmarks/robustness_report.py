@@ -8,24 +8,69 @@ Every report built here is stamped development_only=True and
 frozen_test_accessed=False — this module has no code path that could read
 context.test_bags/split_manifest.test_subjects, so both flags are true by
 construction, not by convention.
+
+Schema v2 (bumped from v1) requires every scientific-identity field to be
+present on every report — including on ineligible/not-evaluated branches —
+and rejects a bare None for any identity that was ACTUALLY EVALUATED (a
+model was fit and/or a held-out prediction was produced). A field that is
+scientifically inapplicable for a given report (e.g. domain_head_fingerprint
+for a classical baseline, which has no domain head) must use the structured
+`not_applicable(reason)` representation below, never a bare None and never a
+placeholder string invented ad hoc by a caller.
 """
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from .atomic_io import atomic_write_json
 
-ROBUSTNESS_REPORT_SCHEMA_VERSION = "1.0"
+ROBUSTNESS_REPORT_SCHEMA_VERSION = "2.0"
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def not_applicable(reason: str) -> Dict:
+    """The one sanctioned structured representation of a scientifically
+    inapplicable identity field — never a bare None, never an ad hoc string
+    such as "not_applicable" or "n/a" invented at a call site."""
+    return {"status": "not_applicable", "reason": str(reason)}
+
+
+def is_not_applicable(value) -> bool:
+    return isinstance(value, dict) and value.get("status") == "not_applicable"
+
+
+def _is_valid_hash(value: str) -> bool:
+    return isinstance(value, str) and bool(_SHA256_RE.match(value))
+
+
+# Every field here must appear on EVERY report, evaluated or not — an
+# ineligible/not-evaluated branch still declares an explicit not_applicable()
+# for whichever identity fields it genuinely does not have.
+_IDENTITY_FIELDS = (
+    "dataset_manifest_fingerprint", "source_policy_fingerprint", "source_split_manifest_fingerprint",
+    "preprocessing_fingerprint", "gene_list_fingerprint", "module_fingerprint", "model_fingerprint",
+    "domain_head_fingerprint", "domain_vocabulary_fingerprint", "calibration_fingerprint",
+    "threshold_policy_fingerprint", "environment_fingerprint",
+)
+
+# Fields that, for an EVALUATED report (a model was actually fit and applied
+# to the held-out source), must be a real hash — never not_applicable and
+# never None. An ineligible/no-candidate/no-held-out-bags report is not
+# "evaluated" in this sense and may legitimately mark all of these
+# not_applicable.
+_REQUIRED_WHEN_EVALUATED = (
+    "preprocessing_fingerprint", "gene_list_fingerprint", "module_fingerprint", "model_fingerprint",
+)
 
 _REQUIRED_FIELDS = (
     "schema_version", "development_only", "frozen_test_accessed", "task", "model", "strategy",
-    "dataset_manifest_fingerprint", "source_split_manifest_fingerprint", "preprocessing_fingerprint",
-    "module_fingerprint", "model_fingerprint", "calibration_fingerprint", "held_out_source",
-    "eligibility", "development_sources", "metrics", "calibration", "uncertainty", "domain_shift",
-    "biological_stability", "comparisons", "limitations",
-)
+    "held_out_source", "eligibility", "development_sources", "metrics", "calibration", "uncertainty",
+    "domain_shift", "biological_stability", "comparisons", "limitations", "seed",
+) + _IDENTITY_FIELDS
 
 
 def _sha256_json(payload) -> str:
@@ -40,15 +85,22 @@ class RobustnessReport:
     task: str
     model: str
     strategy: str
-    dataset_manifest_fingerprint: Optional[str]
-    source_split_manifest_fingerprint: Optional[str]
-    preprocessing_fingerprint: Optional[str]
-    module_fingerprint: Optional[str]
-    model_fingerprint: Optional[str]
-    calibration_fingerprint: Optional[str]
+    dataset_manifest_fingerprint: Union[str, Dict]
+    source_split_manifest_fingerprint: Union[str, Dict]
+    preprocessing_fingerprint: Union[str, Dict]
+    module_fingerprint: Union[str, Dict]
+    model_fingerprint: Union[str, Dict]
+    calibration_fingerprint: Union[str, Dict]
     held_out_source: str
     eligibility: Dict
     development_sources: List[str]
+    seed: Optional[int]
+    gene_list_fingerprint: Union[str, Dict]
+    source_policy_fingerprint: Union[str, Dict]
+    domain_vocabulary_fingerprint: Union[str, Dict]
+    domain_head_fingerprint: Union[str, Dict]
+    environment_fingerprint: Union[str, Dict]
+    threshold_policy_fingerprint: Union[str, Dict]
     metrics: Dict = field(default_factory=dict)
     calibration: Dict = field(default_factory=dict)
     uncertainty: Dict = field(default_factory=dict)
@@ -57,12 +109,7 @@ class RobustnessReport:
     comparisons: List[Dict] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
     label_state: Dict = field(default_factory=dict)
-    seed: Optional[int] = None
-    gene_list_fingerprint: Optional[str] = None
-    source_policy_fingerprint: Optional[str] = None
-    domain_vocabulary_fingerprint: Optional[str] = None
-    domain_head_fingerprint: Optional[str] = None
-    environment_fingerprint: Optional[str] = None
+    evaluated: bool = False
 
     def fingerprint(self) -> str:
         return _sha256_json(self.to_dict(include_fingerprint=False))
@@ -76,7 +123,9 @@ class RobustnessReport:
 
 class RobustnessReportValidationError(ValueError):
     """Raised when a robustness report dict does not satisfy the schema
-    contract — missing a required field, or claiming frozen-test access."""
+    contract — missing a required field, a None/malformed required identity,
+    an evaluated report missing a mandatory identity, or a fingerprint
+    mismatch after a field was altered post-hoc."""
 
 
 def validate_robustness_report(d: Dict) -> None:
@@ -92,6 +141,65 @@ def validate_robustness_report(d: Dict) -> None:
             f"robustness report schema_version={d['schema_version']!r} != "
             f"expected {ROBUSTNESS_REPORT_SCHEMA_VERSION!r}"
         )
+    if d["seed"] is None:
+        raise RobustnessReportValidationError("robustness report must record a non-None seed")
+
+    for f in _IDENTITY_FIELDS:
+        v = d[f]
+        if v is None:
+            raise RobustnessReportValidationError(
+                f"robustness report field {f!r} is a bare None — use not_applicable(reason) if this "
+                "identity is genuinely inapplicable, never a bare None."
+            )
+        if is_not_applicable(v):
+            if not v.get("reason"):
+                raise RobustnessReportValidationError(f"robustness report field {f!r}: not_applicable() requires a reason")
+            continue
+        if not _is_valid_hash(v):
+            raise RobustnessReportValidationError(
+                f"robustness report field {f!r}={v!r} is neither a valid 64-hex-char SHA-256 digest "
+                "nor a structured not_applicable() value."
+            )
+
+    if d.get("evaluated"):
+        missing_evaluated = [f for f in _REQUIRED_WHEN_EVALUATED if is_not_applicable(d[f])]
+        if missing_evaluated:
+            raise RobustnessReportValidationError(
+                f"robustness report is marked evaluated=True but field(s) {missing_evaluated} are "
+                "not_applicable — an evaluated neural/classical report must record real model/"
+                "preprocessing/gene identities."
+            )
+        strategy = d.get("strategy")
+        if strategy == "domain_adversarial":
+            for f in ("domain_head_fingerprint", "domain_vocabulary_fingerprint"):
+                if is_not_applicable(d[f]):
+                    raise RobustnessReportValidationError(
+                        f"robustness report strategy='domain_adversarial' but {f!r} is not_applicable "
+                        "— an adversarial report must record real domain-head/vocabulary identities."
+                    )
+        if d.get("calibration"):
+            for f in ("calibration_fingerprint", "threshold_policy_fingerprint"):
+                if is_not_applicable(d[f]):
+                    raise RobustnessReportValidationError(
+                        f"robustness report has a non-empty calibration block but {f!r} is "
+                        "not_applicable — a calibrated cancer report must record real calibration/"
+                        "threshold identities."
+                    )
+
+
+def validate_report_fingerprint_unchanged(d: Dict) -> None:
+    """Re-derives the report_fingerprint from every OTHER field in `d` and
+    raises if it disagrees with the stored value — detects post-hoc
+    tampering with any field after the report was written."""
+    if "report_fingerprint" not in d:
+        raise RobustnessReportValidationError("robustness report missing report_fingerprint")
+    stored = d["report_fingerprint"]
+    recomputed = _sha256_json({k: v for k, v in d.items() if k != "report_fingerprint"})
+    if stored != recomputed:
+        raise RobustnessReportValidationError(
+            "robustness report report_fingerprint does not match its own content — a field was "
+            "altered after the report was written."
+        )
 
 
 def build_robustness_report(
@@ -99,27 +207,43 @@ def build_robustness_report(
     development_sources: List[str], metrics: Optional[Dict] = None, calibration: Optional[Dict] = None,
     uncertainty: Optional[Dict] = None, domain_shift: Optional[Dict] = None,
     biological_stability: Optional[Dict] = None, comparisons: Optional[List[Dict]] = None,
-    limitations: Optional[List[str]] = None, dataset_manifest_fingerprint: Optional[str] = None,
-    source_split_manifest_fingerprint: Optional[str] = None, preprocessing_fingerprint: Optional[str] = None,
-    module_fingerprint: Optional[str] = None, model_fingerprint: Optional[str] = None,
-    calibration_fingerprint: Optional[str] = None, label_state: Optional[Dict] = None,
-    seed: Optional[int] = None, gene_list_fingerprint: Optional[str] = None,
-    source_policy_fingerprint: Optional[str] = None, domain_vocabulary_fingerprint: Optional[str] = None,
-    domain_head_fingerprint: Optional[str] = None, environment_fingerprint: Optional[str] = None,
+    limitations: Optional[List[str]] = None, dataset_manifest_fingerprint: Union[str, Dict, None] = None,
+    source_split_manifest_fingerprint: Union[str, Dict, None] = None,
+    preprocessing_fingerprint: Union[str, Dict, None] = None,
+    module_fingerprint: Union[str, Dict, None] = None, model_fingerprint: Union[str, Dict, None] = None,
+    calibration_fingerprint: Union[str, Dict, None] = None, label_state: Optional[Dict] = None,
+    seed: Optional[int] = None, gene_list_fingerprint: Union[str, Dict, None] = None,
+    source_policy_fingerprint: Union[str, Dict, None] = None,
+    domain_vocabulary_fingerprint: Union[str, Dict, None] = None,
+    domain_head_fingerprint: Union[str, Dict, None] = None,
+    environment_fingerprint: Union[str, Dict, None] = None,
+    threshold_policy_fingerprint: Union[str, Dict, None] = None,
+    evaluated: bool = False,
 ) -> RobustnessReport:
+    def _na(v, reason):
+        return v if v is not None else not_applicable(reason)
+
     return RobustnessReport(
         schema_version=ROBUSTNESS_REPORT_SCHEMA_VERSION, development_only=True, frozen_test_accessed=False,
-        task=task, model=model, strategy=strategy, dataset_manifest_fingerprint=dataset_manifest_fingerprint,
-        source_split_manifest_fingerprint=source_split_manifest_fingerprint,
-        preprocessing_fingerprint=preprocessing_fingerprint, module_fingerprint=module_fingerprint,
-        model_fingerprint=model_fingerprint, calibration_fingerprint=calibration_fingerprint,
+        task=task, model=model, strategy=strategy,
+        dataset_manifest_fingerprint=_na(dataset_manifest_fingerprint, "no dataset manifest supplied"),
+        source_split_manifest_fingerprint=_na(source_split_manifest_fingerprint, "split manifest not built for this branch"),
+        preprocessing_fingerprint=_na(preprocessing_fingerprint, "no model was fit for this source"),
+        module_fingerprint=_na(module_fingerprint, "candidate has no gene-module structure"),
+        model_fingerprint=_na(model_fingerprint, "no model was fit for this source"),
+        calibration_fingerprint=_na(calibration_fingerprint, "no probability calibration performed for this report"),
+        threshold_policy_fingerprint=_na(threshold_policy_fingerprint, "no decision threshold selected for this report"),
         held_out_source=held_out_source, eligibility=eligibility, development_sources=list(development_sources),
         metrics=metrics or {}, calibration=calibration or {}, uncertainty=uncertainty or {},
         domain_shift=domain_shift or {}, biological_stability=biological_stability or {},
-        seed=seed, gene_list_fingerprint=gene_list_fingerprint, source_policy_fingerprint=source_policy_fingerprint,
-        domain_vocabulary_fingerprint=domain_vocabulary_fingerprint, domain_head_fingerprint=domain_head_fingerprint,
-        environment_fingerprint=environment_fingerprint,
+        seed=seed,
+        gene_list_fingerprint=_na(gene_list_fingerprint, "no model was fit for this source"),
+        source_policy_fingerprint=_na(source_policy_fingerprint, "source policy not resolved for this branch"),
+        domain_vocabulary_fingerprint=_na(domain_vocabulary_fingerprint, "candidate has no domain-source vocabulary"),
+        domain_head_fingerprint=_na(domain_head_fingerprint, "candidate has no domain-adversarial head"),
+        environment_fingerprint=_na(environment_fingerprint, "environment fingerprint not collected for this branch"),
         comparisons=comparisons or [], limitations=limitations or [], label_state=label_state or {},
+        evaluated=evaluated,
     )
 
 
@@ -134,6 +258,7 @@ def write_robustness_report(path, report: RobustnessReport) -> str:
     if reloaded != d:
         raise RuntimeError(f"write_robustness_report: reload mismatch at {path} — write was not faithful.")
     validate_robustness_report(reloaded)
+    validate_report_fingerprint_unchanged(reloaded)
     import pathlib
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 

@@ -96,6 +96,42 @@ def test_biological_stability_report_labels_synthetic_modules(fixture):
     assert "label_permutation_null" in report
 
 
+def test_biological_stability_cross_run_stability_insufficient_evidence_by_default(fixture):
+    """With no extra_seeds, cross_run_stability must never be fabricated
+    from repeated calls to the one already-fitted model."""
+    report = cancer_biological_stability_report(
+        fixture["context"], fixture["fitted"], fixture["dev_bags"], fixture["held_out_bags"],
+        fixture["outcomes"], fixture["num_cell_types"], fixture["min_cells"], seed=1,
+    )
+    assert report["cross_run_stability"]["status"] == "insufficient_evidence"
+
+
+def test_biological_stability_cross_run_stability_uses_genuine_independent_refits(fixture):
+    """extra_seeds must trigger real independent refits — status becomes
+    'evaluated' and records the exact seeds actually used."""
+    report = cancer_biological_stability_report(
+        fixture["context"], fixture["fitted"], fixture["dev_bags"], fixture["held_out_bags"],
+        fixture["outcomes"], fixture["num_cell_types"], fixture["min_cells"], seed=1, extra_seeds=[2, 3],
+    )
+    stability = report["cross_run_stability"]
+    assert stability["status"] == "evaluated"
+    assert sorted(stability["seeds"]) == [1, 2, 3]
+    assert stability["n_runs"] == 3
+
+
+def test_biological_stability_gene_module_and_expression_null_controls_present(fixture):
+    report = cancer_biological_stability_report(
+        fixture["context"], fixture["fitted"], fixture["dev_bags"], fixture["held_out_bags"],
+        fixture["outcomes"], fixture["num_cell_types"], fixture["min_cells"], seed=1,
+    )
+    gmp = report["gene_module_permutation_null"]
+    assert gmp["status"] == "null_record"
+    assert "permuted_gene_mapping_fingerprint" in gmp
+    wgp = report["within_gene_expression_permutation_null"]
+    assert wgp["status"] == "null_record"
+    assert wgp["n_valid_cells_permuted_over"] > 0
+
+
 def test_biological_stability_not_applicable_for_non_pathway_candidate(fixture):
     from benchmarks.final_evaluation import FittedFinalCandidate
 

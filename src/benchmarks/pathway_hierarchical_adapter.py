@@ -44,6 +44,7 @@ from .domain_losses import (
     group_embeddings_by_source,
     mmd_loss,
     resolve_domain_robustness_config,
+    validate_source_provenance,
 )
 
 MODEL_NAME = "pathway_hierarchical_mil"
@@ -219,6 +220,7 @@ class PathwayHierarchicalAdapter:
                 "alone does not implicitly enable its regularizer."
             )
         if self.domain_head is None:
+            validate_source_provenance(sources)
             unique_sources = sorted(set(str(s) for s in sources))
             self.domain_source_vocabulary = unique_sources
             self.domain_head = DomainClassifierHead(self.config.embedding_dim, unique_sources).to(self.device)
@@ -241,6 +243,7 @@ class PathwayHierarchicalAdapter:
             cfg = self.domain_robustness["coral"]
             if not cfg["enabled"] or cfg["weight"] == 0.0:
                 return zero
+            validate_source_provenance(sources)
             grouped = group_embeddings_by_source(subject_embeddings, sources)
             loss, meta = coral_loss(grouped)
             self.last_loss_components["coral_loss"] = float(loss.detach().item())
@@ -251,6 +254,7 @@ class PathwayHierarchicalAdapter:
             cfg = self.domain_robustness["mmd"]
             if not cfg["enabled"] or cfg["weight"] == 0.0:
                 return zero
+            validate_source_provenance(sources)
             grouped = group_embeddings_by_source(subject_embeddings, sources)
             loss, meta = mmd_loss(grouped, kernel=cfg["kernel"])
             self.last_loss_components["mmd_loss"] = float(loss.detach().item())
@@ -261,6 +265,7 @@ class PathwayHierarchicalAdapter:
             cfg = self.domain_robustness["adversarial"]
             if not cfg["enabled"] or cfg["weight"] == 0.0 or self.domain_head is None:
                 return zero
+            validate_source_provenance(sources)
             if epoch < cfg["warmup_epochs"]:
                 # Deterministic warm-up: the encoder is never adversarially
                 # regularized before warmup_epochs has elapsed, so the
@@ -291,6 +296,7 @@ class PathwayHierarchicalAdapter:
             return None
         subject_ids = np.array([str(b["subject_id"]) for b in bags])
         sources = np.array([str(b.get("source") or "unknown") for b in bags])
+        validate_source_provenance(sources)
         index = SourceSubjectIndex(subject_ids=subject_ids, sources=sources)
         cfg = self.domain_robustness["source_balancing"]
         batch_size = cfg.get("batch_size") or min(len(bags), 8)
@@ -403,6 +409,20 @@ class PathwayHierarchicalAdapter:
                 batch["cell_mask"].to(self.device),
             )
         return out.smoke_logits.argmax(dim=1).cpu().numpy()
+
+    def predict_smoke_proba(self, subject_dataset) -> np.ndarray:
+        """Softmax class-probability matrix ([n_subjects, num_smoke]) per
+        subject, ordered like subject_dataset.bags — the multi-class
+        analogue of predict_proba, used only for uncertainty/abstention
+        diagnostics, never for the primary macro-F1 metric."""
+        self.model.eval()
+        batch = bags_to_pathway_batch(subject_dataset.bags)
+        with torch.no_grad():
+            out = self.model(
+                batch["expression"].to(self.device), batch["cell_type_ids"].to(self.device),
+                batch["cell_mask"].to(self.device),
+            )
+        return torch.softmax(out.smoke_logits, dim=1).cpu().numpy()
 
     def known_smoke_labels(self, subject_dataset) -> np.ndarray:
         """Subject-level majority smoke label + known mask, in the SAME

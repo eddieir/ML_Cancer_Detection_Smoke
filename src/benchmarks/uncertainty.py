@@ -73,6 +73,17 @@ def apply_abstention_threshold(
     }
 
 
+def multiclass_predictive_uncertainty(proba: np.ndarray) -> Dict[str, np.ndarray]:
+    """Per-subject uncertainty summaries for a multi-class softmax
+    probability matrix ([n_subjects, n_classes]) — predictive entropy and
+    maximum class probability, no labels involved."""
+    p = np.clip(np.asarray(proba, dtype=np.float64), 1e-12, 1.0)
+    p = p / p.sum(axis=1, keepdims=True)
+    entropy = -(p * np.log(p)).sum(axis=1)
+    max_class_prob = p.max(axis=1)
+    return {"entropy": entropy, "max_class_probability": max_class_prob}
+
+
 def mc_dropout_uncertainty_report(adapter, bags: Sequence[dict], n_passes: int = 20, seed: int = 0) -> Dict:
     """Thin wrapper around pathway_hierarchical_mil.mc_dropout_predict —
     explicitly NOT a calibrated confidence interval, purely a dispersion

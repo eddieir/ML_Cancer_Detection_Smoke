@@ -23,10 +23,10 @@ from benchmarks.source_eligibility import (
 from data.manifest import DatasetManifestEntry
 
 
-def _manifest_entry(dataset_id="GSE_TEST", species="human", controlled_access=False):
+def _manifest_entry(dataset_id="GSE_TEST", species="human", controlled_access=False, assay_type="scRNA-seq"):
     return DatasetManifestEntry(
         dataset_id=dataset_id, accession=dataset_id, source_url="http://example.invalid",
-        official_record_url="http://example.invalid", species=species, assay_type="scRNA-seq",
+        official_record_url="http://example.invalid", species=species, assay_type=assay_type,
         matrix_representation="counts", subject_identifier_field="subject_id",
         license_or_access_level="open", controlled_access=controlled_access, synthetic_or_real="synthetic_fixture",
     )
@@ -163,14 +163,33 @@ def test_resolve_source_policy_prefers_manifest_over_caller_when_present():
         "GSE_TEST", species_by_source={}, controlled_access_sources=[],
         manifest_by_source={"GSE_TEST": entry},
     )
-    assert policy == {"species": "human", "controlled_access": False, "source_of_truth": "dataset_manifest"}
+    assert policy["species"] == "human"
+    assert policy["controlled_access"] is False
+    assert policy["source_of_truth"] == "dataset_manifest"
+    assert policy["assay_mode"] == entry.assay_type
+    assert policy["cohort_role"] == entry.synthetic_or_real
+    assert policy["label_semantics_version"] == entry.label_policy_version
 
 
 def test_resolve_source_policy_falls_back_to_caller_when_source_not_in_manifest():
     policy = resolve_source_policy(
         "sourceA", species_by_source={"sourceA": "human"}, controlled_access_sources=[], manifest_by_source={},
     )
-    assert policy == {"species": "human", "controlled_access": False, "source_of_truth": "caller_supplied"}
+    assert policy["species"] == "human"
+    assert policy["controlled_access"] is False
+    assert policy["source_of_truth"] == "caller_supplied"
+    assert policy["assay_mode"] is None
+    assert policy["cohort_role"] is None
+
+
+def test_resolve_source_policy_assay_mismatch_rejects_bulk_source():
+    entry = _manifest_entry("TCGA_TEST", species="human", assay_type="bulk_rnaseq")
+    from benchmarks.source_eligibility import assess_cancer_source_eligibility
+    report = assess_cancer_source_eligibility(
+        "TCGA_TEST", [1, 0, 1, 0], manifest_by_source={"TCGA_TEST": entry}, reference_assay_mode="single_cell",
+    )
+    assert report.status == "assay_mismatch"
+    assert report.eligible is False
 
 
 def test_resolve_source_policy_rejects_species_drift_from_manifest():
