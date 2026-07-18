@@ -536,6 +536,7 @@ def run_cancer_source_held_out(
             source_policy_fingerprint=source_policy_fp, environment_fingerprint=environment_fp,
             gene_list_fingerprint=gene_list_fp, domain_vocabulary_fingerprint=domain_vocab_fp,
             domain_head_fingerprint=domain_head_fp, seed=seed, evaluated=True,
+            is_module_based_candidate=(best_name == PATHWAY_MODEL_NAME),
         ).to_dict()
 
     return reports
@@ -564,6 +565,25 @@ class UnsupportedSmokeDomainStrategyError(ValueError):
 _SUPPORTED_SMOKE_CANDIDATES = frozenset(set(SMOKE_BASELINES) | {PATHWAY_MODEL_NAME})
 
 
+def _align_proba_to_full_classes(proba: np.ndarray, model_classes: Sequence[int], num_classes: int) -> np.ndarray:
+    """
+    A fold's training data can legitimately miss a class entirely (a small
+    grouped-CV fold, especially for a rare smoke type) — sklearn's
+    predict_proba then returns columns only for model.classes_ (whatever
+    subset the model actually saw), never the full [0, num_classes) range.
+    Re-embeds those columns into a FIXED-width, fixed-order [n, num_classes]
+    array (missing classes explicitly zero-filled) so every fold's OOF
+    probabilities share one consistent class axis regardless of which
+    classes that fold's training data happened to contain.
+    """
+    out = np.zeros((proba.shape[0], num_classes), dtype=np.float64)
+    for col, cls in enumerate(model_classes):
+        cls = int(cls)
+        if 0 <= cls < num_classes:
+            out[:, cls] = proba[:, col]
+    return out
+
+
 def _smoke_candidate_dev_score(
     context, name: str, dev_subjects: Sequence[str], label_by_subject: Dict[str, int],
     num_cell_types: int, num_classes: int, n_hvgs: int, device: str, seed: int,
@@ -576,17 +596,31 @@ def _smoke_candidate_dev_score(
     fold's own training subjects (select_nested_hyperparameters_with_refit),
     mirroring cross_validation.run_smoke_cv's per-fold nested-selection
     pattern but scoped to this held-out source's development pool only.
-    Returns (mean_macro_f1_or_None, evidence_dict).
+
+    Every dev subject is predicted by EXACTLY ONE fold (the one it was held
+    out of) — never a fold it also trained on — so evidence["oof_by_subject"]
+    is a genuine out-of-fold probability vector (fixed num_classes columns,
+    see _align_proba_to_full_classes) per subject with a defined fold
+    prediction, never an in-sample probability. A subject whose every
+    containing fold was skipped (empty train/val bags after the min-cells/
+    known-label mask) legitimately has no OOF entry — the caller must not
+    assume every dev_subject appears in oof_by_subject.
+
+    Returns (mean_macro_f1_or_None, evidence_dict). evidence_dict always has
+    an "oof_by_subject" key (possibly empty) so a caller can rely on its
+    presence without a hasattr/get-with-default dance.
     """
     labeled_dev_subjects = sorted(s for s in dev_subjects if s in label_by_subject)
+    oof_by_subject: Dict[str, np.ndarray] = {}
     if len(labeled_dev_subjects) < 2:
-        return None, {"error": "fewer than 2 verified-label development subjects"}
+        return None, {"error": "fewer than 2 verified-label development subjects", "oof_by_subject": oof_by_subject}
     y_full = np.array([label_by_subject[s] for s in labeled_dev_subjects])
     if len(set(y_full.tolist())) < 2:
-        return None, {"error": "development pool has only one verified smoke class"}
+        return None, {"error": "development pool has only one verified smoke class", "oof_by_subject": oof_by_subject}
 
     folds = grouped_kfold(np.array(labeled_dev_subjects), y_full, n_folds=n_dev_folds, seed=seed)
     fold_scores, fold_records = [], []
+    seen_oof_subjects: set = set()
     for fold_idx, fold in enumerate(folds):
         artifact, train_ds, val_ds = fold_train_val_datasets(
             context, fold["train"], fold["val"], n_hvgs=n_hvgs,
@@ -610,6 +644,9 @@ def _smoke_candidate_dev_score(
             preds = model.predict(Xva_raw[va_mask])
             yva = np.array([label_by_subject[s] for s, keep in zip(subj_va, va_mask) if keep])
             report = full_smoke_metrics_report(yva, preds, num_classes)
+            proba_va = model.predict_proba(Xva_raw[va_mask])
+            proba_va_aligned = _align_proba_to_full_classes(proba_va, model.model.classes_, num_classes)
+            va_subjects = [s for s, keep in zip(subj_va, va_mask) if keep]
         elif name == PATHWAY_MODEL_NAME:
             train_bags = bags_from_fold_cell_dataset(train_ds, {}, min_cells_per_subject=1)
             val_bags = bags_from_fold_cell_dataset(val_ds, {}, min_cells_per_subject=1)
@@ -630,6 +667,8 @@ def _smoke_candidate_dev_score(
             if not known.any():
                 continue
             report = full_smoke_metrics_report(y_val[known], preds[known], num_classes)
+            proba_va_aligned = adapter.predict_smoke_proba(val_sd)[known]
+            va_subjects = [str(b["subject_id"]) for b, k in zip(val_sd.bags, known) if k]
         else:
             raise UnsupportedSmokeCandidateError(
                 f"{name!r} is not a supported Task A source-held-out candidate — "
@@ -637,10 +676,22 @@ def _smoke_candidate_dev_score(
             )
         fold_scores.append(report["macro_f1"])
         fold_records.append({"fold": fold_idx, "macro_f1": report["macro_f1"], "hyperparameter_search": hp_search})
+        for sid, proba_row in zip(va_subjects, proba_va_aligned):
+            if sid in seen_oof_subjects:
+                raise RuntimeError(
+                    f"_smoke_candidate_dev_score: subject {sid!r} received an OOF prediction from more "
+                    "than one fold — grouped_kfold must assign every subject to exactly one validation "
+                    "fold; this indicates a fold-construction bug, never an expected outcome."
+                )
+            seen_oof_subjects.add(sid)
+            oof_by_subject[sid] = proba_row
 
     if not fold_scores:
-        return None, {"error": "no development fold produced a defined macro-F1", "folds": fold_records}
-    return float(np.mean(fold_scores)), {"folds": fold_records, "n_folds_scored": len(fold_scores)}
+        return None, {"error": "no development fold produced a defined macro-F1", "folds": fold_records,
+                       "oof_by_subject": oof_by_subject}
+    return float(np.mean(fold_scores)), {
+        "folds": fold_records, "n_folds_scored": len(fold_scores), "oof_by_subject": oof_by_subject,
+    }
 
 
 def run_smoke_source_held_out(
@@ -746,14 +797,22 @@ def run_smoke_source_held_out(
 
         candidate_scores: Dict[str, Dict] = {}
         best_name, best_score = None, -np.inf
+        best_oof_by_subject: Dict[str, np.ndarray] = {}
         for name in model_names:
             score, evidence = _smoke_candidate_dev_score(
                 context, name, dev_subjects, dev_label_by_subject, num_cell_types, num_classes,
                 n_hvgs, device, seed, n_dev_cv_folds, n_inner_folds,
             )
+            # oof_by_subject carries raw subject IDs and per-subject
+            # probability vectors — never let it flow into candidate_scores/
+            # comparisons, which are embedded verbatim in the persisted
+            # report; it is retained here only for the WINNING candidate's
+            # internal uncertainty computation below.
+            oof_by_subject = evidence.pop("oof_by_subject", {})
             candidate_scores[name] = {"development_macro_f1": score, **evidence}
             if score is not None and score > best_score:
                 best_name, best_score = name, score
+                best_oof_by_subject = oof_by_subject
 
         if best_name is None:
             reports[held_out_source] = build_robustness_report(
@@ -823,8 +882,8 @@ def run_smoke_source_held_out(
             yte = np.array([held_out_label_by_subject[s] for s, keep in zip(subj_te, te_mask) if keep])
             report = full_smoke_metrics_report(yte, preds, num_classes)
             model_state_fp = model.model_state_fingerprint()
-            dev_proba, held_out_proba = model.predict_proba(Xdev), model.predict_proba(Xte_full[te_mask])
-            dev_labels_for_uncertainty, held_out_labels_for_uncertainty = ydev, yte
+            held_out_proba = model.predict_proba(Xte_full[te_mask])
+            held_out_labels_for_uncertainty = yte
         else:
             dev_bags = bags_from_fold_cell_dataset(dev_ds, {}, min_cells_per_subject=1)
             held_out_bags = bags_from_fold_cell_dataset(held_out_ds, {}, min_cells_per_subject=1)
@@ -857,11 +916,9 @@ def run_smoke_source_held_out(
                 continue
             report = full_smoke_metrics_report(labels[known], preds[known], num_classes)
             model_state_fp = adapter.model_state_fingerprint()
-            dev_labels_raw, dev_known = adapter.known_smoke_labels(dev_sd)
-            dev_proba_full = adapter.predict_smoke_proba(dev_sd)
             held_out_proba_full = adapter.predict_smoke_proba(held_out_sd)
-            dev_proba, held_out_proba = dev_proba_full[dev_known], held_out_proba_full[known]
-            dev_labels_for_uncertainty, held_out_labels_for_uncertainty = dev_labels_raw[dev_known], labels[known]
+            held_out_proba = held_out_proba_full[known]
+            held_out_labels_for_uncertainty = labels[known]
 
         module_info = None
         if best_name == PATHWAY_MODEL_NAME:
@@ -876,8 +933,21 @@ def run_smoke_source_held_out(
         else:
             module_fp = not_applicable(f"{best_name} has no gene-module structure")
 
+        # Development-only OOF probabilities from the SAME dev-only nested
+        # grouped-CV sweep that selected best_name (best_oof_by_subject,
+        # captured above) — never the final dev-pool-fitted model's
+        # in-sample predictions. A subject with no OOF entry (every fold
+        # containing it was skipped) is simply absent from this array, not
+        # imputed.
+        oof_dev_subjects = sorted(best_oof_by_subject)
+        if oof_dev_subjects:
+            dev_proba_oof = np.stack([best_oof_by_subject[s] for s in oof_dev_subjects])
+            dev_labels_oof = np.array([dev_label_by_subject[s] for s in oof_dev_subjects])
+        else:
+            dev_proba_oof, dev_labels_oof = None, None
+
         smoke_uncertainty = smoke_uncertainty_report(
-            dev_proba, dev_labels_for_uncertainty, held_out_proba, held_out_labels_for_uncertainty, num_classes,
+            dev_proba_oof, dev_labels_oof, held_out_proba, held_out_labels_for_uncertainty, num_classes,
         )
 
         manifest = build_source_held_out_manifest(
@@ -903,7 +973,7 @@ def run_smoke_source_held_out(
                          "weak_labels_enabled": weak_labels_enabled},
             dataset_manifest_fingerprint=dataset_manifest_fp, source_policy_fingerprint=source_policy_fp,
             environment_fingerprint=environment_fp, gene_list_fingerprint=gene_list_fp, seed=seed,
-            evaluated=True,
+            evaluated=True, is_module_based_candidate=(best_name == PATHWAY_MODEL_NAME),
         ).to_dict()
 
     return reports

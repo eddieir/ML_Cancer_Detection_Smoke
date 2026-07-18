@@ -142,10 +142,21 @@ def within_gene_expression_permutation_null(adapter, bags: Sequence[dict], targe
     distribution over these cells EXACTLY (it is a permutation, not a
     resample), while destroying the real per-cell joint structure across
     genes (cross-gene correlations, cell-type-conditional co-expression).
-    Operates only on already-supplied bags' own expression values — reads
-    no subject_id, no label, no held-out-source data, so it cannot leak
-    subject or label identity across bags. Reports the mean absolute change
-    in the target logit, the same sensitivity statistic
+
+    When called from cancer_biological_stability_report, `bags` IS a sample
+    of the held-out source's own bags — this function DOES read held-out
+    EXPRESSION values, for post-fit sensitivity analysis only. It never
+    reads any LABEL (subject-level outcome) from `bags`, and it runs
+    strictly AFTER candidate selection, the final development-pool fit,
+    calibration/threshold freezing, and held-out prediction generation
+    (see cancer_biological_stability_report's call site in
+    source_held_out.py, and test_perturbation_diagnostics_run_only_after_
+    development_freeze in tests/test_source_held_out.py for the ordering
+    proof) — nothing computed here feeds back into model selection,
+    preprocessing, fitting, calibration, threshold selection, or
+    abstention-threshold selection; it is read-only with respect to every
+    decision this protocol makes. Reports the mean absolute change in the
+    target logit, the same sensitivity statistic
     cell_type_label_permutation_check reports for its own (different)
     perturbation.
     """

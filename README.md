@@ -1545,7 +1545,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (1092 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py` |
+| `tests/*` | All modules covered (1114 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py` |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -2044,26 +2044,54 @@ the aggregate's source count.
   trigger GENUINE independent refits (never repeated calls to one already-
   fitted model) whose module-ablation rankings are compared via
   `module_ranking_stability`.
-- Task A now has its own multi-class uncertainty/abstention diagnostic
-  (`smoke_uncertainty_report`): predictive entropy and maximum class
-  probability over the softmax output, a development-only abstention
-  threshold, and retained-subset macro-F1 as a secondary statistic (the
-  full-population macro-F1 already in the main metrics block stays
-  primary). The development probabilities driving threshold selection are
-  the dev-pool-fitted model's own in-sample predictions (this protocol does
-  not carry a per-fold OOF probability array through to this point the way
-  the cancer path does) — this is disclosed in the report's own `note`
-  field rather than presented as an out-of-fold estimate, and held-out-
-  source labels never influence the selected threshold regardless.
+- Task A's multi-class uncertainty/abstention diagnostic
+  (`smoke_uncertainty_report`) selects its development abstention threshold
+  from GENUINE out-of-fold probabilities — `_smoke_candidate_dev_score`'s
+  grouped-CV sweep now returns `oof_by_subject` (each verified development
+  subject predicted only by the one fold it was held out of, columns
+  re-aligned to the full class vocabulary even when a fold's training data
+  missed a class) for whichever candidate wins selection, and that is what
+  drives threshold selection — never the final dev-pool-fitted model's
+  in-sample predictions on its own training pool. Full-population macro-F1
+  remains primary; retained-subset macro-F1 is secondary. Held-out-source
+  labels and expression never influence the threshold.
+- The robustness report schema's `module_fingerprint` requirement is now
+  candidate-kind-aware (`is_module_based_candidate`, stamped by the caller):
+  an evaluated classical baseline or non-module MIL model must record a
+  structured `not_applicable` module identity; only `pathway_hierarchical_
+  mil` must record a real module hash. `domain_head_fingerprint`/
+  `domain_vocabulary_fingerprint` remain required only for
+  `strategy=domain_adversarial`; `calibration_fingerprint`/
+  `threshold_policy_fingerprint` remain required only when a report's
+  `calibration` block is non-empty.
+- Every per-source report is validated (`validate_robustness_report` +
+  `validate_report_fingerprint_unchanged`) before it is allowed to enter an
+  aggregate (`build_aggregate_report`, `run_domain_robustness_ablation`) or
+  reach disk — this is enforced by the production functions themselves,
+  not left to tests to call manually. `validate_aggregate_report` checks
+  the aggregate's own schema/stamps and recursively validates every nested
+  per-source report; `write_aggregate_report` mirrors
+  `write_robustness_report`'s atomic-write-plus-reload-and-validate
+  contract for the aggregate shape.
+- `gene_space_compatibility` no longer reports a self-vs-self "100%
+  compatible" placeholder. This pipeline unifies every source onto one
+  shared gene space at ingestion time, before any per-source raw gene
+  panel would even be distinguishable, so no current caller has a real
+  held-out raw gene panel to compare against — the function now returns a
+  structured `not_evaluable` status (`"reason": "raw source-specific gene
+  contract unavailable"`) by default, and performs a real missing/
+  unexpected/duplicate-mapping/coverage computation whenever a caller does
+  supply one (tested directly against synthetic partial gene panels).
 - `GeneModuleCollection` (`pathway_hierarchical_mil.py`) records
   `source_name`/`source_version` provenance and a content fingerprint, but
   does not yet carry a full real-module provenance schema (organism,
-  namespace, mapping-policy, license, checksum) — since no real GMT
-  resource ships with or is referenced by this repository, every concrete
-  module-based result remains a synthetic-diagnostic (`is_synthetic_modules
-  =True`) result, and expanding this schema without a real resource to
-  validate it against was judged higher-risk than the benefit for this
-  phase.
+  namespace, mapping-policy, license, checksum). Rather than emit
+  `scope: real_module_sensitivity_analysis` without that contract,
+  `cancer_biological_stability_report` now explicitly REJECTS a non-
+  synthetic module source (`status: "unsupported"`,
+  `scope: "unsupported_real_module_analysis"`) — real-module biological-
+  stability analysis is disabled, not silently under-documented. Synthetic-
+  module results remain `scope: "software_diagnostic_only"`.
 
 ## Next steps
 

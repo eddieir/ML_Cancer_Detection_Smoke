@@ -16,6 +16,7 @@ from benchmarks.robustness_report import (
     build_robustness_report,
     is_not_applicable,
     not_applicable,
+    validate_aggregate_report,
     validate_report_fingerprint_unchanged,
     validate_robustness_report,
     write_robustness_report,
@@ -65,17 +66,39 @@ def test_schema_contains_no_raw_subject_ids_by_construction():
 
 
 def test_report_fingerprint_deterministic_round_trip():
+    """report_fingerprint (a field INSIDE the JSON, hashing every other
+    field) and file_sha256 (write_robustness_report's return value, hashing
+    the serialized file's raw bytes) are two independent hashes over
+    different inputs — this test checks each on its own terms rather than
+    conflating them."""
     with tempfile.TemporaryDirectory() as tmp:
         report = build_robustness_report(
             task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
             eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5}, seed=7,
         )
         path = Path(tmp) / "r.json"
-        fp1 = write_robustness_report(path, report)
+        file_sha256 = write_robustness_report(path, report)
+        import hashlib
         import json
+
         reloaded = json.loads(path.read_text())
-        assert reloaded["report_fingerprint"] == fp1 or True  # fp1 is the file's own sha256, not the report fingerprint
         assert reloaded["development_only"] is True
+
+        # report_fingerprint must equal a fresh recomputation over the
+        # SAME content, and must be deterministic given identical inputs.
+        assert reloaded["report_fingerprint"] == report.fingerprint()
+        report_again = build_robustness_report(
+            task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
+            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5}, seed=7,
+        )
+        assert report_again.fingerprint() == report.fingerprint()
+
+        # file_sha256 must equal a fresh SHA-256 of the actual file bytes,
+        # and must NOT equal report_fingerprint (they hash different things
+        # — the whole JSON document including report_fingerprint itself,
+        # versus the report's own fields excluding it).
+        assert file_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert file_sha256 != reloaded["report_fingerprint"]
 
 
 def test_schema_version_bumped_to_v2():
@@ -123,9 +146,48 @@ def test_evaluated_report_missing_model_identity_rejected():
 
 
 def test_evaluated_report_with_all_required_identities_passes():
-    d = _report("sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
-                module_fingerprint=_HASH_A, model_fingerprint=_HASH_B)
+    d = _report(
+        "sourceA", 0.8, evaluated=True, is_module_based_candidate=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+    )
     validate_robustness_report(d)
+
+
+def test_evaluated_classical_baseline_requires_not_applicable_module_fingerprint():
+    """A classical baseline (is_module_based_candidate=False, the default)
+    must record a structured not_applicable module_fingerprint — a real
+    hash there would be scientifically meaningless for a model with no
+    gene-module structure."""
+    d = _report(
+        "sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+    )
+    validate_robustness_report(d)  # module_fingerprint defaults to not_applicable — passes
+
+
+def test_evaluated_classical_baseline_with_real_module_hash_rejected():
+    d = _report(
+        "sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        module_fingerprint=_HASH_A,  # a classical baseline has no module structure to hash
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_module_based_candidate_missing_module_fingerprint_rejected():
+    d = _report(
+        "sourceA", 0.8, evaluated=True, is_module_based_candidate=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
 
 
 def test_adversarial_report_missing_domain_head_identity_rejected():
@@ -181,6 +243,51 @@ def test_corrupted_report_fingerprint_detected():
             validate_report_fingerprint_unchanged(d)
 
 
+def test_file_bytes_corruption_detected_independently_of_report_fingerprint():
+    """Corrupting the FILE's raw bytes (disk-level corruption, not a field
+    edit) must be detectable via file_sha256 — a check entirely separate
+    from validate_report_fingerprint_unchanged, which only ever looks at
+    already-parsed JSON content."""
+    import hashlib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        report = build_robustness_report(
+            task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
+            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5}, seed=7,
+        )
+        path = Path(tmp) / "r.json"
+        file_sha256 = write_robustness_report(path, report)
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == file_sha256
+
+        with open(path, "ab") as f:
+            f.write(b" ")  # append a byte — corrupts the file without touching any JSON field value
+        assert hashlib.sha256(path.read_bytes()).hexdigest() != file_sha256
+
+
+def test_legitimately_rewritten_report_recomputes_a_consistent_fingerprint():
+    """A NEW report built with a genuinely different field (not tampering
+    with an already-written one) gets its own, internally-consistent
+    report_fingerprint — this is the legitimate-rewrite case
+    validate_report_fingerprint_unchanged must NOT reject."""
+    with tempfile.TemporaryDirectory() as tmp:
+        report_v1 = build_robustness_report(
+            task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
+            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.5}, seed=7,
+        )
+        path = Path(tmp) / "r.json"
+        write_robustness_report(path, report_v1)
+
+        report_v2 = build_robustness_report(
+            task="smoke_classification", model="majority", strategy="erm", held_out_source="sourceA",
+            eligibility={"status": "eligible"}, development_sources=["b"], metrics={"macro_f1": 0.7}, seed=7,
+        )
+        write_robustness_report(path, report_v2)  # legitimate overwrite, not tampering
+        import json
+        reloaded = json.loads(path.read_text())
+        validate_report_fingerprint_unchanged(reloaded)  # must pass — this is a fresh, self-consistent report
+        assert reloaded["report_fingerprint"] != report_v1.fingerprint()
+
+
 def test_aggregate_worst_source_is_visible_not_hidden_in_pooled_average():
     reports = [_report("good", 0.95), _report("bad", 0.4), _report("mid", 0.7)]
     agg = aggregate_source_reports(reports, "auroc")
@@ -217,3 +324,53 @@ def test_build_aggregate_report_contains_per_source_reports():
     assert agg["development_only"] is True
     assert agg["frozen_test_accessed"] is False
     assert len(agg["per_source_reports"]) == 2
+    validate_aggregate_report(agg)  # must already validate cleanly by construction
+
+
+def test_build_aggregate_report_rejects_a_malformed_per_source_report():
+    """build_aggregate_report must validate every child BEFORE it enters
+    the aggregate — this is the production enforcement point, not
+    something only a test remembers to call."""
+    good = _report("a", 0.6)
+    bad = _report("b", 0.7)
+    bad["module_fingerprint"] = None  # a bare None is never valid
+    with pytest.raises(RobustnessReportValidationError):
+        build_aggregate_report("cancer_prediction", "prevalence", "erm", [good, bad], "auroc")
+
+
+def test_build_aggregate_report_rejects_a_tampered_per_source_report():
+    """A child report whose report_fingerprint no longer matches its own
+    content (post-hoc tampering) must be rejected before it enters an
+    aggregate."""
+    good = _report("a", 0.6)
+    tampered = _report("b", 0.7)
+    tampered["metrics"]["auroc"] = 0.99  # tamper without recomputing report_fingerprint
+    with pytest.raises(RobustnessReportValidationError):
+        build_aggregate_report("cancer_prediction", "prevalence", "erm", [good, tampered], "auroc")
+
+
+def test_write_aggregate_report_atomic_round_trip_and_corruption_detection():
+    with tempfile.TemporaryDirectory() as tmp:
+        reports = [_report("a", 0.6), _report("b", 0.7)]
+        agg = build_aggregate_report("cancer_prediction", "prevalence", "erm", reports, "auroc")
+        path = Path(tmp) / "agg.json"
+        from benchmarks.robustness_report import write_aggregate_report
+        file_sha = write_aggregate_report(path, agg)
+        import hashlib
+        assert file_sha == hashlib.sha256(path.read_bytes()).hexdigest()
+
+        import json
+        corrupted = json.loads(path.read_text())
+        corrupted["per_source_reports"][0]["module_fingerprint"] = None
+        bad_path = Path(tmp) / "agg_bad.json"
+        bad_path.write_text(json.dumps(corrupted))
+        with pytest.raises(RobustnessReportValidationError):
+            validate_aggregate_report(json.loads(bad_path.read_text()))
+
+
+def test_validate_aggregate_report_rejects_n_sources_considered_mismatch():
+    reports = [_report("a", 0.6), _report("b", 0.7)]
+    agg = build_aggregate_report("cancer_prediction", "prevalence", "erm", reports, "auroc")
+    agg["n_sources_considered"] = 99
+    with pytest.raises(RobustnessReportValidationError):
+        validate_aggregate_report(agg)

@@ -58,18 +58,21 @@ _IDENTITY_FIELDS = (
 )
 
 # Fields that, for an EVALUATED report (a model was actually fit and applied
-# to the held-out source), must be a real hash — never not_applicable and
-# never None. An ineligible/no-candidate/no-held-out-bags report is not
-# "evaluated" in this sense and may legitimately mark all of these
-# not_applicable.
+# to the held-out source), must be a real hash regardless of candidate kind
+# — never not_applicable and never None. module_fingerprint is deliberately
+# NOT here: it is only required when is_module_based_candidate=True (see
+# validate_robustness_report) — a classical baseline or non-module MIL
+# candidate has no gene-module structure to fingerprint, and requiring one
+# unconditionally would reject every legitimate classical-baseline report.
 _REQUIRED_WHEN_EVALUATED = (
-    "preprocessing_fingerprint", "gene_list_fingerprint", "module_fingerprint", "model_fingerprint",
+    "preprocessing_fingerprint", "gene_list_fingerprint", "model_fingerprint",
+    "source_policy_fingerprint", "source_split_manifest_fingerprint", "environment_fingerprint",
 )
 
 _REQUIRED_FIELDS = (
     "schema_version", "development_only", "frozen_test_accessed", "task", "model", "strategy",
     "held_out_source", "eligibility", "development_sources", "metrics", "calibration", "uncertainty",
-    "domain_shift", "biological_stability", "comparisons", "limitations", "seed",
+    "domain_shift", "biological_stability", "comparisons", "limitations", "seed", "is_module_based_candidate",
 ) + _IDENTITY_FIELDS
 
 
@@ -110,6 +113,7 @@ class RobustnessReport:
     limitations: List[str] = field(default_factory=list)
     label_state: Dict = field(default_factory=dict)
     evaluated: bool = False
+    is_module_based_candidate: bool = False
 
     def fingerprint(self) -> str:
         return _sha256_json(self.to_dict(include_fingerprint=False))
@@ -166,9 +170,23 @@ def validate_robustness_report(d: Dict) -> None:
         if missing_evaluated:
             raise RobustnessReportValidationError(
                 f"robustness report is marked evaluated=True but field(s) {missing_evaluated} are "
-                "not_applicable — an evaluated neural/classical report must record real model/"
-                "preprocessing/gene identities."
+                "not_applicable — an evaluated report must record real model/preprocessing/gene/"
+                "policy/environment identities regardless of candidate kind."
             )
+        if d.get("is_module_based_candidate"):
+            if is_not_applicable(d["module_fingerprint"]):
+                raise RobustnessReportValidationError(
+                    "robustness report is_module_based_candidate=True but module_fingerprint is "
+                    "not_applicable — a module-based/pathway candidate must record a real module "
+                    "identity."
+                )
+        else:
+            if not is_not_applicable(d["module_fingerprint"]):
+                raise RobustnessReportValidationError(
+                    "robustness report is_module_based_candidate=False but module_fingerprint is a "
+                    "real hash — a classical baseline or non-module MIL candidate has no gene-module "
+                    "structure and must record a structured not_applicable() reason instead."
+                )
         strategy = d.get("strategy")
         if strategy == "domain_adversarial":
             for f in ("domain_head_fingerprint", "domain_vocabulary_fingerprint"):
@@ -218,7 +236,7 @@ def build_robustness_report(
     domain_head_fingerprint: Union[str, Dict, None] = None,
     environment_fingerprint: Union[str, Dict, None] = None,
     threshold_policy_fingerprint: Union[str, Dict, None] = None,
-    evaluated: bool = False,
+    evaluated: bool = False, is_module_based_candidate: bool = False,
 ) -> RobustnessReport:
     def _na(v, reason):
         return v if v is not None else not_applicable(reason)
@@ -243,7 +261,7 @@ def build_robustness_report(
         domain_head_fingerprint=_na(domain_head_fingerprint, "candidate has no domain-adversarial head"),
         environment_fingerprint=_na(environment_fingerprint, "environment fingerprint not collected for this branch"),
         comparisons=comparisons or [], limitations=limitations or [], label_state=label_state or {},
-        evaluated=evaluated,
+        evaluated=evaluated, is_module_based_candidate=is_module_based_candidate,
     )
 
 
@@ -329,14 +347,76 @@ def aggregate_source_reports(
     }
 
 
+_AGGREGATE_REQUIRED_FIELDS = (
+    "schema_version", "development_only", "frozen_test_accessed", "task", "model", "strategy",
+    "n_sources_considered", "primary_metric_summary", "per_source_reports",
+)
+
+
+def validate_per_source_reports(per_source_reports: List[Dict]) -> None:
+    """Validates EVERY per-source report against the full schema-v2
+    contract (validate_robustness_report) and its own tamper-detection
+    check (validate_report_fingerprint_unchanged) — the one choke point
+    every aggregate-building/persisting code path must call before a child
+    report is allowed to enter an aggregate or be written to disk."""
+    for r in per_source_reports:
+        validate_robustness_report(r)
+        validate_report_fingerprint_unchanged(r)
+
+
+def validate_aggregate_report(agg: Dict) -> None:
+    """Validates an aggregate report's own schema/version/stamps AND
+    recursively validates every per-source report nested inside it — never
+    relies on the caller (a test, the CLI) to have already done so."""
+    missing = [f for f in _AGGREGATE_REQUIRED_FIELDS if f not in agg]
+    if missing:
+        raise RobustnessReportValidationError(f"aggregate report missing required field(s): {missing}")
+    if agg["schema_version"] != ROBUSTNESS_REPORT_SCHEMA_VERSION:
+        raise RobustnessReportValidationError(
+            f"aggregate report schema_version={agg['schema_version']!r} != "
+            f"expected {ROBUSTNESS_REPORT_SCHEMA_VERSION!r}"
+        )
+    if agg["development_only"] is not True:
+        raise RobustnessReportValidationError("aggregate report must have development_only=True")
+    if agg["frozen_test_accessed"] is not False:
+        raise RobustnessReportValidationError("aggregate report must have frozen_test_accessed=False")
+    if agg["n_sources_considered"] != len(agg["per_source_reports"]):
+        raise RobustnessReportValidationError(
+            f"aggregate report n_sources_considered={agg['n_sources_considered']!r} does not match "
+            f"len(per_source_reports)={len(agg['per_source_reports'])!r}"
+        )
+    validate_per_source_reports(agg["per_source_reports"])
+
+
 def build_aggregate_report(
     task: str, model: str, strategy: str, per_source_reports: List[Dict], primary_metric: str,
     subject_counts: Optional[Dict[str, int]] = None,
 ) -> Dict:
-    return {
+    """Builds the cross-source aggregate report. Validates every per-source
+    report BEFORE it is allowed to enter the aggregate — this is the
+    production enforcement point every CLI caller goes through by
+    construction, not a check tests must remember to call manually."""
+    validate_per_source_reports(per_source_reports)
+    agg = {
         "schema_version": ROBUSTNESS_REPORT_SCHEMA_VERSION, "development_only": True,
         "frozen_test_accessed": False, "task": task, "model": model, "strategy": strategy,
         "n_sources_considered": len(per_source_reports),
         "primary_metric_summary": aggregate_source_reports(per_source_reports, primary_metric, subject_counts),
         "per_source_reports": per_source_reports,
     }
+    validate_aggregate_report(agg)
+    return agg
+
+
+def write_aggregate_report(path, agg: Dict) -> str:
+    """Atomic write + immediate reload-and-verify + full recursive
+    validation, mirroring write_robustness_report's contract for the
+    aggregate report shape. Returns the written file's own SHA-256."""
+    atomic_write_json(path, agg)
+    with open(path) as f:
+        reloaded = json.load(f)
+    if reloaded != agg:
+        raise RuntimeError(f"write_aggregate_report: reload mismatch at {path} — write was not faithful.")
+    validate_aggregate_report(reloaded)
+    import pathlib
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()

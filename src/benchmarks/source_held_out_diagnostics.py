@@ -65,22 +65,24 @@ def _module_gene_counts(modules) -> Dict[str, int]:
     return {name: int(modules.membership_mask[i].sum().item()) for i, name in enumerate(modules.module_names)}
 
 
-def _gene_and_module_coverage(required_gene_list: Optional[Sequence[str]], modules) -> Dict:
-    """held_out_bags were built from the SAME shared AnnData var-space as
-    dev_bags (this pipeline unifies every source onto one HVG-selected gene
-    list at preprocessing time, before any per-source split exists) — so
-    gene_space_compatibility here is necessarily self-vs-self (coverage
-    1.0), documenting that the frozen development gene list is exactly what
-    the held-out subjects were transformed into, not a claim that some
-    other, incompatible raw gene panel was reconciled."""
+def _gene_and_module_coverage(
+    required_gene_list: Optional[Sequence[str]], modules, held_out_raw_gene_list: Optional[Sequence[str]] = None,
+) -> Dict:
+    """
+    required_gene_list: the frozen development artifact's own ordered gene
+    list — never affected by anything computed here.
+    held_out_raw_gene_list: the held-out source's RAW, pre-alignment gene
+    identities captured before the frozen transform, if the caller has
+    them. This pipeline currently unifies every source onto one shared
+    HVG-selected gene space at ingestion time, before any per-source raw
+    panel would even be distinguishable (see ARCHITECTURE.md §16.10) — no
+    current caller has raw per-source gene identities to supply, so this
+    defaults to None and gene_space_compatibility reports a structured
+    not_evaluable status rather than a fabricated 100%-compatible result.
+    """
     coverage: Dict = {}
     if required_gene_list is not None:
-        cmp = gene_space_compatibility(required_gene_list, required_gene_list)
-        cmp["note"] = ("this pipeline unifies all sources onto one shared gene space before any "
-                        "per-source split exists, so held-out subjects were transformed into exactly "
-                        "this gene list by construction — this field documents that fact, not an "
-                        "independent raw-panel reconciliation.")
-        coverage["gene_space_compatibility"] = cmp
+        coverage["gene_space_compatibility"] = gene_space_compatibility(required_gene_list, held_out_raw_gene_list)
     if modules is not None:
         coverage["module_coverage"] = module_coverage_compatibility(_module_gene_counts(modules), MIN_GENES_PER_MODULE)
     return coverage
@@ -90,6 +92,7 @@ def cancer_domain_shift_report(
     dev_bags: Sequence[dict], held_out_bags: Sequence[dict], num_cell_types: int,
     subject_to_source: Dict[str, str], seed: int = 0,
     required_gene_list: Optional[Sequence[str]] = None, modules=None,
+    held_out_raw_gene_list: Optional[Sequence[str]] = None,
 ) -> Dict:
     """Label-free: built entirely from development-fitted subject-summary
     features (dev_bags/held_out_bags were both produced by TRANSFORMING,
@@ -97,13 +100,17 @@ def cancer_domain_shift_report(
     caller guarantees this, see source_held_out.py). required_gene_list/
     modules, when supplied, add gene-space and module-coverage compatibility
     fields — both computed only from the FROZEN development artifact's own
-    gene list/module structure, never from held-out expression values."""
+    gene list/module structure, never from held-out expression values.
+    held_out_raw_gene_list, when the caller actually has the held-out
+    source's raw pre-alignment gene identities, enables a REAL coverage
+    measurement instead of the default not_evaluable status (see
+    domain_shift.gene_space_compatibility)."""
     if not dev_bags or not held_out_bags:
         return {"status": "not_evaluable", "reason": "empty development or held-out bag set"}
     Xdev, _, dev_ids, _ = build_cancer_subject_features(dev_bags, num_cell_types)
     Xho, _, ho_ids, _ = build_cancer_subject_features(held_out_bags, num_cell_types)
     report = distribution_shift_report(Xdev, Xho)
-    report.update(_gene_and_module_coverage(required_gene_list, modules))
+    report.update(_gene_and_module_coverage(required_gene_list, modules, held_out_raw_gene_list))
     missing = [str(s) for s in dev_ids if str(s) not in subject_to_source]
     if missing:
         from .domain_losses import MissingSourceProvenanceError
@@ -124,17 +131,19 @@ def smoke_domain_shift_report(
     dev_cell_dataset, held_out_cell_dataset, num_cell_types: int, num_classes: int,
     subject_to_source: Dict[str, str], seed: int = 0,
     required_gene_list: Optional[Sequence[str]] = None, modules=None,
+    held_out_raw_gene_list: Optional[Sequence[str]] = None,
 ) -> Dict:
     """Task A analogue of cancer_domain_shift_report — label-free, built
     from subject-summary features (build_smoke_subject_summary_features)
     computed from cell datasets that were TRANSFORMED (never refit) through
-    the frozen development-only preprocessing artifact."""
+    the frozen development-only preprocessing artifact. See
+    cancer_domain_shift_report's docstring for held_out_raw_gene_list."""
     if len(dev_cell_dataset) == 0 or len(held_out_cell_dataset) == 0:
         return {"status": "not_evaluable", "reason": "empty development or held-out cell dataset"}
     Xdev, _, dev_ids, _ = build_smoke_subject_summary_features(dev_cell_dataset, num_cell_types, num_classes)
     Xho, _, ho_ids, _ = build_smoke_subject_summary_features(held_out_cell_dataset, num_cell_types, num_classes)
     report = distribution_shift_report(Xdev, Xho)
-    report.update(_gene_and_module_coverage(required_gene_list, modules))
+    report.update(_gene_and_module_coverage(required_gene_list, modules, held_out_raw_gene_list))
     missing = [str(s) for s in dev_ids if str(s) not in subject_to_source]
     if missing:
         from .domain_losses import MissingSourceProvenanceError
@@ -186,13 +195,15 @@ def smoke_uncertainty_report(
     entropy + maximum class probability over the softmax output, a
     development-only abstention threshold, and retained-subset macro-F1 as a
     SECONDARY diagnostic — the full-population macro-F1 already reported in
-    the main metrics block remains primary. dev_proba/dev_labels here are
-    the final dev-pool-fitted model's IN-SAMPLE predictions on its own
-    development pool (this source-held-out protocol does not carry a
-    per-fold OOF probability array through to this point the way the cancer
-    path does) — this is disclosed explicitly below rather than presented as
-    an out-of-fold estimate, and held-out-source labels never influence the
-    selected threshold regardless.
+    the main metrics block remains primary. dev_proba/dev_labels here MUST
+    be genuine out-of-fold predictions (see
+    source_held_out.py::_smoke_candidate_dev_score's oof_by_subject — each
+    dev subject predicted only by the one grouped-CV fold it was held out
+    of, never a fold it also trained on) — never the final dev-pool-fitted
+    model's in-sample predictions on its own training pool, which would
+    make the selected threshold optimistic about development calibration.
+    held-out-source labels never influence the selected threshold
+    regardless of which probabilities are supplied.
     """
     if dev_proba is None or held_out_proba is None or len(dev_proba) == 0 or len(held_out_proba) == 0:
         return {"status": "not_applicable", "reason": "candidate does not produce class probabilities, or "
@@ -210,10 +221,10 @@ def smoke_uncertainty_report(
 
     result: Dict = {
         "development_threshold_selection": selection,
-        "note": "development probabilities are in-sample (dev-pool-fitted model applied to its own "
-                "training pool), not out-of-fold — the threshold-selection diagnostic above is "
-                "therefore optimistic about development calibration; held-out-source labels are never "
-                "read by the threshold-selection step regardless.",
+        "note": "development probabilities are genuine out-of-fold predictions from the dev-only "
+                "nested grouped-CV sweep that selected this candidate — never the final dev-pool-"
+                "fitted model's in-sample predictions; held-out-source labels are never read by the "
+                "threshold-selection step regardless.",
     }
     if selection.get("status") == "selected":
         threshold = selection["uncertainty_threshold"]
@@ -264,6 +275,29 @@ def cancer_biological_stability_report(
     adapter = fitted.predictor
     modules = adapter.modules
     is_synthetic = is_synthetic_module_source(modules.source_name)
+    if not is_synthetic:
+        # Real-module analysis requires a complete provenance contract
+        # (resource name/version, organism, gene-identifier namespace,
+        # mapping policy, source URL/citation, license, local artifact
+        # checksum, ordered module fingerprint, mapped/unmapped gene
+        # counts, minimum-coverage policy) bound into the model/report
+        # identities — GeneModuleCollection does not yet carry that
+        # contract (only source_name/source_version/a content fingerprint;
+        # see ARCHITECTURE.md §16.10), so real-module analysis is disabled
+        # here rather than emitting scope="real_module_sensitivity_analysis"
+        # without it. This module source is real (not the synthetic
+        # diagnostic scheme), but no provenance contract exists yet to
+        # validate it against.
+        return {
+            "status": "unsupported",
+            "reason": "real-module biological-stability analysis requires a complete provenance "
+                      "contract (organism, namespace, mapping policy, license, checksum, ordered "
+                      "module fingerprint, coverage policy) that GeneModuleCollection does not yet "
+                      "implement — disabled rather than reported without it.",
+            "is_synthetic_modules": False,
+            "module_source_name": modules.source_name,
+            "scope": "unsupported_real_module_analysis",
+        }
     sample = list(held_out_bags[:MAX_BIOLOGICAL_STABILITY_BAGS])
 
     invariance = cell_order_permutation_invariance_check(adapter, sample, seed=seed)
@@ -332,9 +366,12 @@ def cancer_biological_stability_report(
             }
 
     return {
+        # is_synthetic is always True here — the not-synthetic case
+        # returns early above with scope="unsupported_real_module_analysis"
+        # rather than ever reaching this point.
         "is_synthetic_modules": is_synthetic,
         "module_source_name": modules.source_name,
-        "scope": "software_diagnostic_only" if is_synthetic else "real_module_sensitivity_analysis",
+        "scope": "software_diagnostic_only",
         "cell_order_permutation_invariance": invariance,
         "cell_type_label_permutation_null": cell_type_null,
         "module_ablation_scores": ablation,

@@ -58,7 +58,7 @@ from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError,
 from data.transforms import assert_batch_correction_safe
 from .domain_losses import resolve_domain_robustness_config
 from .domain_robustness_ablation import run_domain_robustness_ablation
-from .robustness_report import aggregate_source_reports, build_aggregate_report
+from .robustness_report import aggregate_source_reports, build_aggregate_report, write_aggregate_report
 from .source_held_out import UnsupportedSmokeDomainStrategyError, run_cancer_source_held_out, run_smoke_source_held_out
 
 
@@ -271,6 +271,7 @@ def run_smoke_task(context, args, run_dir) -> dict:
     # the pre-existing --leave-one-source-out path above. Never touches the
     # frozen-test guard (see source_held_out.py's module docstring).
     domain_robustness_report = None
+    is_ablation_report = False
     if getattr(args, "domain_strategy", None) is not None or getattr(args, "domain_robustness_ablation", False):
         bench_cfg = context.config.get("benchmarks", {})
         loso_kwargs = dict(
@@ -283,6 +284,7 @@ def run_smoke_task(context, args, run_dir) -> dict:
             domain_robustness_report = run_domain_robustness_ablation(
                 context, "smoke", args.models, device=args.device, seed=args.seeds[0], **loso_kwargs,
             )
+            is_ablation_report = True
         else:
             requested_strategy = _domain_robustness_config_from_args(context, args)["strategy"]
             if requested_strategy != "erm":
@@ -298,9 +300,23 @@ def run_smoke_task(context, args, run_dir) -> dict:
                 "smoke_classification", args.models[0], _domain_robustness_config_from_args(context, args)["strategy"],
                 list(per_source.values()), primary_metric="macro_f1",
             )
-        write_json(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
-        if getattr(args, "robustness_report", None):
-            write_json(Path(args.robustness_report), domain_robustness_report)
+        # An ablation report has a materially different top-level shape
+        # (variants/per-seed results, not a single per_source_reports list)
+        # — its own child reports are already validated inside
+        # run_domain_robustness_ablation at construction time, so it is
+        # written with the generic (but still atomic/reload-verified)
+        # write_json. The plain aggregate report goes through
+        # write_aggregate_report, which re-validates the WHOLE aggregate
+        # (schema/stamps + every nested per-source report) at write time —
+        # never persisted through an unvalidated path.
+        if is_ablation_report:
+            write_json(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
+            if getattr(args, "robustness_report", None):
+                write_json(Path(args.robustness_report), domain_robustness_report)
+        else:
+            write_aggregate_report(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
+            if getattr(args, "robustness_report", None):
+                write_aggregate_report(Path(args.robustness_report), domain_robustness_report)
 
     imbalance_ablation_report = None
     if getattr(args, "imbalance_ablation", False):
@@ -478,6 +494,7 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     # like --leave-one-source-out, just with the richer both-task/all-
     # model-kind protocol and (optionally) domain-robust training.
     domain_robustness_report = None
+    is_ablation_report = False
     if getattr(args, "domain_strategy", None) is not None or getattr(args, "domain_robustness_ablation", False):
         bench_cfg = context.config.get("benchmarks", {})
         loso_kwargs = dict(
@@ -490,6 +507,7 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             domain_robustness_report = run_domain_robustness_ablation(
                 context, "cancer", args.models, device=args.device, seed=args.seeds[0], **loso_kwargs,
             )
+            is_ablation_report = True
         else:
             domain_cfg = _domain_robustness_config_from_args(context, args)
             per_source = run_cancer_source_held_out(
@@ -501,9 +519,18 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
                 "cancer_prediction", args.models[0], domain_cfg["strategy"],
                 list(per_source.values()), primary_metric="auroc",
             )
-        write_json(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
-        if getattr(args, "robustness_report", None):
-            write_json(Path(args.robustness_report), domain_robustness_report)
+        # See run_smoke_task's identical branch for why ablation reports
+        # (a different top-level shape) use write_json while the plain
+        # aggregate goes through write_aggregate_report's full recursive
+        # validation at write time.
+        if is_ablation_report:
+            write_json(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
+            if getattr(args, "robustness_report", None):
+                write_json(Path(args.robustness_report), domain_robustness_report)
+        else:
+            write_aggregate_report(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
+            if getattr(args, "robustness_report", None):
+                write_aggregate_report(Path(args.robustness_report), domain_robustness_report)
 
     # ══════════════════════════════════════════════════════════════════════
     # STAGE A — development-only. Every call below may read train_bags/

@@ -2000,13 +2000,10 @@ report schema and several diagnostics were strengthened further:
 - **Task A multi-class uncertainty**: `PathwayHierarchicalAdapter.
   predict_smoke_proba` (softmax over `smoke_logits`) and
   `uncertainty.multiclass_predictive_uncertainty` (entropy, max class
-  probability) feed `source_held_out_diagnostics.smoke_uncertainty_report`,
-  which selects its abstention threshold from the dev-pool-fitted model's
-  own development predictions only (disclosed as in-sample, not
-  out-of-fold, in the report's own `note` field — this protocol does not
-  carry a per-fold OOF probability array through to this point) and reports
-  retained-subset macro-F1 as a secondary statistic; held-out-source labels
-  never influence the threshold.
+  probability) feed `source_held_out_diagnostics.smoke_uncertainty_report`.
+  As of §16.11, its development probabilities are GENUINE out-of-fold
+  predictions (`_smoke_candidate_dev_score`'s `oof_by_subject`), not the
+  dev-pool-fitted model's in-sample predictions — see §16.11.
 - **Terminology audit**: a repository-wide grep for
   biomarker/mechanistic/causal/"clinical validation"/"biological
   validation" language found no unguarded claim outside the existing,
@@ -2018,3 +2015,115 @@ report schema and several diagnostics were strengthened further:
   expanding a core model dataclass without one to test against was judged
   higher-risk than the benefit for this phase. Every concrete module-based
   result therefore remains `is_synthetic_modules=True`.
+
+### 16.11 Enforced schema validation, candidate-kind identity rules, genuine smoke OOF uncertainty, honest gene coverage, and disabled real-module mode
+
+A further independent review of the §16.10 diff found eight remaining
+issues, addressed as follows:
+
+- **Enforced validation, not test-only.** `build_aggregate_report`
+  (`robustness_report.py`) now calls `validate_per_source_reports` — which
+  runs `validate_robustness_report` + `validate_report_fingerprint_unchanged`
+  on every entry — BEFORE assembling the aggregate, and
+  `validate_aggregate_report` (schema/version/stamps + a recursive check of
+  every nested per-source report) runs again before `build_aggregate_report`
+  returns. `run_domain_robustness_ablation` (a different report shape —
+  per-seed variant results, not a flat `per_source_reports` list) validates
+  every per-source report the same way at construction time, before it
+  enters its own results structure. `runner.py` persists the plain
+  aggregate via the new `write_aggregate_report` (atomic write + reload +
+  full recursive validation, mirroring `write_robustness_report`'s
+  contract) instead of the generic `write_json`; an ablation report (a
+  materially different shape) still uses `write_json`, but its own child
+  reports were already validated at construction. A CLI-level test
+  (`test_malformed_per_source_report_blocks_real_cli_persistence`)
+  monkeypatches `run_cancer_source_held_out` to return one report with
+  `module_fingerprint=None` and asserts a real `main([...])` invocation
+  raises `RobustnessReportValidationError` and never writes the output
+  file — proving the production path enforces this, not only a unit test
+  of the validator.
+- **Candidate-kind-aware identity rules.** Schema v2's
+  `_REQUIRED_WHEN_EVALUATED` no longer includes `module_fingerprint`
+  unconditionally (which rejected every legitimate classical-baseline
+  report). A new `is_module_based_candidate: bool` field (stamped by the
+  caller — `source_held_out.py` sets it `True` only when
+  `best_name == PATHWAY_MODEL_NAME`) drives the rule: an evaluated report
+  with `is_module_based_candidate=True` must record a real
+  `module_fingerprint`; one with `False` must record a structured
+  `not_applicable` module identity — a real hash there is now itself
+  rejected as scientifically meaningless for a candidate with no
+  gene-module structure. `preprocessing_fingerprint`/`gene_list_fingerprint`/
+  `model_fingerprint`/`source_policy_fingerprint`/
+  `source_split_manifest_fingerprint`/`environment_fingerprint` remain
+  required for every evaluated report regardless of candidate kind;
+  `domain_head_fingerprint`/`domain_vocabulary_fingerprint` remain required
+  only for `strategy=domain_adversarial`; `calibration_fingerprint`/
+  `threshold_policy_fingerprint` remain required only when `calibration` is
+  non-empty (cancer reports are always calibrated; smoke reports never
+  are).
+- **Genuine out-of-fold smoke uncertainty.** `_smoke_candidate_dev_score`
+  (`source_held_out.py`) now returns `oof_by_subject` — a per-subject,
+  fixed-`num_classes`-width probability vector collected from whichever
+  grouped-CV fold that subject was held out of (never a fold it also
+  trained on; a subject appearing in more than one fold's validation set
+  raises `RuntimeError` rather than silently overwriting an entry).
+  `_align_proba_to_full_classes` re-embeds a fold's `predict_proba` output
+  (whose columns cover only `model.classes_`, since a small fold can
+  legitimately miss a class) into the full, fixed class axis. The winning
+  candidate's `oof_by_subject` (captured during the same dev-only sweep
+  that selected it, never recomputed against the final dev-pool-fitted
+  model) is what `smoke_uncertainty_report` uses to select its abstention
+  threshold — `oof_by_subject` itself is popped out of `candidate_scores`/
+  `comparisons` before those are embedded in the persisted report, since it
+  carries raw subject IDs. `smoke_uncertainty_report`'s "in-sample, not
+  out-of-fold" disclosure note is removed; it now documents the OOF
+  guarantee instead.
+- **Honest gene coverage.** `domain_shift.gene_space_compatibility` no
+  longer accepts a bare self-vs-self call — `present_genes=None` (the
+  default at every current call site, since this pipeline unifies every
+  source onto one shared gene space at ingestion time, before any
+  per-source raw panel would even be distinguishable) returns
+  `{"status": "not_evaluable", "reason": "raw source-specific gene contract
+  unavailable"}` rather than a fabricated 100%-compatible result. When a
+  caller DOES supply a real `present_genes` list, the function performs a
+  real missing/unexpected/duplicate-mapping/order/coverage computation
+  (tested directly with a synthetic gene panel deliberately missing several
+  required genes, confirming reduced coverage while the required
+  development gene list itself is never mutated).
+  `cancer_domain_shift_report`/`smoke_domain_shift_report` gained an
+  optional `held_out_raw_gene_list` pass-through parameter for whenever
+  raw per-source gene identities do become available; no current caller
+  supplies one.
+- **Disabled real-module mode.** `cancer_biological_stability_report` now
+  checks module-source syntheticness FIRST: a non-synthetic (real) module
+  source returns `{"status": "unsupported", "scope":
+  "unsupported_real_module_analysis", ...}` immediately, before running any
+  ablation/permutation diagnostic, rather than ever emitting
+  `scope: "real_module_sensitivity_analysis"` — `GeneModuleCollection` does
+  not yet implement the full provenance contract (organism, namespace,
+  mapping policy, license, checksum, ordered module fingerprint, coverage
+  policy) real-module analysis would require, so real-module analysis is
+  disabled entirely rather than partially documented.
+- **Perturbation call-order proof.** `within_gene_expression_permutation_
+  null`'s docstring now states explicitly that it reads held-out
+  EXPRESSION for post-fit sensitivity analysis, never held-out LABELS, and
+  runs strictly after candidate selection/final fit/calibration freeze/
+  held-out prediction generation.
+  `test_perturbation_diagnostics_run_only_after_development_freeze`
+  (`tests/test_source_held_out_diagnostics.py`) poisons the held-out bags'
+  expression, runs `cancer_biological_stability_report` against them, and
+  asserts the already-fitted candidate's `selected_params`/
+  `preprocessing_artifact_fingerprint`/`model_state_fingerprint` are
+  byte-for-byte unchanged — perturbation diagnostics cannot feed back into
+  model ranking or strategy selection because they never touch the fitted
+  candidate's own state.
+- **Test-suite audit for tautological assertions.** The one
+  `assert reloaded["report_fingerprint"] == fp1 or True` (a always-true
+  expression) was replaced with independent checks of `report_fingerprint`
+  (a content hash, re-derived and compared against `report.fingerprint()`)
+  and `file_sha256` (`write_robustness_report`'s return value, a hash of
+  the serialized file's raw bytes) — the two are asserted unequal, since
+  they hash different inputs. An AST-based sweep of every test function
+  touched across this and the two prior remediation passes found no other
+  unconditional, tautological, or assert-free test beyond legitimate
+  "must not raise" smoke checks.

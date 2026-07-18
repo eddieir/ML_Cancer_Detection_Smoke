@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .robustness_report import aggregate_source_reports
+from .robustness_report import aggregate_source_reports, validate_per_source_reports
 from .source_held_out import run_cancer_source_held_out, run_smoke_source_held_out
 
 # Required comparison strategies (Step 27). "domain_adversarial" is included
@@ -92,6 +92,12 @@ def run_domain_robustness_ablation(
                     reference_species=reference_species, reference_assay_mode=reference_assay_mode,
                 )
             reports_list = list(per_source.values())
+            # Validate every per-source report BEFORE it enters this
+            # ablation's own results structure — this is the production
+            # enforcement point, since run_domain_robustness_ablation's
+            # report shape is not a build_aggregate_report() aggregate and
+            # so is not covered by that function's internal validation.
+            validate_per_source_reports(reports_list)
             agg = aggregate_source_reports(reports_list, primary_metric)
             per_seed[s] = {"per_source": per_source, "aggregate": agg}
         results[variant_name] = {"per_seed": per_seed}

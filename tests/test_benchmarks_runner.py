@@ -50,6 +50,40 @@ def test_synthetic_smoke_task_with_leave_one_source_out():
     shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
 
 
+def test_malformed_per_source_report_blocks_real_cli_persistence(monkeypatch):
+    """Injects one malformed per-source identity into a REAL CLI run
+    (main(...), not a unit-level call to the validator) and proves the run
+    raises rather than silently persisting a broken robustness-report JSON
+    — schema-v2 validation is enforced by the production path itself, not
+    only by tests that remember to call it."""
+    import benchmarks.runner as runner_module
+    from benchmarks.robustness_report import RobustnessReportValidationError
+
+    real_run_cancer_source_held_out = runner_module.run_cancer_source_held_out
+
+    def _corrupting_run_cancer_source_held_out(*args, **kwargs):
+        reports = real_run_cancer_source_held_out(*args, **kwargs)
+        # Corrupt exactly one real per-source report's identity: a bare
+        # None is never a valid value for any identity field.
+        first_key = next(iter(reports))
+        reports[first_key] = dict(reports[first_key])
+        reports[first_key]["module_fingerprint"] = None
+        return reports
+
+    monkeypatch.setattr(runner_module, "run_cancer_source_held_out", _corrupting_run_cancer_source_held_out)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(RobustnessReportValidationError):
+            main([
+                "--synthetic", "--fast", "--task", "cancer", "--domain-strategy", "erm",
+                "--output", tmp, "--run-id", "corrupted_run",
+            ])
+        # The aggregate report must never have been written — persistence
+        # failed before any bytes reached disk for this file.
+        assert not (Path(tmp) / "corrupted_run" / "metrics" / "domain_robustness_cancer.json").exists()
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
 def test_run_id_collision_raises_not_overwrites():
     with tempfile.TemporaryDirectory() as tmp:
         _run(["--synthetic", "--fast", "--task", "smoke", "--output", tmp, "--run-id", "dup"])

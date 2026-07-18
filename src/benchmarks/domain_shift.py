@@ -29,18 +29,47 @@ def _to_tensor(x: np.ndarray):
 
 # ─── Gene-space compatibility ───────────────────────────────────────────────
 
-def gene_space_compatibility(required_genes: Sequence[str], present_genes: Sequence[str]) -> Dict:
+def gene_space_compatibility(
+    required_genes: Sequence[str], present_genes: Optional[Sequence[str]],
+) -> Dict:
+    """
+    required_genes: the frozen development artifact's own ordered gene list
+    (never affected by anything computed here). present_genes: the
+    held-out source's RAW, pre-alignment gene identities, captured BEFORE
+    the frozen transform — never the required list itself (a required-vs-
+    required call would be self-vs-self and always report 100% coverage,
+    which is not a real measurement).
+
+    present_genes=None means raw source-specific gene provenance was not
+    captured at this call site (this pipeline currently unifies every
+    source onto one shared gene space at ingestion time, before any
+    per-source raw panel would even be distinguishable — see
+    ARCHITECTURE.md §16.10) — returns a structured not_evaluable status
+    rather than a fabricated 100%-compatible result.
+    """
+    if present_genes is None:
+        return {
+            "status": "not_evaluable",
+            "reason": "raw source-specific gene contract unavailable",
+        }
     required = list(required_genes)
-    present_set = set(present_genes)
+    present = list(present_genes)
+    present_set = set(present)
     required_set = set(required)
     missing = sorted(required_set - present_set)
     unexpected = sorted(present_set - required_set)
-    order_compatible = list(present_genes[:len(required)]) == required if len(present_genes) >= len(required) else False
+    seen: Dict[str, int] = {}
+    for g in present:
+        seen[g] = seen.get(g, 0) + 1
+    duplicate_mappings = sorted(g for g, c in seen.items() if c > 1)
+    order_compatible = present[:len(required)] == required if len(present) >= len(required) else False
     coverage = 1.0 - (len(missing) / len(required)) if required else 1.0
     return {
-        "n_required_genes": len(required), "n_present_genes": len(present_genes),
+        "status": "evaluated",
+        "n_required_genes": len(required), "n_present_genes": len(present),
         "n_missing_genes": len(missing), "missing_genes": missing[:50],
         "n_unexpected_genes": len(unexpected), "unexpected_genes": unexpected[:50],
+        "n_duplicate_mappings": len(duplicate_mappings), "duplicate_mappings": duplicate_mappings[:50],
         "gene_coverage": coverage, "gene_order_compatible": order_compatible,
     }
 

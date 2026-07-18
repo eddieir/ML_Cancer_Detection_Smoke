@@ -96,6 +96,61 @@ def test_biological_stability_report_labels_synthetic_modules(fixture):
     assert "label_permutation_null" in report
 
 
+def test_perturbation_diagnostics_run_only_after_development_freeze(fixture):
+    """Poisoned-policy proof: biological_stability's perturbation
+    diagnostics (module ablation, gene-module permutation, within-gene
+    expression permutation) run against ALREADY-FROZEN state — candidate
+    selection, the final development-pool fit, and calibration/threshold
+    freezing all already happened by the time `fitted` exists (this
+    fixture builds it via fit_final_candidate_on_dev_pool, exactly like
+    source_held_out.py's real call site). Poisoning the held-out bags'
+    expression AFTER that point must never change the frozen candidate's
+    own identity (selected hyperparameters, preprocessing fingerprint,
+    fitted model weights) — perturbation diagnostics read held-out data,
+    they never write back into it."""
+    fitted = fixture["fitted"]
+    before_selected_params = dict(fitted.selected_params)
+    before_preprocessing_fp = fitted.preprocessing_artifact_fingerprint
+    before_model_fp = fitted.model_state_fingerprint
+
+    poisoned_bags = []
+    rng = np.random.RandomState(0)
+    for b in fixture["held_out_bags"]:
+        poisoned = dict(b)
+        poisoned["gene_matrix"] = rng.randn(*np.asarray(b["gene_matrix"]).shape).astype(np.float32)
+        poisoned_bags.append(poisoned)
+
+    report = cancer_biological_stability_report(
+        fixture["context"], fitted, fixture["dev_bags"], poisoned_bags,
+        fixture["outcomes"], fixture["num_cell_types"], fixture["min_cells"], seed=1,
+    )
+    assert "module_ablation_scores" in report  # the diagnostic still ran against the poisoned data
+
+    # The frozen candidate itself — the one thing a real leakage bug would
+    # have to alter — is byte-for-byte unchanged after the perturbation
+    # diagnostics ran against poisoned held-out data.
+    assert fitted.selected_params == before_selected_params
+    assert fitted.preprocessing_artifact_fingerprint == before_preprocessing_fp
+    assert fitted.model_state_fingerprint == before_model_fp
+
+
+def test_biological_stability_real_module_mode_disabled_without_provenance_contract(fixture, monkeypatch):
+    """A real (non-synthetic) module source must be REJECTED — no
+    complete provenance contract (organism, namespace, mapping policy,
+    license, checksum, ordered module fingerprint, coverage policy) is
+    implemented yet, so real-module analysis is disabled entirely rather
+    than emitting scope='real_module_sensitivity_analysis' without it."""
+    monkeypatch.setattr(fixture["fitted"].predictor.modules, "source_name", "some_real_resource.gmt")
+    report = cancer_biological_stability_report(
+        fixture["context"], fixture["fitted"], fixture["dev_bags"], fixture["held_out_bags"],
+        fixture["outcomes"], fixture["num_cell_types"], fixture["min_cells"], seed=1,
+    )
+    assert report["status"] == "unsupported"
+    assert report["is_synthetic_modules"] is False
+    assert report["scope"] == "unsupported_real_module_analysis"
+    assert "module_ablation_scores" not in report
+
+
 def test_biological_stability_cross_run_stability_insufficient_evidence_by_default(fixture):
     """With no extra_seeds, cross_run_stability must never be fabricated
     from repeated calls to the one already-fitted model."""
