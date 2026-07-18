@@ -17,7 +17,7 @@ step to do here.
 """
 
 import time
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -29,6 +29,15 @@ from pathway_hierarchical_mil import (
     PathwayHierarchicalMIL,
     PathwayHierarchicalMILConfig,
     collate_subject_bags,
+)
+from .domain_losses import (
+    DomainClassifierHead,
+    DomainLossConfigurationError,
+    coral_loss,
+    domain_adversarial_loss,
+    group_embeddings_by_source,
+    mmd_loss,
+    resolve_domain_robustness_config,
 )
 
 MODEL_NAME = "pathway_hierarchical_mil"
@@ -129,7 +138,15 @@ def bags_to_pathway_batch(bags: Sequence[dict]) -> Dict[str, torch.Tensor]:
             cancer_label=torch.tensor(float(cancer_label) if cancer_known else 0.0, dtype=torch.float32),
             cancer_known=torch.tensor(cancer_known, dtype=torch.bool),
         ))
-    return collate_subject_bags(prepared)
+    batch = collate_subject_bags(prepared)
+    # Development-source label per subject, in the SAME bag order as every
+    # other field above — used only by domain-robustness regularizers
+    # (coral/mmd/domain_adversarial), never by the primary task heads. A bag
+    # with no recorded source (legacy/synthetic caller) reports "unknown",
+    # which domain-robustness code must treat as its own explicit source
+    # bucket, never silently merged into another one.
+    batch["source"] = [str(b.get("source") or "unknown") for b in bags]
+    return batch
 
 
 class PathwayHierarchicalAdapter:
@@ -144,13 +161,25 @@ class PathwayHierarchicalAdapter:
 
     name = MODEL_NAME
 
-    def __init__(self, device: str = "cpu", config_overrides: Optional[Dict] = None):
+    def __init__(
+        self, device: str = "cpu", config_overrides: Optional[Dict] = None,
+        domain_robustness_config: Optional[Dict] = None,
+    ):
         self.device = device
         self.config_overrides = dict(config_overrides or {})
         self.config: Optional[PathwayHierarchicalMILConfig] = None
         self.modules: Optional[GeneModuleCollection] = None
         self.model: Optional[PathwayHierarchicalMIL] = None
         self.fit_seconds: Optional[float] = None
+        # Development-only domain-robustness strategy — see domain_losses.py.
+        # Defaults to plain ERM (every regularizer disabled, weight 0.0) when
+        # not supplied, so every existing caller of this adapter (CV, OOF,
+        # final dev-pool fit, LOSO baselines) is completely unaffected unless
+        # it explicitly opts in.
+        self.domain_robustness = resolve_domain_robustness_config(domain_robustness_config)
+        self.domain_head: Optional[DomainClassifierHead] = None
+        self.domain_source_vocabulary: Optional[List[str]] = None
+        self.last_loss_components: Dict[str, float] = {}
 
     def _build(self, context, num_smoke: int) -> None:
         gene_list = list(context.preprocessing_artifact.gene_list)
@@ -164,28 +193,111 @@ class PathwayHierarchicalAdapter:
         self.config = PathwayHierarchicalMILConfig.from_dict(base)
         self.model = PathwayHierarchicalMIL(self.modules, self.config, num_smoke=num_smoke).to(self.device)
 
+    def _maybe_build_domain_head(self, sources: Sequence[str]) -> None:
+        """Development-source vocabulary is fixed the FIRST time this
+        adapter is trained (never rebuilt per epoch, never extended with a
+        source seen only later) — see DomainClassifierHead. Only built at
+        all when the adversarial strategy is actually enabled, so ERM /
+        coral / mmd / source_balanced runs never pay for or persist an
+        unused domain head."""
+        if self.domain_robustness["strategy"] != "domain_adversarial":
+            return
+        if not self.domain_robustness["adversarial"]["enabled"]:
+            raise DomainLossConfigurationError(
+                "domain_robustness.strategy='domain_adversarial' requires "
+                "domain_robustness.adversarial.enabled=true (with a weight > 0) — a strategy name "
+                "alone does not implicitly enable its regularizer."
+            )
+        if self.domain_head is None:
+            unique_sources = sorted(set(str(s) for s in sources))
+            self.domain_source_vocabulary = unique_sources
+            self.domain_head = DomainClassifierHead(self.config.embedding_dim, unique_sources).to(self.device)
+
+    def _domain_regularizer(
+        self, subject_embeddings: torch.Tensor, sources: Sequence[str], epoch: int,
+    ) -> "torch.Tensor":
+        """Adds whichever development-only regularizer this adapter's
+        domain_robustness config selects to the primary task loss. Returns a
+        zero (but differentiable, when applicable) tensor for 'erm' and
+        'source_balanced' — the latter changes SAMPLING, not the loss
+        function, so it has no additional loss term here."""
+        strategy = self.domain_robustness["strategy"]
+        device = subject_embeddings.device
+        zero = torch.zeros((), device=device)
+        if strategy in ("erm", "source_balanced"):
+            return zero
+
+        if strategy == "coral":
+            cfg = self.domain_robustness["coral"]
+            if not cfg["enabled"] or cfg["weight"] == 0.0:
+                return zero
+            grouped = group_embeddings_by_source(subject_embeddings, sources)
+            loss, meta = coral_loss(grouped)
+            self.last_loss_components["coral_loss"] = float(loss.detach().item())
+            self.last_loss_components.update({f"coral_{k}": v for k, v in meta.items()})
+            return cfg["weight"] * loss
+
+        if strategy == "mmd":
+            cfg = self.domain_robustness["mmd"]
+            if not cfg["enabled"] or cfg["weight"] == 0.0:
+                return zero
+            grouped = group_embeddings_by_source(subject_embeddings, sources)
+            loss, meta = mmd_loss(grouped, kernel=cfg["kernel"])
+            self.last_loss_components["mmd_loss"] = float(loss.detach().item())
+            self.last_loss_components.update({f"mmd_{k}": v for k, v in meta.items()})
+            return cfg["weight"] * loss
+
+        if strategy == "domain_adversarial":
+            cfg = self.domain_robustness["adversarial"]
+            if not cfg["enabled"] or cfg["weight"] == 0.0 or self.domain_head is None:
+                return zero
+            if epoch < cfg["warmup_epochs"]:
+                # Deterministic warm-up: the encoder is never adversarially
+                # regularized before warmup_epochs has elapsed, so the
+                # primary task heads get a stable representation to start
+                # from — same schedule every run for a fixed config, not a
+                # random or data-dependent one.
+                return zero
+            loss, meta = domain_adversarial_loss(
+                self.domain_head, subject_embeddings, sources, lambda_=cfg["gradient_reversal_lambda"],
+            )
+            self.last_loss_components["domain_adversarial_loss"] = float(loss.detach().item())
+            self.last_loss_components["domain_accuracy"] = meta["domain_accuracy"]
+            return cfg["weight"] * loss
+
+        raise DomainLossConfigurationError(f"Unhandled domain_robustness.strategy={strategy!r}")
+
     def _train_loop(self, bags: Sequence[dict], epochs: int, seed: int) -> None:
         torch.manual_seed(seed)
         batch = bags_to_pathway_batch(bags)
+        sources = batch["source"]
+        self._maybe_build_domain_head(sources)
         loss_fn = MultitaskMaskedLoss(
             smoke_loss_weight=self.config.smoke_loss_weight,
             cancer_loss_weight=self.config.cancer_loss_weight,
             empty_batch_policy=self.config.empty_batch_policy,
         )
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=DEFAULT_LR)
+        params = list(self.model.parameters())
+        if self.domain_head is not None:
+            params += list(self.domain_head.parameters())
+        optimizer = torch.optim.AdamW(params, lr=DEFAULT_LR)
         self.model.train()
         expression = batch["expression"].to(self.device)
         cell_type_ids = batch["cell_type_ids"].to(self.device)
         cell_mask = batch["cell_mask"].to(self.device)
-        for _ in range(max(epochs, 1)):
+        for epoch in range(max(epochs, 1)):
             optimizer.zero_grad()
             out = self.model(expression, cell_type_ids, cell_mask)
-            total, _ = loss_fn(
+            task_loss, _ = loss_fn(
                 out.smoke_logits, batch["smoke_label"].to(self.device), batch["smoke_known"].to(self.device),
                 out.cancer_logits, batch["cancer_label"].to(self.device), batch["cancer_known"].to(self.device),
             )
+            domain_term = self._domain_regularizer(out.subject_embeddings, sources, epoch)
+            total = task_loss + domain_term
+            self.last_loss_components["task_loss"] = float(task_loss.detach().item())
+            self.last_loss_components["total_loss"] = float(total.detach().item())
             total.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), DEFAULT_GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(params, DEFAULT_GRAD_CLIP)
             optimizer.step()
 
     def fit(
@@ -259,6 +371,9 @@ class PathwayHierarchicalAdapter:
             "module_source_name": self.modules.source_name if self.modules else None,
             "module_coverage": self.modules.coverage_report() if self.modules else None,
             "config": dict(self.config.__dict__) if self.config else dict(self.config_overrides),
+            "domain_robustness": self.domain_robustness,
+            "domain_source_vocabulary": self.domain_source_vocabulary,
+            "last_loss_components": dict(self.last_loss_components),
         }
 
     def model_state_fingerprint(self) -> str:

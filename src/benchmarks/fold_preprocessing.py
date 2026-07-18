@@ -343,6 +343,17 @@ def bags_from_fold_cell_dataset(
         if mask.sum() < min_cells_per_subject:
             continue
         outcome = outcomes_by_subject.get(str(sid))
+        bag_source = None
+        if fold_cell_dataset.dataset_source is not None:
+            srcs = np.asarray(fold_cell_dataset.dataset_source)[mask]
+            if len(srcs) > 0:
+                # A subject is expected to have a single dataset_source across
+                # all its cells (see ood.py::_find_cross_source_subjects,
+                # which rejects the opposite upstream) — take the majority
+                # value defensively rather than asserting here, since this
+                # constructor has no access to raise a data-assembly error.
+                vals, counts = np.unique(srcs, return_counts=True)
+                bag_source = str(vals[np.argmax(counts)])
         bags.append({
             "subject_id": sid,
             "gene_matrix": fold_cell_dataset.X[mask].numpy(),
@@ -353,5 +364,6 @@ def bags_from_fold_cell_dataset(
             "malig_known": fold_cell_dataset.malig_known[mask].numpy(),
             "cancer_label": outcome,
             "cancer_label_known": outcome is not None,
+            "source": bag_source,
         })
     return bags
