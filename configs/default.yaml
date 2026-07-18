@@ -207,6 +207,47 @@ model:
       empty_module_policy: error
       allow_synthetic_modules: false
 
+benchmarks:
+  # Phase 6 — source-held-out domain robustness evaluation and optional
+  # development-only domain-robust training strategies for
+  # pathway_hierarchical_mil (src/benchmarks/domain_losses.py,
+  # source_held_out.py). This is entirely separate from the frozen final
+  # test split (data.split / preprocessing.batch_correction above,
+  # src/benchmarks/test_guard.py): source-held-out evaluation only ever
+  # touches train+val-pool subjects and never acquires the frozen-test
+  # guard. Disabled/ERM by default — enabling this changes evaluation
+  # reporting and (optionally) training-time regularization, never the
+  # frozen-test protocol itself.
+  domain_robustness:
+    enabled: false
+    strategy: erm  # erm | source_balanced | coral | mmd | domain_adversarial
+    outer_protocol: leave_one_source_out
+    inner_protocol: source_aware
+    minimum_subjects_per_source: 3
+    minimum_classes_per_source: 2
+    report_worst_source: true
+    source_balancing:
+      enabled: false
+    coral:
+      enabled: false
+      weight: 0.0
+    mmd:
+      enabled: false
+      weight: 0.0
+      kernel: rbf
+    adversarial:
+      enabled: false
+      weight: 0.0
+      warmup_epochs: 0
+      gradient_reversal_lambda: 0.0
+    uncertainty:
+      enabled: true
+      abstention_analysis: false
+    biological_stability:
+      enabled: true
+      top_k: 10
+      permutation_runs: 20
+
 train:
   phase1_epochs: 15
   phase1_lr: 1.0e-3

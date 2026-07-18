@@ -56,6 +56,10 @@ from .reporting import compare_models, new_run_dir, write_benchmark_report, writ
 from .ood import run_leave_one_source_out
 from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError, default_guard_dir
 from data.transforms import assert_batch_correction_safe
+from .domain_losses import resolve_domain_robustness_config
+from .domain_robustness_ablation import run_domain_robustness_ablation
+from .robustness_report import aggregate_source_reports, build_aggregate_report
+from .source_held_out import run_cancer_source_held_out, run_smoke_source_held_out
 
 
 def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentContext:
@@ -204,6 +208,37 @@ def _run_manifest(context: ExperimentContext, seeds: List[int], synthetic: bool,
     }
 
 
+def _domain_robustness_config_from_args(context, args) -> dict:
+    """
+    Merge configs/default.yaml's benchmarks.domain_robustness section
+    (already-declared defaults: ERM, every regularizer disabled) with
+    explicit CLI overrides. CLI flags always win over the config file when
+    given, so `--domain-strategy coral --coral-weight 0.1` works even
+    against a config whose file only declares the section's defaults.
+    Unsupported flag combinations (e.g. --coral-weight without
+    --domain-strategy coral) are NOT silently ignored — they are recorded
+    in the resolved config and will simply have no effect, which
+    resolve_domain_robustness_config's own validation does not reject
+    since a declared-but-unused weight is not a contradiction, only a
+    likely user mistake; --domain-robustness-ablation runs every strategy
+    regardless of --domain-strategy, so this combination is not an error.
+    """
+    base = dict(context.config.get("benchmarks", {}).get("domain_robustness", {}) or {})
+    if args.domain_strategy is not None:
+        base["strategy"] = args.domain_strategy
+    if args.source_balanced:
+        base["source_balancing"] = dict(base.get("source_balancing", {}), enabled=True)
+    if args.coral_weight is not None:
+        base["coral"] = dict(base.get("coral", {}), enabled=True, weight=args.coral_weight)
+    if args.mmd_weight is not None:
+        base["mmd"] = dict(base.get("mmd", {}), enabled=True, weight=args.mmd_weight)
+    if args.domain_loss_weight is not None and base.get("strategy") == "domain_adversarial":
+        base["adversarial"] = dict(base.get("adversarial", {}), enabled=True, weight=args.domain_loss_weight)
+    if args.gradient_reversal_lambda is not None:
+        base["adversarial"] = dict(base.get("adversarial", {}), gradient_reversal_lambda=args.gradient_reversal_lambda)
+    return resolve_domain_robustness_config(base)
+
+
 def run_smoke_task(context, args, run_dir) -> dict:
     eligibility = {"smoke_classification": check_task_a_eligibility(context)}
     if not eligibility["smoke_classification"].eligible:
@@ -229,8 +264,34 @@ def run_smoke_task(context, args, run_dir) -> dict:
             species_by_source=bench_cfg.get("species_by_source"),
             reference_species=bench_cfg.get("reference_species"),
         )
-        from .reporting import write_json
         write_json(run_dir / "metrics" / "leave_one_source_out.json", ood_report)
+
+    # Phase 6 — richer source-held-out protocol (both classical baselines
+    # and, if requested, pathway_hierarchical_mil), reported separately from
+    # the pre-existing --leave-one-source-out path above. Never touches the
+    # frozen-test guard (see source_held_out.py's module docstring).
+    domain_robustness_report = None
+    if getattr(args, "domain_strategy", None) is not None or getattr(args, "domain_robustness_ablation", False):
+        bench_cfg = context.config.get("benchmarks", {})
+        loso_kwargs = dict(
+            incompatible_sources=bench_cfg.get("incompatible_sources"),
+            species_by_source=bench_cfg.get("species_by_source"),
+            reference_species=bench_cfg.get("reference_species"),
+        )
+        if getattr(args, "domain_robustness_ablation", False):
+            domain_robustness_report = run_domain_robustness_ablation(
+                context, "smoke", args.models, device=args.device, seed=args.seeds[0], **loso_kwargs,
+            )
+        else:
+            per_source = run_smoke_source_held_out(context, args.models, device=args.device, seed=args.seeds[0],
+                                                     **loso_kwargs)
+            domain_robustness_report = build_aggregate_report(
+                "smoke_classification", args.models[0], _domain_robustness_config_from_args(context, args)["strategy"],
+                list(per_source.values()), primary_metric="macro_f1",
+            )
+        write_json(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
+        if getattr(args, "robustness_report", None):
+            write_json(Path(args.robustness_report), domain_robustness_report)
 
     imbalance_ablation_report = None
     if getattr(args, "imbalance_ablation", False):
@@ -254,7 +315,8 @@ def run_smoke_task(context, args, run_dir) -> dict:
     return {"eligibility": eligibility, "cv_reports": {"smoke_classification": cv_report},
             "comparisons": comparisons, "ood_report": ood_report,
             "imbalance_ablation_report": imbalance_ablation_report,
-            "pathway_hierarchical_ablation_report": pathway_hierarchical_ablation_report}
+            "pathway_hierarchical_ablation_report": pathway_hierarchical_ablation_report,
+            "domain_robustness_report": domain_robustness_report}
 
 
 def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outcomes_by_subject,
@@ -401,6 +463,37 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             continue
         comparisons.append(compare_models(cv_report["results"], "auroc", name, baseline_ref))
 
+    # Phase 6 — source-held-out domain robustness (development-only,
+    # structurally cannot touch the frozen-test guard below — see
+    # source_held_out.py). Runs entirely over the train+val pool, exactly
+    # like --leave-one-source-out, just with the richer both-task/all-
+    # model-kind protocol and (optionally) domain-robust training.
+    domain_robustness_report = None
+    if getattr(args, "domain_strategy", None) is not None or getattr(args, "domain_robustness_ablation", False):
+        bench_cfg = context.config.get("benchmarks", {})
+        loso_kwargs = dict(
+            incompatible_sources=bench_cfg.get("incompatible_sources"),
+            species_by_source=bench_cfg.get("species_by_source"),
+            reference_species=bench_cfg.get("reference_species"),
+        )
+        if getattr(args, "domain_robustness_ablation", False):
+            domain_robustness_report = run_domain_robustness_ablation(
+                context, "cancer", args.models, device=args.device, seed=args.seeds[0], **loso_kwargs,
+            )
+        else:
+            domain_cfg = _domain_robustness_config_from_args(context, args)
+            per_source = run_cancer_source_held_out(
+                context, args.models, device=args.device, domain_robustness_config=domain_cfg,
+                seed=args.seeds[0], **loso_kwargs,
+            )
+            domain_robustness_report = build_aggregate_report(
+                "cancer_prediction", args.models[0], domain_cfg["strategy"],
+                list(per_source.values()), primary_metric="auroc",
+            )
+        write_json(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
+        if getattr(args, "robustness_report", None):
+            write_json(Path(args.robustness_report), domain_robustness_report)
+
     # ══════════════════════════════════════════════════════════════════════
     # STAGE A — development-only. Every call below may read train_bags/
     # val_bags and CV-report evidence, but NEVER context.test_bags, NEVER
@@ -423,7 +516,8 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     except NoEligibleFinalCandidateError as e:
         return {"eligibility": eligibility, "cv_reports": {"cancer_prediction": cv_report},
                 "comparisons": comparisons,
-                "calibration_report": {"selected_model": None, "error": str(e)}}
+                "calibration_report": {"selected_model": None, "error": str(e)},
+                "domain_robustness_report": domain_robustness_report}
 
     pooling = pooling_for.get(best_name, args.pooling or "attention")
     seed = args.seeds[0]
@@ -587,7 +681,8 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
     }
 
     return {"eligibility": eligibility, "cv_reports": {"cancer_prediction": cv_report},
-            "comparisons": comparisons, "calibration_report": calibration_report}
+            "comparisons": comparisons, "calibration_report": calibration_report,
+            "domain_robustness_report": domain_robustness_report}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -627,6 +722,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     # publication run) skip the durable guard. Using it without --synthetic
     # is refused by run_cancer_task, not silently honored.
     parser.add_argument("--disable-frozen-test-guard", action="store_true")
+
+    # ── Phase 6: source-held-out domain robustness ─────────────────────
+    # --leave-one-source-out (above) is the pre-existing Task A classical-
+    # baseline-only external-domain diagnostic (benchmarks/ood.py) and
+    # remains unchanged. --domain-strategy (and any of the flags below it)
+    # additionally runs the richer, both-task, all-model-kind source-held-
+    # out protocol (benchmarks/source_held_out.py) — a development-only
+    # DIAGNOSTIC EVALUATION of external-domain robustness, structurally
+    # separate from, and never consuming, the one-shot frozen final test
+    # guard (test_guard.py) evaluated later in this same run.
+    parser.add_argument("--domain-strategy", type=str, default=None,
+                         choices=["erm", "source_balanced", "coral", "mmd", "domain_adversarial"])
+    parser.add_argument("--domain-robustness-ablation", action="store_true")
+    parser.add_argument("--source-balanced", action="store_true")
+    parser.add_argument("--coral-weight", type=float, default=None)
+    parser.add_argument("--mmd-weight", type=float, default=None)
+    parser.add_argument("--domain-loss-weight", type=float, default=None)
+    parser.add_argument("--gradient-reversal-lambda", type=float, default=None)
+    parser.add_argument("--robustness-report", type=str, default=None,
+                         help="Path to write the aggregate cross-source robustness report JSON.")
     args = parser.parse_args(argv)
 
     if args.synthetic:
