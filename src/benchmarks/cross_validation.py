@@ -32,6 +32,7 @@ from train import (
     MILEligibilityError,
     SubjectLevelDataset,
     assert_disjoint_subjects,
+    check_mil_eligibility,
     validate_experiment_partitions,
 )
 
@@ -52,7 +53,9 @@ from .metrics import (
     full_smoke_metrics_report,
     subject_weighted_smoke_metrics,
 )
+from .mil_registry import MIL_CANDIDATE_NAMES, build_mil_adapter, pathway_search_space
 from .neural import NeuralCancerAdapter, NeuralSmokeAdapter
+from .pathway_hierarchical_adapter import MODEL_NAME as PATHWAY_MODEL_NAME
 
 DEFAULT_SEEDS = [42, 43, 44]
 
@@ -181,6 +184,68 @@ def _mil_fit_score_fn(context, pooling: str, device: str, outcomes_by_subject: d
     return fn
 
 
+def _pathway_smoke_fit_score_fn(context, device: str, num_classes: int, fast: bool = False):
+    """fit_score_fn for pathway_hierarchical_mil on Task A: bags are built
+    with min_cells_per_subject=1 (one-cell bags are a supported case for
+    this architecture — see pathway_hierarchical_mil.py) and no cancer
+    outcomes (cancer_label_known=False for every bag; this candidate is
+    being scored purely on smoke-classification evidence). Score is
+    subject-level Macro-F1 restricted to subjects with a known majority
+    smoke label, matching build_smoke_subject_summary_features's own
+    subject-level convention."""
+    def fn(params, artifact, inner_train_ds, inner_val_ds, seed):
+        train_bags = bags_from_fold_cell_dataset(inner_train_ds, {}, min_cells_per_subject=1)
+        val_bags = bags_from_fold_cell_dataset(inner_val_ds, {}, min_cells_per_subject=1)
+        if not train_bags or not val_bags:
+            return None
+        train_sd = SubjectLevelDataset(train_bags, require_known_outcome=False)
+        val_sd = SubjectLevelDataset(val_bags, require_known_outcome=False)
+        fold_ctx = _fold_context(context, artifact, inner_train_ds, inner_val_ds)
+        adapter = build_mil_adapter(PATHWAY_MODEL_NAME, None, device, config_overrides=params)
+        adapter.fit(fold_ctx, inner_train_ds, inner_val_ds, train_sd, val_sd, seed=seed)
+        preds = adapter.predict_smoke(val_sd)
+        y_val, known = adapter.known_smoke_labels(val_sd)
+        if known.sum() == 0:
+            return None
+        return full_smoke_metrics_report(y_val[known], preds[known], num_classes)["macro_f1"]
+    return fn
+
+
+def _pathway_cancer_fit_score_fn(context, device: str, outcomes_by_subject: dict, min_cells: int):
+    """fit_score_fn for pathway_hierarchical_mil on Task B — mirrors
+    _mil_fit_score_fn's contract exactly (same bag construction, same
+    AUROC-or-None scoring), just dispatched through build_mil_adapter with
+    this candidate's architecture/loss-weight params instead of a fixed
+    pooling choice. check_mil_eligibility is called explicitly here (the
+    pooling-based MIL models get this same check for free inside
+    Trainer.phase2 — this adapter has no Trainer, so it is applied at the
+    call site instead) so a too-small/degenerate fold fails the same way
+    for every MIL-kind candidate."""
+    def fn(params, artifact, inner_train_ds, inner_val_ds, seed):
+        train_bags = bags_from_fold_cell_dataset(inner_train_ds, outcomes_by_subject, min_cells)
+        val_bags = bags_from_fold_cell_dataset(inner_val_ds, outcomes_by_subject, min_cells)
+        if not train_bags or not val_bags:
+            return None
+        train_sd = SubjectLevelDataset(train_bags)
+        val_sd = SubjectLevelDataset(val_bags)
+        try:
+            validate_experiment_partitions(
+                train_cell_dataset=inner_train_ds, val_cell_dataset=inner_val_ds,
+                train_subject_dataset=train_sd, val_subject_dataset=val_sd,
+            )
+            check_mil_eligibility(train_sd)
+            check_mil_eligibility(val_sd)
+            fold_ctx = _fold_context(context, artifact, inner_train_ds, inner_val_ds)
+            adapter = build_mil_adapter(PATHWAY_MODEL_NAME, None, device, config_overrides=params)
+            adapter.fit(fold_ctx, inner_train_ds, inner_val_ds, train_sd, val_sd, seed=seed)
+            proba = adapter.predict_proba(val_sd)
+            y_val_ordered = np.array([b["cancer_label"] for b in val_sd.bags])
+            return _auroc_or_none(y_val_ordered, proba)
+        except MILEligibilityError:
+            return None
+    return fn
+
+
 def _fold_context(context, artifact, train_cell_dataset, val_cell_dataset):
     """Shallow-copied ExperimentContext with the fold's own artifact/cell
     datasets swapped in, so Trainer.from_experiment_context builds a model
@@ -279,6 +344,40 @@ def run_smoke_cv(
                     fold_record["max_cells_per_subject"] = max_cells_per_subject
                     fold_record["n_cells_before_cap"] = {"train": len(train_ds), "val": len(val_ds)}
                     fold_record["n_cells_after_cap"] = {"train": len(train_ds_capped), "val": len(val_ds_capped)}
+                elif name == PATHWAY_MODEL_NAME:
+                    # Subject-level MIL bags for this fold — min_cells=1
+                    # (one-cell bags are a supported case for this
+                    # architecture), no cancer outcomes required (this is
+                    # the smoke task; cancer_label_known=False everywhere).
+                    train_bags = bags_from_fold_cell_dataset(train_ds, {}, min_cells_per_subject=1)
+                    val_bags = bags_from_fold_cell_dataset(val_ds, {}, min_cells_per_subject=1)
+                    train_sd = SubjectLevelDataset(train_bags, require_known_outcome=False)
+                    val_sd = SubjectLevelDataset(val_bags, require_known_outcome=False)
+
+                    pathway_hp = select_nested_hyperparameters_with_refit(
+                        context, fold["train"], label_by_subject,
+                        build_param_grid(pathway_search_space(fast=False)),
+                        fit_score_fn=_pathway_smoke_fit_score_fn(context, device, num_classes),
+                        seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                    )
+                    fold_context = _fold_context(context, artifact, train_ds, val_ds)
+                    adapter = build_mil_adapter(
+                        PATHWAY_MODEL_NAME, None, device, config_overrides=pathway_hp["selected_params"],
+                    )
+                    adapter.fit(fold_context, train_ds, val_ds, train_sd, val_sd, seed=seed)
+                    preds = adapter.predict_smoke(val_sd)
+                    y_val, known = adapter.known_smoke_labels(val_sd)
+                    cell_report = (
+                        full_smoke_metrics_report(y_val[known], preds[known], num_classes)
+                        if known.any() else full_smoke_metrics_report(np.array([]), np.array([]), num_classes)
+                    )
+                    subj_report = cell_report
+                    fold_record["hyperparameters"] = adapter.metadata()
+                    fold_record["hyperparameter_search"] = pathway_hp
+                    fold_record["evaluation_mode"] = "subject_mil"
+                    fold_record["feature_mode"] = "subject_mil"
+                    fold_record["module_fingerprint"] = adapter.modules.fingerprint() if adapter.modules else None
+                    fold_record["n_smoke_known_val_subjects"] = int(known.sum())
                 else:
                     # Nested, leakage-free hyperparameter selection ENTIRELY
                     # from this outer fold's own training subjects — never
@@ -355,7 +454,7 @@ def run_cancer_cv(
     subject_ids = np.array(known_subjects)
     y_full = np.array([outcomes_by_subject[s] for s in known_subjects])
 
-    mil_names = [n for n in model_names if n in ("neural", "mean_mil", "max_mil", "attention_mil")]
+    mil_names = [n for n in model_names if n in MIL_CANDIDATE_NAMES]
     baseline_names = [n for n in model_names if n not in mil_names]
     pooling_for = {
         "mean_mil": "mean", "max_mil": "max", "attention_mil": "attention", "neural": pooling or "attention",
@@ -415,18 +514,36 @@ def run_cancer_cv(
                         train_cell_dataset=train_cell_ds, val_cell_dataset=val_cell_ds,
                         train_subject_dataset=train_sd, val_subject_dataset=val_sd,
                     )
-                    mil_hp = select_nested_hyperparameters_with_refit(
-                        context, fold["train"], outcomes_by_subject,
-                        build_param_grid(MIL_SEARCH_SPACE),
-                        fit_score_fn=_mil_fit_score_fn(context, pooling_for[name], device, outcomes_by_subject, min_cells),
-                        seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
-                    )
+                    is_pathway = name == PATHWAY_MODEL_NAME
+                    if is_pathway:
+                        # check_mil_eligibility is applied for free inside
+                        # Trainer.phase2 for the pooling-based MIL models;
+                        # this adapter has no Trainer, so it is applied
+                        # explicitly here — same threshold, same exception.
+                        check_mil_eligibility(train_sd)
+                        check_mil_eligibility(val_sd)
+                        mil_hp = select_nested_hyperparameters_with_refit(
+                            context, fold["train"], outcomes_by_subject,
+                            build_param_grid(pathway_search_space(fast=False)),
+                            fit_score_fn=_pathway_cancer_fit_score_fn(context, device, outcomes_by_subject, min_cells),
+                            seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                        )
+                    else:
+                        mil_hp = select_nested_hyperparameters_with_refit(
+                            context, fold["train"], outcomes_by_subject,
+                            build_param_grid(MIL_SEARCH_SPACE),
+                            fit_score_fn=_mil_fit_score_fn(context, pooling_for[name], device, outcomes_by_subject, min_cells),
+                            seed=seed, n_inner_folds=DEFAULT_INNER_FOLDS, n_hvgs=n_hvgs,
+                        )
                     fold_context = _fold_context(context, artifact, train_cell_ds, val_cell_ds)
-                    adapter = NeuralCancerAdapter(pooling=pooling_for[name], device=device)
+                    adapter = build_mil_adapter(
+                        name, pooling_for.get(name), device,
+                        config_overrides=mil_hp["selected_params"] if is_pathway else None,
+                    )
                     adapter.fit(
                         fold_context, train_cell_ds, val_cell_ds,
                         train_sd, val_sd, seed=seed,
-                        pretrain_epochs=mil_hp["selected_params"].get("pretrain_epochs", 2),
+                        pretrain_epochs=None if is_pathway else mil_hp["selected_params"].get("pretrain_epochs", 2),
                     )
                     proba = adapter.predict_proba(val_sd)
                     y_val_ordered = np.array([b["cancer_label"] for b in val_sd.bags])
@@ -434,6 +551,8 @@ def run_cancer_cv(
                     report.update({"seed": seed, "fold": fold_idx, "hyperparameters": adapter.metadata(),
                                    "hyperparameter_search": mil_hp,
                                    "preprocessing_fingerprint": fp})
+                    if is_pathway:
+                        report["module_fingerprint"] = adapter.modules.fingerprint() if adapter.modules else None
                 except MILEligibilityError as e:
                     # A fold this small failing MIL eligibility (see
                     # train.check_mil_eligibility) is an honest, expected

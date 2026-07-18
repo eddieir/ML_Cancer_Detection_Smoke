@@ -1450,3 +1450,254 @@ remains transductive-only, and `UnsafeBatchCorrectionError` makes that
 limitation enforced rather than merely documented, not fixed. It does not
 change `test_guard.py` itself. These remain the section's honest
 boundaries, not claims made beyond them.
+
+## 15. Pathway-Aware Hierarchical Multi-Instance Network ("Phase 5")
+
+`src/pathway_hierarchical_mil.py` implements a second, optional model —
+code identifier `pathway_hierarchical_mil` — alongside `model.py`'s
+`MultiSmokeCancerNet`. It is a research-candidate architecture: nothing in
+this section, the module, or its tests claims clinical validity,
+superiority over the existing baselines, or scientific novelty beyond
+"this is a different architecture we implemented and unit-tested."
+`MultiSmokeCancerNet` is unchanged and remains the default; the new model
+is selected explicitly and never runs without a compatible preprocessing
+artifact and gene-module artifact (§15.6).
+
+### 15.1 Data flow
+
+```
+preprocessed expression, fixed artifact gene order      [G]
+    -> masked gene-to-module projection (GeneModuleCollection-aligned)
+    -> module activations                                [P]
+    -> optional residual gene projection                 [R]
+    -> fused, LayerNorm'd cell embedding                  [D]
+    -> optional cell-type / source / species conditioning
+    -> cell-type-local gated attention (Level 1)
+    -> per-cell-type representation                     [C, D]
+    -> cell-type gated attention (Level 2)
+    -> subject representation                              [D]
+        -> smoke-type head (multiclass logits)
+        -> cancer-risk head (single logit)
+        -> optional domain/source head (diagnostic only)
+```
+
+Every stage operates on already-preprocessed, fixed-gene-order expression.
+Nothing in this file calls a preprocessing *fit* method; it only consumes
+an already-fit `PreprocessingArtifact`'s gene order.
+
+### 15.2 Gene-module contract
+
+`GeneModuleCollection` binds a set of named modules to one exact, ordered
+gene list (`gene_names`) via a boolean `membership_mask` of shape
+`[n_modules, n_genes]`. Two construction paths:
+
+- `from_gmt(path, gene_order, ...)` — parses a
+  `module<TAB>description<TAB>GENE1<TAB>GENE2...` file, keeps only genes
+  present in `gene_order` (unavailable genes are dropped from membership,
+  never fed back into preprocessing), deduplicates genes within a module
+  deterministically, and either drops or raises on a module whose aligned
+  gene count falls below `minimum_genes_per_module`, per
+  `empty_module_policy`.
+- `synthetic(gene_order, n_modules, genes_per_module, seed)` — a
+  deterministic, seeded, clearly-labelled (`source_name =
+  "synthetic_diagnostic_v1"`) scheme with no participant data, used only by
+  tests and by synthetic workflows that explicitly opt in via
+  `gene_modules.allow_synthetic_modules: true`. The default configuration
+  (`gene_modules.path: null`, `allow_synthetic_modules: false`) makes a
+  real training run fail with an actionable configuration error rather
+  than silently substituting synthetic modules.
+
+`fingerprint()` hashes gene order, module order, and full membership;
+changing any of them changes the model's `module_fingerprint`, which is
+recorded alongside the checkpoint and (optionally) the bundle manifest's
+`extra` fields, so a checkpoint built against one module set cannot be
+silently paired with another. Module membership is decided once, from the
+module source and the artifact's gene order alone — never from labels and
+never from a validation or test split (see
+`test_module_membership_decided_before_any_validation_split`).
+
+### 15.3 Masked pathway encoder
+
+`MaskedModuleProjection` holds a `nn.Parameter` weight the same shape as
+`membership_mask`, but every forward pass recomputes
+`effective_weight = weight * membership_mask` before the linear map, and a
+backward hook on `weight` multiplies its incoming gradient by the same
+mask — disallowed (gene, module) connections are exactly zero on every
+forward pass and receive exactly zero gradient, not merely a small one.
+`PathwayCellEncoder` combines the resulting module activations (GELU +
+LayerNorm + dropout) with an optional compact residual gene projection,
+fuses them, and LayerNorm's the result into a `D`-dimensional cell
+embedding. LayerNorm is used deliberately instead of BatchNorm1d: a batch
+of cells routinely mixes multiple subjects (and, when conditioning is
+enabled, multiple sources), and BatchNorm1d's cross-example statistics
+would leak information across subject boundaries in a way LayerNorm's
+per-sample normalization does not.
+
+### 15.4 Hierarchical attention pooling
+
+Level 1 (`HierarchicalAttentionPooling`, cells -> cell-type
+representation) computes one gated-attention score per cell
+(`tanh(Vh) * sigmoid(Uh)`, scored by `w`), then, independently for each
+cell-type bucket, takes a masked softmax over the cell dimension restricted
+to real (non-padded) cells of that bucket for that subject. Buckets with no
+matching cells produce an all-zero weight vector (`cell_type_present=False`
+for that bucket) rather than a fabricated representation. Level 2 pools the
+resulting (up to `num_cell_type_buckets`) cell-type representations with a
+second gated attention, masked to only the buckets actually observed for
+that subject. Both levels' weights sum to exactly one within any non-empty
+group and exactly zero for an empty one (`masked_softmax`); attention is
+computed independently per row of the batch, so no attention ever crosses
+a subject boundary (verified directly by
+`test_no_attention_computed_across_subjects`). A subject whose bag is
+entirely padding fails immediately at the top-level `forward()` call rather
+than silently producing a degenerate zero-vector prediction.
+
+`num_cell_type_buckets` reserves one bucket (the highest index) for cells
+whose type is unknown — an explicit policy, not a silent drop.
+
+### 15.5 Multitask heads, masking, and loss
+
+The smoke-type head and cancer-risk head both read the same subject
+embedding. `MultitaskMaskedLoss` masks each task's inputs to only its
+`*_known` examples before computing `F.cross_entropy` (smoke, with an
+optional class-weight tensor applied exactly once) or
+`F.binary_cross_entropy_with_logits` (cancer) — an unknown label never
+becomes a fabricated negative and never contributes to either loss term. A
+batch with zero known labels for one task contributes a differentiable
+zero for that task only; a batch with zero known labels for *both* tasks
+follows an explicit, tested `empty_batch_policy` ("skip" returns a
+differentiable zero total loss; "error" raises `EmptyBatchLossError`).
+
+### 15.6 Configuration, identity, and bundle integration
+
+`configs/default.yaml`'s `model.pathway_hierarchical_mil` section
+(`enabled: false` by default) mirrors `PathwayHierarchicalMILConfig`
+field-for-field; `test_pathway_hierarchical_mil_yaml_defaults_match_python_dataclass`
+keeps the two from drifting apart. `PathwayHierarchicalMILConfig.validate()`
+rejects non-positive dimensions, out-of-range dropout, negative loss
+weights, and an unrecognized `empty_batch_policy` before a model is ever
+constructed. The model exposes `input_dim` and `num_smoke` attributes with
+the same names `MultiSmokeCancerNet` uses, so the existing generic
+`benchmarks/bundle.py::validate_bundle_for_model` check works unchanged for
+either architecture; `write_model_bundle`'s `extra` argument is used to
+record `model_type="pathway_hierarchical_mil"` and the model's
+`module_fingerprint` in the bundle manifest, so a bundle built for this
+architecture cannot be silently loaded against a mismatched gene-module
+set (`test_bundle_round_trip_and_module_fingerprint_binding`,
+`test_bundle_rejects_swapped_preprocessing_artifact`,
+`test_bundle_rejects_corrupted_checkpoint`). Calibration reuses
+`benchmarks/calibration.py::fit_calibration`/`FrozenCalibrator` unchanged —
+both already operate on post-hoc numpy probability arrays and have no
+model-specific logic to duplicate.
+
+### 15.7 Honest scope boundaries
+
+This implementation covers the model itself (gene-module contract, masked
+pathway encoder, two-level hierarchical attention, optional source/species
+conditioning, multitask heads and masked loss, uncertainty diagnostics
+via predictive entropy and an explicitly-opt-in MC-dropout utility,
+bundle-manifest identity binding) with unit and integration test coverage
+across gene modules, the pathway encoder, hierarchical attention, multitask
+masking, domain conditioning, and checkpoint/bundle identity, plus a
+synthetic end-to-end training loop and a frozen-test-sentinel
+non-access check. A second pass (§15.8) additionally wires the model into
+`benchmarks/runner.py`'s CLI, the nested cross-validation loop, the
+hyperparameter search, the OOF/final-development-fit protocol, and a
+dedicated ablation runner.
+
+An adversarial domain-training head and a model-specific calibration fit
+(as opposed to reusing the existing generic post-hoc calibrator) remain
+unimplemented — natural follow-on work, not silently dropped requirements.
+See the accompanying pull request description for the itemized list
+against the original specification.
+
+### 15.8 CLI, nested cross-validation, hyperparameter search, and ablation integration
+
+`benchmarks/mil_registry.py` is the one place that maps a Task A/B
+MIL-kind candidate name to its adapter class:
+`NeuralCancerAdapter` for `"neural"`/`"mean_mil"`/`"max_mil"`/
+`"attention_mil"` (unchanged), and the new
+`PathwayHierarchicalAdapter` (`benchmarks/pathway_hierarchical_adapter.py`)
+for `"pathway_hierarchical_mil"`. `PathwayHierarchicalAdapter.fit`/
+`fit_final`/`predict_proba` intentionally mirror `NeuralCancerAdapter`'s
+signatures exactly (including the unused cell-dataset positional arguments
+and the `pretrain_epochs` keyword, which this adapter treats as its single
+AdamW training loop's epoch count — the architecture has no separate
+cell-level pretraining phase, so nothing needs a Phase 1 step), so
+`cross_validation.py` and `final_evaluation.py` dispatch through
+`build_mil_adapter()` at construction time and otherwise call every
+MIL-kind candidate identically. `run_cancer_cv`'s existing `mil_names`
+list, `final_evaluation.py`'s `is_mil_candidate`/`_fit_mil`/
+`fit_final_candidate_on_dev_pool`, and `runner.py`'s
+`_final_dev_pool_hyperparameters` were extended with one branch each
+(`name == "pathway_hierarchical_mil"`) selecting this candidate's own
+declared search space and fit-score function instead of the pooling-based
+`MIL_SEARCH_SPACE`/`_mil_fit_score_fn` — every other candidate's code path
+is untouched.
+
+`run_smoke_cv` previously had no subject-level MIL branch at all (only a
+cell-level `"neural"` special case and a subject-summary baseline path);
+a third branch was added that builds one-cell-minimum MIL bags via
+`fold_preprocessing.bags_from_fold_cell_dataset(..., {}, min_cells_per_subject=1)`
+(no cancer outcomes required — every bag's `cancer_label_known=False` for
+this task) and scores subject-level Macro-F1 restricted to subjects with a
+known majority smoke label.
+
+`check_mil_eligibility` (>=10 known-outcome subjects, >=2 per class) is
+applied explicitly wherever this adapter's cancer-task fit happens — the
+pooling-based adapters get this check for free inside `Trainer.phase2`
+(both train AND val subject sets); since `PathwayHierarchicalAdapter` has
+no `Trainer`, the same two-sided check is called explicitly at every
+matching call site (`_pathway_cancer_fit_score_fn`, the `run_cancer_cv` mil
+loop, `_fit_mil`, and the ablation runner), so a too-small/degenerate fold
+is rejected identically regardless of which MIL-kind candidate is running.
+The one final development-pool fit (`fit_final_candidate_on_dev_pool`) has
+no validation split to check for ANY MIL-kind candidate, matching
+`Trainer.phase2_final_fit`'s own no-internal-validation contract exactly.
+
+The declared search space (`mil_registry.PATHWAY_SEARCH_SPACE`) covers
+`embedding_dim` ([64, 128]), `attention_dim` ([32, 64]), `dropout`
+([0.1, 0.3]), `use_gene_residual` ([True, False]), `smoke_loss_weight`
+([0.5, 1.0]), and `cancer_loss_weight` ([0.5, 1.0]) — selected via the
+same `select_nested_hyperparameters_with_refit` every other candidate
+uses (fold-local inner-CV selection, a fresh `PreprocessingArtifact` refit
+per inner fold, no reuse of one fold's selection inside another fold's
+OOF prediction). A reduced single-candidate grid
+(`pathway_search_space(fast=True)`) exists for synthetic/CI use but is not
+yet wired into a `--fast`-conditional call site — the full grid runs even
+under `--synthetic --fast` today, which is correct but slower than
+necessary; see the honest-limitations list.
+
+OOF prediction records (`generate_subject_oof_predictions`) and per-fold
+CV records now carry `module_fingerprint` alongside the
+`preprocessing_fingerprint`/`model_state_fingerprint` every candidate
+already recorded; `runner.py`'s OOF CSV gained a `module_fingerprint`
+column (empty for every non-pathway candidate).
+
+`benchmarks/pathway_hierarchical_adapter.py::validate_pathway_bundle_identity`
+cross-checks an already-loaded bundle manifest's `model_type` and
+`module_fingerprint` fields against a constructed model instance — the
+same shape of check `bundle.py::validate_bundle_for_model` already performs
+generically for `input_dim`/`num_smoke` — so a bundle built for a different
+architecture, or against a different gene-module set, is rejected before
+its checkpoint is trusted.
+
+`benchmarks/pathway_hierarchical_ablation.py` (CLI flag
+`--pathway-hierarchical-ablation`, following the existing
+`--imbalance-ablation` convention) compares six variants over the SAME
+cancer-task grouped-subject CV folds `run_cancer_cv` would use:
+`existing_attention_mil` (the pre-existing gated-attention MIL baseline,
+via `NeuralCancerAdapter`), `full_multitask`, `no_gene_residual`,
+`no_cell_type_embedding`, `single_task_cancer`
+(`smoke_loss_weight=0.0`), and `single_task_smoke`
+(`cancer_loss_weight=0.0`). Because this architecture produces both a
+cancer prediction and a smoke prediction from one fit, every pathway
+variant's fold record carries BOTH task's metrics (cancer AUROC/AUPRC as
+the primary comparison metric, smoke Macro-F1 as a secondary diagnostic
+restricted to subjects with a known majority smoke label) from the same
+fitted model — `existing_attention_mil` has no subject-level smoke
+prediction surface, so its smoke metric is recorded as not evaluated,
+never fabricated. Variants requiring unimplemented features (an
+adversarial domain-training head) are absent, not faked. Every result is
+explicitly marked `development_only`/`software_only`; the frozen test
+split is never touched.

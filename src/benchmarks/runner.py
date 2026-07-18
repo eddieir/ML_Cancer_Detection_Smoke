@@ -35,6 +35,7 @@ from .cross_validation import (
     MIL_SEARCH_SPACE,
     _cancer_baseline_fit_score_fn,
     _mil_fit_score_fn,
+    _pathway_cancer_fit_score_fn,
     run_cancer_cv,
     run_smoke_cv,
 )
@@ -48,6 +49,9 @@ from .final_evaluation import (
     select_final_candidate,
 )
 from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
+from .mil_registry import pathway_search_space
+from .pathway_hierarchical_adapter import MODEL_NAME as PATHWAY_MODEL_NAME
+from .pathway_hierarchical_ablation import run_pathway_hierarchical_ablation, write_pathway_hierarchical_ablation_artifact
 from .reporting import compare_models, new_run_dir, write_benchmark_report, write_csv_table, write_json
 from .ood import run_leave_one_source_out
 from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError, default_guard_dir
@@ -119,7 +123,25 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
 
     config = {
         "data": {"min_cells_per_subject": 5},
-        "model": {"embedding_dim": 16, "attention_dim": 8, "num_cell_types": n_ct},
+        "model": {
+            "embedding_dim": 16, "attention_dim": 8, "num_cell_types": n_ct,
+            # Development/CI-only pathway_hierarchical_mil configuration: a
+            # deterministic synthetic module scheme (never a real pathway
+            # resource) is explicitly opted into here — see
+            # pathway_hierarchical_adapter.build_gene_modules_for_context.
+            # Real (non-synthetic) runs must supply gene_modules.path
+            # instead; configs/default.yaml's own default leaves
+            # allow_synthetic_modules false.
+            "pathway_hierarchical_mil": {
+                "embedding_dim": 16, "attention_dim": 8, "residual_gene_dim": 8, "dropout": 0.1,
+                "num_cell_type_buckets": n_ct + 1,
+                "gene_modules": {
+                    "path": None, "allow_synthetic_modules": True,
+                    "synthetic_seed": 0, "synthetic_n_modules": 4, "synthetic_genes_per_module": 5,
+                    "minimum_genes_per_module": 2,
+                },
+            },
+        },
         "train": {"phase1_epochs": 1, "phase2_epochs": 1, "phase1_batch_size": 64,
                   "checkpoint_dir": "checkpoints/benchmarks_synthetic"},
         "benchmarks": {"species_by_source": {"sourceA": "human", "sourceB": "human"},
@@ -220,9 +242,19 @@ def run_smoke_task(context, args, run_dir) -> dict:
             run_dir, context, imbalance_ablation_report, synthetic=bool(getattr(args, "synthetic", False)),
         )
 
+    pathway_hierarchical_ablation_report = None
+    if getattr(args, "pathway_hierarchical_ablation", False):
+        pathway_hierarchical_ablation_report = run_pathway_hierarchical_ablation(
+            context, n_folds=args.cv_folds, seeds=args.seeds, device=args.device,
+        )
+        write_pathway_hierarchical_ablation_artifact(
+            run_dir, context, pathway_hierarchical_ablation_report, synthetic=bool(getattr(args, "synthetic", False)),
+        )
+
     return {"eligibility": eligibility, "cv_reports": {"smoke_classification": cv_report},
             "comparisons": comparisons, "ood_report": ood_report,
-            "imbalance_ablation_report": imbalance_ablation_report}
+            "imbalance_ablation_report": imbalance_ablation_report,
+            "pathway_hierarchical_ablation_report": pathway_hierarchical_ablation_report}
 
 
 def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outcomes_by_subject,
@@ -237,7 +269,10 @@ def _final_dev_pool_hyperparameters(context, best_name: str, dev_subjects, outco
     of reusing this one, so an OOF-held-out subject's label never
     influences the configuration used to predict it.
     """
-    if is_mil_candidate(best_name):
+    if best_name == PATHWAY_MODEL_NAME:
+        candidates = build_param_grid(pathway_search_space(fast=False))
+        fit_score_fn = _pathway_cancer_fit_score_fn(context, device, outcomes_by_subject, min_cells)
+    elif is_mil_candidate(best_name):
         candidates = build_param_grid(MIL_SEARCH_SPACE)
         fit_score_fn = _mil_fit_score_fn(context, pooling, device, outcomes_by_subject, min_cells)
     else:
@@ -254,7 +289,8 @@ _OOF_CSV_COLUMNS = [
     "subject_id", "target", "probability", "seed", "outer_oof_fold", "candidate_name",
     "candidate_type", "pooling", "selected_params_json", "selected_params_fingerprint",
     "inner_selection_fingerprint", "training_subjects_fingerprint", "validation_subjects_fingerprint",
-    "preprocessing_fingerprint", "model_state_fingerprint", "prediction_status", "undefined_reason",
+    "preprocessing_fingerprint", "module_fingerprint", "model_state_fingerprint",
+    "prediction_status", "undefined_reason",
 ]
 
 
@@ -288,6 +324,7 @@ def _write_oof_predictions_csv(run_dir, oof: dict, outcomes_by_subject: dict, ca
                 "training_subjects_fingerprint": fold.get("training_subjects_fingerprint"),
                 "validation_subjects_fingerprint": fold.get("validation_subjects_fingerprint"),
                 "model_state_fingerprint": fold.get("model_state_fingerprint"),
+                "module_fingerprint": fold.get("module_fingerprint"),
             }
 
     rows = []
@@ -314,6 +351,7 @@ def _write_oof_predictions_csv(run_dir, oof: dict, outcomes_by_subject: dict, ca
             "training_subjects_fingerprint": meta.get("training_subjects_fingerprint", ""),
             "validation_subjects_fingerprint": meta.get("validation_subjects_fingerprint", ""),
             "preprocessing_fingerprint": meta.get("preprocessing_fingerprint", ""),
+            "module_fingerprint": meta.get("module_fingerprint", "") or "",
             "model_state_fingerprint": meta.get("model_state_fingerprint", ""),
             "prediction_status": status,
             "undefined_reason": "" if proba is not None else "subject never received an OOF prediction",
@@ -571,6 +609,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     # data or the frozen-test guard. Writes its own artifact under
     # <run_dir>/metrics/smoke_imbalance_ablation.json.
     parser.add_argument("--imbalance-ablation", action="store_true")
+    # Development-only comparison of pathway_hierarchical_mil architecture
+    # variants against each other and against the existing gated-attention
+    # MIL baseline (benchmarks/pathway_hierarchical_ablation.py) — only
+    # meaningful for --task smoke (it runs its own cancer-task-shaped CV
+    # internally so both tasks' metrics come from one fit per fold; see
+    # that module's docstring). Never touches test data or the frozen-test
+    # guard. Writes its own artifact under
+    # <run_dir>/metrics/pathway_hierarchical_ablation.json.
+    parser.add_argument("--pathway-hierarchical-ablation", action="store_true")
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--run-id", type=str, default=None)

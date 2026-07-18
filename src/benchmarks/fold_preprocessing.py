@@ -326,7 +326,15 @@ def bags_from_fold_cell_dataset(
     space as the fold's cell-level data, not the outer artifact's bags.
     outcomes_by_subject: {subject_id: 0/1} for subjects with a KNOWN cancer
     outcome only — a subject absent from this dict gets cancer_label_known=False,
-    never a fabricated negative.
+    never a fabricated negative. Pass {} for a caller that only needs the
+    smoke-related fields (e.g. a smoke-task MIL model) — every bag then
+    carries cancer_label_known=False, never a fabricated cancer outcome.
+
+    Each bag also carries "smoke_known" (per-cell bool array, Phase 5) so a
+    subject-level consumer can restrict smoke supervision to cells with a
+    verified (non-weak-proxy, non-placeholder) label — see
+    CellLevelDataset's own smoke_known docstring for what the underlying
+    per-cell value means when smoke_known is False.
     """
     bags = []
     subj = fold_cell_dataset.subject_ids
@@ -340,6 +348,7 @@ def bags_from_fold_cell_dataset(
             "gene_matrix": fold_cell_dataset.X[mask].numpy(),
             "cell_type_ids": fold_cell_dataset.ctype[mask].numpy(),
             "smoke_labels": fold_cell_dataset.smoke[mask].numpy(),
+            "smoke_known": fold_cell_dataset.smoke_known[mask].numpy(),
             "malig_labels": fold_cell_dataset.malig[mask].numpy(),
             "malig_known": fold_cell_dataset.malig_known[mask].numpy(),
             "cancer_label": outcome,

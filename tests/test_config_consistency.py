@@ -114,3 +114,33 @@ def test_tcga_bulk_disabled_by_default():
 def test_experiment_mode_human_only_by_default():
     cfg = _load_config()
     assert cfg["data"]["experiment_mode"] == "human_only"
+
+
+# ─── Phase 5 — pathway hierarchical MIL defaults ────────────────────────────
+
+def test_pathway_hierarchical_mil_disabled_by_default():
+    cfg = _load_config()
+    phm = cfg["model"]["pathway_hierarchical_mil"]
+    assert phm["enabled"] is False
+
+
+def test_pathway_hierarchical_mil_yaml_defaults_match_python_dataclass():
+    from pathway_hierarchical_mil import PathwayHierarchicalMILConfig
+
+    cfg = _load_config()
+    phm = dict(cfg["model"]["pathway_hierarchical_mil"])
+    phm.pop("uncertainty", None)
+    phm.pop("gene_modules", None)
+    parsed = PathwayHierarchicalMILConfig.from_dict(phm)
+    defaults = PathwayHierarchicalMILConfig()
+    for key in phm:
+        if hasattr(defaults, key):
+            assert getattr(parsed, key) == getattr(defaults, key), key
+
+
+def test_pathway_hierarchical_mil_gene_modules_default_requires_explicit_source():
+    cfg = _load_config()
+    gm = cfg["model"]["pathway_hierarchical_mil"]["gene_modules"]
+    assert gm["path"] is None
+    assert gm["allow_synthetic_modules"] is False
+    assert gm["empty_module_policy"] == "error"

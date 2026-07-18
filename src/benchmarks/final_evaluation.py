@@ -39,10 +39,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from data.splitting import grouped_kfold
-from train import MILEligibilityError, SubjectLevelDataset, validate_experiment_partitions
+from train import MILEligibilityError, SubjectLevelDataset, check_mil_eligibility, validate_experiment_partitions
 
 from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, positive_class_proba
-from .cross_validation import MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn
+from .cross_validation import MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn, _pathway_cancer_fit_score_fn
 from .features import build_cancer_subject_features
 from .fold_preprocessing import (
     artifact_fingerprint,
@@ -52,9 +52,10 @@ from .fold_preprocessing import (
     require_normalized_adata,
 )
 from .hyperparameter_search import build_param_grid, select_nested_hyperparameters_with_refit
+from .mil_registry import MIL_CANDIDATE_NAMES, build_mil_adapter, pathway_search_space
 from .neural import NeuralCancerAdapter
+from .pathway_hierarchical_adapter import MODEL_NAME as PATHWAY_MODEL_NAME
 
-MIL_CANDIDATE_NAMES = ("neural", "mean_mil", "max_mil", "attention_mil")
 DEFAULT_OOF_INNER_FOLDS = 2
 
 
@@ -126,24 +127,35 @@ def _predict_baseline(model, X: np.ndarray) -> np.ndarray:
     return positive_class_proba(model, X)
 
 
-def _fit_mil(context, artifact, pooling: str, device: str, train_ds, val_ds,
-             train_bags: List[dict], val_bags: List[dict], hp_params: Dict, seed: int) -> NeuralCancerAdapter:
+def _fit_mil(context, candidate_name: str, artifact, pooling: str, device: str, train_ds, val_ds,
+             train_bags: List[dict], val_bags: List[dict], hp_params: Dict, seed: int):
     """Used for OOF-fold fits only (each OOF fold still uses a real,
     subject-disjoint validation split for Trainer's own checkpoint
     selection, exactly like CV) — the final dev-pool refit uses
     fit_final_candidate_on_dev_pool below instead, which trains on every
-    development subject via NeuralCancerAdapter.fit_final."""
+    development subject via the adapter's own fit_final(). candidate_name
+    selects the adapter class via benchmarks/mil_registry.py, so this
+    function works unchanged for every MIL-kind candidate."""
     train_sd = SubjectLevelDataset(train_bags)
     val_sd = SubjectLevelDataset(val_bags)
     validate_experiment_partitions(
         train_cell_dataset=train_ds, val_cell_dataset=val_ds,
         train_subject_dataset=train_sd, val_subject_dataset=val_sd,
     )
+    is_pathway = candidate_name == PATHWAY_MODEL_NAME
+    if is_pathway:
+        # NeuralCancerAdapter.fit gets this same train+val eligibility
+        # check for free inside Trainer.phase2 — this adapter has no
+        # Trainer, so it is applied explicitly here to match.
+        check_mil_eligibility(train_sd)
+        check_mil_eligibility(val_sd)
     fold_ctx = dataclasses.replace(context, preprocessing_artifact=artifact,
                                     train_cell_dataset=train_ds, val_cell_dataset=val_ds)
-    adapter = NeuralCancerAdapter(pooling=pooling, device=device)
+    adapter = build_mil_adapter(
+        candidate_name, pooling, device, config_overrides=hp_params if is_pathway else None,
+    )
     adapter.fit(fold_ctx, train_ds, val_ds, train_sd, val_sd, seed=seed,
-                pretrain_epochs=hp_params.get("pretrain_epochs", 2))
+                pretrain_epochs=None if is_pathway else hp_params.get("pretrain_epochs", 2))
     return adapter
 
 
@@ -161,7 +173,10 @@ def _oof_fold_hyperparameters(
     influenced by every development subject's label (including the one
     being predicted).
     """
-    if is_mil_candidate(candidate_name):
+    if candidate_name == PATHWAY_MODEL_NAME:
+        candidates = build_param_grid(pathway_search_space(fast=False))
+        fit_score_fn = _pathway_cancer_fit_score_fn(context, device, outcomes_by_subject, min_cells_per_subject)
+    elif is_mil_candidate(candidate_name):
         candidates = build_param_grid(MIL_SEARCH_SPACE)
         fit_score_fn = _mil_fit_score_fn(context, pooling, device, outcomes_by_subject, min_cells_per_subject)
     else:
@@ -243,12 +258,14 @@ def generate_subject_oof_predictions(
 
         if is_mil_candidate(candidate_name):
             try:
-                adapter = _fit_mil(context, artifact, pooling, device, train_ds, val_ds,
+                adapter = _fit_mil(context, candidate_name, artifact, pooling, device, train_ds, val_ds,
                                     train_bags, val_bags, selected_params, seed)
                 val_sd = SubjectLevelDataset(val_bags)
                 proba = adapter.predict_proba(val_sd)
                 subj_order = [str(b["subject_id"]) for b in val_sd.bags]
                 record["model_state_fingerprint"] = adapter.model_state_fingerprint()
+                if candidate_name == PATHWAY_MODEL_NAME:
+                    record["module_fingerprint"] = adapter.modules.fingerprint() if adapter.modules else None
             except MILEligibilityError as e:
                 record["skipped_reason"] = f"MIL ineligible: {e}"
                 fold_membership.append(record)
@@ -344,10 +361,17 @@ def fit_final_candidate_on_dev_pool(
     kind = "mil" if is_mil_candidate(candidate_name) else "baseline"
     if kind == "mil":
         dev_sd = SubjectLevelDataset(dev_bags)
+        is_pathway = candidate_name == PATHWAY_MODEL_NAME
+        # No eligibility check here, for any MIL-kind candidate — this
+        # mirrors Trainer.phase2_final_fit exactly: the final dev-pool fit
+        # has no internal validation split to check, by design (blocker 3;
+        # see fit_final_candidate_on_dev_pool's own docstring).
         fold_ctx = dataclasses.replace(context, preprocessing_artifact=final_artifact)
-        adapter = NeuralCancerAdapter(pooling=pooling, device=device)
+        adapter = build_mil_adapter(
+            candidate_name, pooling, device, config_overrides=selected_params if is_pathway else None,
+        )
         adapter.fit_final(fold_ctx, dev_ds, dev_sd, seed=seed,
-                           pretrain_epochs=selected_params.get("pretrain_epochs"))
+                           pretrain_epochs=None if is_pathway else selected_params.get("pretrain_epochs"))
         model_metadata = adapter.metadata()
         model_state_fp = adapter.model_state_fingerprint()
         predictor = adapter
