@@ -13,16 +13,16 @@ validate separately; the production path enforces it by construction.
 
 import hashlib
 import json
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Union
 
 from .atomic_io import atomic_write_json
-from .robustness_report import RobustnessReportValidationError, validate_per_source_reports
+from .robustness_report import RobustnessReportValidationError, is_not_applicable, validate_per_source_reports
 
-ABLATION_REPORT_SCHEMA_VERSION = "1.0"
+ABLATION_REPORT_SCHEMA_VERSION = "2.0"
 
 _TOP_LEVEL_REQUIRED_FIELDS = (
-    "schema_version", "task", "primary_metric", "variants", "seeds", "development_only",
-    "frozen_test_accessed", "results", "paired_comparison_vs_erm", "aggregate_fingerprint",
+    "schema_version", "task", "primary_metric", "candidate_name", "requested_model_names", "variants", "seeds",
+    "development_only", "frozen_test_accessed", "results", "paired_comparison_vs_erm", "aggregate_fingerprint",
 )
 
 _PAIRED_COMPARISON_EVALUATED_FIELDS = (
@@ -43,7 +43,7 @@ def _sha256_json(payload) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-def _validate_seed_result(variant: str, seed, seed_result: Dict) -> None:
+def _validate_seed_result(variant: str, seed, seed_result: Dict, candidate_name: Union[str, Dict]) -> None:
     if not isinstance(seed_result, dict):
         raise AblationReportValidationError(
             f"ablation report variant={variant!r} seed={seed!r}: result must be a dict"
@@ -76,6 +76,27 @@ def _validate_seed_result(variant: str, seed, seed_result: Dict) -> None:
             f"ablation report variant={variant!r} seed={seed!r}: nested per-source report failed "
             f"schema-v2 validation: {e}"
         ) from e
+    # Fixed-model ablation design (Step 5/6): every EVALUATED per-source
+    # report for this variant/seed must (a) have won with the ablation's
+    # single declared candidate_name (when one is declared — the cancer
+    # task always declares one) and (b) record its APPLIED strategy as
+    # exactly this variant's name — a mislabeled applied strategy, or a
+    # different winning candidate than declared, is rejected here rather
+    # than silently entering the ablation's results/paired comparison.
+    for source, report in per_source.items():
+        if not report.get("evaluated"):
+            continue
+        if isinstance(candidate_name, str) and report.get("model") != candidate_name:
+            raise AblationReportValidationError(
+                f"ablation report variant={variant!r} seed={seed!r} source={source!r}: winning candidate "
+                f"{report.get('model')!r} != the ablation's declared fixed candidate_name {candidate_name!r}"
+            )
+        if report.get("strategy") != variant:
+            raise AblationReportValidationError(
+                f"ablation report variant={variant!r} seed={seed!r} source={source!r}: nested report's "
+                f"APPLIED strategy {report.get('strategy')!r} != this result's own variant name {variant!r} "
+                "— a variant's evaluated rows must record having actually applied that exact strategy."
+            )
     aggregate = seed_result["aggregate"]
     if not isinstance(aggregate, dict) or "metric" not in aggregate:
         raise AblationReportValidationError(
@@ -146,6 +167,19 @@ def _validate_structure(report: Dict) -> None:
         raise AblationReportValidationError(
             f"ablation report task must be 'smoke' or 'cancer', got {report['task']!r}"
         )
+    candidate_name = report["candidate_name"]
+    if not (isinstance(candidate_name, str) and candidate_name) and not is_not_applicable(candidate_name):
+        raise AblationReportValidationError(
+            "ablation report candidate_name must be a non-empty string (the single fixed candidate "
+            "every variant evaluated) or a structured not_applicable() value"
+        )
+    if report["task"] == "cancer" and is_not_applicable(candidate_name):
+        raise AblationReportValidationError(
+            "ablation report task='cancer' must declare a real fixed candidate_name — the cancer "
+            "domain-robustness strategy ablation always holds a single candidate fixed."
+        )
+    if not isinstance(report["requested_model_names"], list):
+        raise AblationReportValidationError("ablation report requested_model_names must be a list")
     if report["development_only"] is not True:
         raise AblationReportValidationError("ablation report must have development_only=True")
     if report["frozen_test_accessed"] is not False:
@@ -170,7 +204,7 @@ def _validate_structure(report: Dict) -> None:
                 "declared seeds list"
             )
         for seed, seed_result in per_seed.items():
-            _validate_seed_result(variant, seed, seed_result)
+            _validate_seed_result(variant, seed, seed_result, candidate_name)
     _validate_paired_comparison(report["paired_comparison_vs_erm"])
 
 
@@ -203,7 +237,8 @@ def validate_ablation_report_fingerprint_unchanged(report: Dict) -> None:
 
 def build_ablation_report(
     task: str, primary_metric: str, variants: Sequence[str], seeds: Sequence[int],
-    results: Dict, paired_comparison_vs_erm: Dict,
+    results: Dict, paired_comparison_vs_erm: Dict, candidate_name: Union[str, Dict],
+    requested_model_names: Sequence[str],
 ) -> Dict:
     """
     Assembles, validates (including every nested per-source report,
@@ -211,9 +246,16 @@ def build_ablation_report(
     production enforcement point every caller goes through, mirroring
     robustness_report.build_aggregate_report's contract for the ablation
     report's own (materially different) top-level shape.
+
+    candidate_name is the single candidate every variant was fixed to (a
+    real string for the cancer task, a structured not_applicable() value
+    for the smoke task, which sweeps requested_model_names for its ERM-only
+    variant instead of fixing one candidate — see
+    domain_robustness_ablation.py's module docstring).
     """
     report = {
         "schema_version": ABLATION_REPORT_SCHEMA_VERSION, "task": task, "primary_metric": primary_metric,
+        "candidate_name": candidate_name, "requested_model_names": list(requested_model_names),
         "variants": list(variants), "seeds": list(seeds), "development_only": True,
         "frozen_test_accessed": False, "results": results,
         "paired_comparison_vs_erm": paired_comparison_vs_erm,

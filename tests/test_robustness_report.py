@@ -101,9 +101,9 @@ def test_report_fingerprint_deterministic_round_trip():
         assert file_sha256 != reloaded["report_fingerprint"]
 
 
-def test_schema_version_bumped_to_v2():
+def test_schema_version_bumped_to_v3():
     d = _report("sourceA", 0.8)
-    assert d["schema_version"] == "2.0"
+    assert d["schema_version"] == "3.0"
 
 
 def test_identity_fields_default_to_structured_not_applicable_not_bare_none():
@@ -271,15 +271,20 @@ def test_adversarial_report_missing_domain_head_identity_rejected():
         validate_robustness_report(d)
 
 
-def test_adversarial_strategy_with_classical_baseline_winner_accepts_not_applicable_domain_head():
-    """strategy='domain_adversarial' can still legitimately be won by a
-    classical baseline (that source's OOF sweep simply favored logistic
-    over pathway_hierarchical_mil) — only pathway_hierarchical_mil has a
-    domain-adversarial head at all, so a not_applicable domain_head/
-    vocabulary identity must be ACCEPTED when the winning candidate is not
-    module-based, even though the requested strategy is domain_adversarial."""
+def test_adversarial_request_with_classical_baseline_winner_records_applied_erm_not_applicable_domain_head():
+    """A run REQUESTING strategy='domain_adversarial' can still legitimately
+    be won by a classical baseline (that source's OOF sweep simply favored
+    logistic over pathway_hierarchical_mil) — only pathway_hierarchical_mil
+    has a domain-adversarial head at all, so such a winner must record
+    strategy (applied) ='erm', strategy_applicable=False, and a
+    not_applicable domain_head/vocabulary identity, never claim
+    domain_adversarial was actually applied."""
     d = _report(
-        "sourceA", 0.8, model="logistic", strategy="domain_adversarial", evaluated=True,
+        "sourceA", 0.8, model="logistic", strategy="erm", requested_strategy="domain_adversarial",
+        strategy_applicable=False,
+        strategy_applicability_reason="'logistic' (candidate kind='classical_baseline') does not "
+                                       "support strategy='domain_adversarial' — trained with erm instead",
+        evaluated=True,
         preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
         model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
         source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
@@ -288,6 +293,59 @@ def test_adversarial_strategy_with_classical_baseline_winner_accepts_not_applica
         # all left at their not_applicable defaults.
     )
     validate_robustness_report(d)
+
+
+def test_classical_baseline_winner_cannot_falsely_claim_applied_non_erm_strategy():
+    """A report cannot declare strategy (applied) ='domain_adversarial' for a
+    classical baseline winner — a classical/non-module candidate can only
+    ever apply ERM, regardless of what was requested."""
+    d = _report(
+        "sourceA", 0.8, model="logistic", strategy="domain_adversarial", requested_strategy="domain_adversarial",
+        strategy_applicable=True, evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_classical_baseline_winner_requesting_non_erm_must_record_strategy_applicable_false():
+    d = _report(
+        "sourceA", 0.8, model="logistic", strategy="erm", requested_strategy="coral",
+        strategy_applicable=True,  # wrong — must be False for a classical winner requesting a non-erm strategy
+        evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_pathway_winner_applied_strategy_must_equal_requested_strategy():
+    """A module-based/pathway winner's training path always genuinely
+    applies whatever domain-robustness config was requested — strategy
+    (applied) disagreeing with requested_strategy for a pathway winner is
+    always a reporting bug, never a legitimate outcome."""
+    d = _report(
+        "sourceA", 0.8, model="pathway_hierarchical_mil", strategy="erm", requested_strategy="coral",
+        strategy_applicable=True, evaluated=True, is_module_based_candidate=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_unknown_requested_strategy_name_rejected():
+    d = _report("sourceA", 0.8, requested_strategy="not_a_real_strategy")
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
 
 
 def test_calibrated_report_missing_calibration_identity_rejected():

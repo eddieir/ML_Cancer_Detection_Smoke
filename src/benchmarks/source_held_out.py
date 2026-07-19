@@ -36,6 +36,7 @@ from train import MILEligibilityError, SubjectLevelDataset
 
 from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, SMOKE_BASELINES, SMOKE_SEARCH_SPACE, positive_class_proba
 from .calibration import build_frozen_policy
+from .candidate_registry import resolve_strategy_application
 from .cross_validation import (
     DEFAULT_INNER_FOLDS, MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn,
     _pathway_cancer_fit_score_fn, _pathway_smoke_fit_score_fn, _smoke_baseline_fit_score_fn,
@@ -520,8 +521,22 @@ def run_cancer_source_held_out(
         if module_fp is None:
             module_fp = not_applicable(f"{best_name} has no gene-module structure")
 
+        # Requested vs APPLIED strategy attribution (Step 3/8): best_name won
+        # candidate selection, but only a registry-derived module-based
+        # candidate (pathway_hierarchical_mil) actually has a training-time
+        # attachment point for anything other than plain ERM — see
+        # candidate_registry.resolve_strategy_application, the single
+        # canonical source of truth for this capability matrix. A classical
+        # baseline or non-module MIL winner must never be reported as having
+        # applied a domain-robustness strategy it cannot structurally receive.
+        applied_strategy, strategy_applicable, strategy_reason = resolve_strategy_application(
+            best_name, domain_cfg["strategy"],
+        )
+
         reports[held_out_source] = build_robustness_report(
-            task="cancer_prediction", model=best_name, strategy=domain_cfg["strategy"],
+            task="cancer_prediction", model=best_name, strategy=applied_strategy,
+            requested_strategy=domain_cfg["strategy"], strategy_applicable=strategy_applicable,
+            strategy_applicability_reason=strategy_reason,
             held_out_source=held_out_source, eligibility=elig.to_dict(), development_sources=dev_sources,
             metrics={k: v for k, v in metrics_result.items() if k != "policy"},
             calibration=metrics_result.get("policy", {}),

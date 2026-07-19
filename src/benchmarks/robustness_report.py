@@ -17,6 +17,20 @@ scientifically inapplicable for a given report (e.g. domain_head_fingerprint
 for a classical baseline, which has no domain head) must use the structured
 `not_applicable(reason)` representation below, never a bare None and never a
 placeholder string invented ad hoc by a caller.
+
+Schema v3 (bumped from v2) separates what a caller REQUESTED from what a
+winning candidate actually APPLIED. `strategy` is now, unambiguously, the
+APPLIED strategy: what the winning candidate was actually trained with. A
+model-selection sweep can request e.g. `coral` and still have a classical
+baseline win (only pathway_hierarchical_mil has a CORAL/MMD/source-balanced/
+domain-adversarial attachment point at all — see candidate_registry.py's
+resolve_strategy_application) — such a report must never claim `strategy:
+"coral"` when the winner was actually trained with plain ERM. `strategy`
+therefore equals `requested_strategy` only when the winning candidate's
+registry-derived kind actually supports the requested strategy;
+`strategy_applicable`/`strategy_applicability_reason` record which case
+applied and why. For an EVALUATED report, this consistency is enforced by
+validate_robustness_report, not left to the caller to get right.
 """
 
 import hashlib
@@ -26,8 +40,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from .atomic_io import atomic_write_json
+from .domain_losses import DOMAIN_STRATEGIES
 
-ROBUSTNESS_REPORT_SCHEMA_VERSION = "2.0"
+ROBUSTNESS_REPORT_SCHEMA_VERSION = "3.0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -79,6 +94,7 @@ _REQUIRED_WHEN_EVALUATED = (
 
 _REQUIRED_FIELDS = (
     "schema_version", "development_only", "frozen_test_accessed", "task", "model", "strategy",
+    "requested_strategy", "strategy_applicable", "strategy_applicability_reason",
     "held_out_source", "eligibility", "development_sources", "metrics", "calibration", "uncertainty",
     "domain_shift", "biological_stability", "comparisons", "limitations", "seed", "is_module_based_candidate",
 ) + _IDENTITY_FIELDS
@@ -96,6 +112,9 @@ class RobustnessReport:
     task: str
     model: str
     strategy: str
+    requested_strategy: str
+    strategy_applicable: bool
+    strategy_applicability_reason: str
     dataset_manifest_fingerprint: Union[str, Dict]
     source_split_manifest_fingerprint: Union[str, Dict]
     preprocessing_fingerprint: Union[str, Dict]
@@ -156,6 +175,22 @@ def validate_robustness_report(d: Dict) -> None:
     if d["seed"] is None:
         raise RobustnessReportValidationError("robustness report must record a non-None seed")
 
+    if d["requested_strategy"] not in DOMAIN_STRATEGIES:
+        raise RobustnessReportValidationError(
+            f"robustness report requested_strategy={d['requested_strategy']!r} must be one of "
+            f"{DOMAIN_STRATEGIES}"
+        )
+    if d["strategy"] not in DOMAIN_STRATEGIES:
+        raise RobustnessReportValidationError(
+            f"robustness report strategy (applied) ={d['strategy']!r} must be one of {DOMAIN_STRATEGIES}"
+        )
+    if not isinstance(d["strategy_applicable"], bool):
+        raise RobustnessReportValidationError(
+            f"robustness report strategy_applicable={d['strategy_applicable']!r} must be a bool"
+        )
+    if not d.get("strategy_applicability_reason"):
+        raise RobustnessReportValidationError("robustness report strategy_applicability_reason must be non-empty")
+
     for f in _IDENTITY_FIELDS:
         v = d[f]
         if v is None:
@@ -214,25 +249,72 @@ def validate_robustness_report(d: Dict) -> None:
                     "candidate has no gene-module structure and must record a structured "
                     "not_applicable() reason instead."
                 )
-        strategy = d.get("strategy")
-        # Only pathway_hierarchical_mil actually has a domain-adversarial
-        # attachment point (see mil_registry.py) — a domain_adversarial run
-        # can still legitimately select a classical baseline or non-module
-        # MIL candidate as its winner (e.g. that source's OOF sweep simply
-        # favored logistic regression over the pathway model), and such a
-        # winner has no domain head to fingerprint regardless of the
-        # STRATEGY that was requested. Gating on the registry-derived
-        # candidate kind (not the bare strategy string) avoids rejecting
-        # every legitimate classical-baseline winner under
-        # strategy=domain_adversarial.
-        if strategy == "domain_adversarial" and derived_is_module_based:
+        # `strategy` is the APPLIED strategy (schema v3) — what the winning
+        # candidate was ACTUALLY trained with, never merely what the caller
+        # requested. Only pathway_hierarchical_mil (registry-derived
+        # module-based) supports any strategy other than ERM (see
+        # candidate_registry.SUPPORTED_STRATEGIES_BY_KIND) — a classical
+        # baseline or non-module MIL candidate is always trained with plain
+        # ERM regardless of what was requested for the run it happened to
+        # win, so its APPLIED strategy must always be "erm". A module-based
+        # winner's training path always receives and genuinely applies
+        # whatever domain-robustness config was requested (see
+        # source_held_out.py), so its applied strategy must equal what was
+        # requested and strategy_applicable must be True.
+        strategy = d["strategy"]
+        requested_strategy = d["requested_strategy"]
+        if not derived_is_module_based:
+            if strategy != "erm":
+                raise RobustnessReportValidationError(
+                    f"robustness report's model={d['model']!r} is a registry-derived non-module "
+                    f"candidate but strategy (applied) ={strategy!r} != 'erm' — a classical baseline "
+                    "or non-module MIL candidate can only ever be trained with plain ERM; it must "
+                    "never be reported as having applied a domain-robustness strategy it has no "
+                    "training-time attachment point for."
+                )
+            if requested_strategy == "erm":
+                if d["strategy_applicable"] is not True:
+                    raise RobustnessReportValidationError(
+                        "robustness report requested_strategy='erm' for a non-module candidate but "
+                        "strategy_applicable is not True — ERM is trivially applicable to every "
+                        "candidate kind."
+                    )
+            else:
+                if d["strategy_applicable"] is not False:
+                    raise RobustnessReportValidationError(
+                        f"robustness report's model={d['model']!r} is a registry-derived non-module "
+                        f"candidate that cannot apply requested_strategy={requested_strategy!r}, but "
+                        "strategy_applicable is not False — a candidate that does not support the "
+                        "requested strategy must record strategy_applicable=False, never claim it was "
+                        "applied."
+                    )
+        else:
+            if strategy != requested_strategy:
+                raise RobustnessReportValidationError(
+                    f"robustness report's model={d['model']!r} is a registry-derived module-based/"
+                    f"pathway candidate, whose training path always genuinely applies whatever "
+                    f"domain-robustness config was requested, but strategy (applied) ={strategy!r} != "
+                    f"requested_strategy={requested_strategy!r} — these must agree for a module-based "
+                    "winner."
+                )
+            if d["strategy_applicable"] is not True:
+                raise RobustnessReportValidationError(
+                    "robustness report's model is a registry-derived module-based/pathway candidate "
+                    "but strategy_applicable is not True — pathway_hierarchical_mil supports every "
+                    "declared domain-robustness strategy."
+                )
+        # Only a report whose winning candidate ACTUALLY applied
+        # domain_adversarial training (strategy == 'domain_adversarial', which
+        # by the consistency check above can only be true for a module-based/
+        # pathway winner) has a real domain-adversarial head to fingerprint.
+        if strategy == "domain_adversarial":
             for f in ("domain_head_fingerprint", "domain_vocabulary_fingerprint"):
                 if is_not_applicable(d[f]):
                     raise RobustnessReportValidationError(
-                        f"robustness report strategy='domain_adversarial' with a module-based/pathway "
-                        f"winning candidate but {f!r} is not_applicable — an adversarial report whose "
-                        "winning candidate actually has a domain head must record real domain-head/"
-                        "vocabulary identities."
+                        f"robustness report strategy='domain_adversarial' (applied) but {f!r} is "
+                        "not_applicable — a report whose winning candidate actually applied "
+                        "domain-adversarial training must record real domain-head/vocabulary "
+                        "identities."
                     )
         if d.get("calibration"):
             for f in ("calibration_fingerprint", "threshold_policy_fingerprint"):
@@ -276,13 +358,38 @@ def build_robustness_report(
     environment_fingerprint: Union[str, Dict, None] = None,
     threshold_policy_fingerprint: Union[str, Dict, None] = None,
     evaluated: bool = False, is_module_based_candidate: bool = False,
+    requested_strategy: Optional[str] = None, strategy_applicable: Optional[bool] = None,
+    strategy_applicability_reason: Optional[str] = None,
 ) -> RobustnessReport:
+    """
+    `strategy` is the APPLIED strategy (schema v3) — what the winning
+    candidate was actually trained with. `requested_strategy` defaults to
+    `strategy` when not given, which is correct for every call site that
+    does not itself do model selection across candidate kinds that support
+    different strategies (e.g. a branch with no candidate fit at all, or a
+    smoke-task branch where only ERM is ever requested or applied). A
+    caller that DOES select among heterogeneous candidate kinds (see
+    source_held_out.py::run_cancer_source_held_out) must resolve
+    requested_strategy/strategy/strategy_applicable/
+    strategy_applicability_reason explicitly via
+    candidate_registry.resolve_strategy_application before calling this
+    function, rather than relying on this default.
+    """
     def _na(v, reason):
         return v if v is not None else not_applicable(reason)
+
+    resolved_requested_strategy = requested_strategy if requested_strategy is not None else strategy
+    resolved_strategy_applicable = strategy_applicable if strategy_applicable is not None else True
+    resolved_strategy_applicability_reason = strategy_applicability_reason or (
+        "requested strategy equals applied strategy (default — no cross-candidate-kind selection at "
+        "this call site)"
+    )
 
     return RobustnessReport(
         schema_version=ROBUSTNESS_REPORT_SCHEMA_VERSION, development_only=True, frozen_test_accessed=False,
         task=task, model=model, strategy=strategy,
+        requested_strategy=resolved_requested_strategy, strategy_applicable=resolved_strategy_applicable,
+        strategy_applicability_reason=resolved_strategy_applicability_reason,
         dataset_manifest_fingerprint=_na(dataset_manifest_fingerprint, "no dataset manifest supplied"),
         source_split_manifest_fingerprint=_na(source_split_manifest_fingerprint, "split manifest not built for this branch"),
         preprocessing_fingerprint=_na(preprocessing_fingerprint, "no model was fit for this source"),

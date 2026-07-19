@@ -52,13 +52,20 @@ def _minimal_results():
 _VARIANTS = ["erm", "source_balanced", "coral"]
 
 
+_CANDIDATE = "pathway_hierarchical_mil"
+
+
 def _build():
-    return build_ablation_report("cancer", "auroc", _VARIANTS, [1], _minimal_results(), _minimal_paired_comparison())
+    return build_ablation_report(
+        "cancer", "auroc", _VARIANTS, [1], _minimal_results(), _minimal_paired_comparison(),
+        candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+    )
 
 
 def test_build_ablation_report_validates_by_construction():
     report = _build()
-    assert report["schema_version"] == "1.0"
+    assert report["schema_version"] == "2.0"
+    assert report["candidate_name"] == _CANDIDATE
     validate_ablation_report(report)
     validate_ablation_report_fingerprint_unchanged(report)
 
@@ -116,7 +123,10 @@ def test_corruption_nested_source_report_rejected_by_construction():
         "aggregate": results["erm"]["per_seed"][1]["aggregate"],
     }
     with pytest.raises(AblationReportValidationError):
-        build_ablation_report("cancer", "auroc", _VARIANTS, [1], results, _minimal_paired_comparison())
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [1], results, _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )
 
 
 def test_corruption_nested_source_report_rejected_after_the_fact():
@@ -154,28 +164,96 @@ def test_results_keys_must_match_declared_variants():
     with pytest.raises(AblationReportValidationError):
         build_ablation_report(
             "cancer", "auroc", ["erm", "source_balanced"], [1], _minimal_results(), _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
         )
 
 
 def test_seed_keys_must_match_declared_seeds():
     with pytest.raises(AblationReportValidationError):
-        build_ablation_report("cancer", "auroc", _VARIANTS, [2], _minimal_results(), _minimal_paired_comparison())
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [2], _minimal_results(), _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )
 
 
 def test_not_evaluable_seed_result_requires_a_reason():
     results = _minimal_results()
     results["coral"]["per_seed"][1] = {"status": "not_evaluable"}  # no reason
     with pytest.raises(AblationReportValidationError):
-        build_ablation_report("cancer", "auroc", _VARIANTS, [1], results, _minimal_paired_comparison())
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [1], results, _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )
 
 
 def test_insufficient_evidence_paired_comparison_requires_a_reason():
     paired = _minimal_paired_comparison()
     paired["coral"] = {"status": "insufficient_evidence"}  # no reason
     with pytest.raises(AblationReportValidationError):
-        build_ablation_report("cancer", "auroc", _VARIANTS, [1], _minimal_results(), paired)
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [1], _minimal_results(), paired,
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )
 
 
 def test_invalid_task_rejected():
     with pytest.raises(AblationReportValidationError):
-        build_ablation_report("not_a_task", "auroc", _VARIANTS, [1], _minimal_results(), _minimal_paired_comparison())
+        build_ablation_report(
+            "not_a_task", "auroc", _VARIANTS, [1], _minimal_results(), _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )
+
+
+def test_cancer_task_requires_real_candidate_name():
+    with pytest.raises(AblationReportValidationError):
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [1], _minimal_results(), _minimal_paired_comparison(),
+            candidate_name={"status": "not_applicable", "reason": "x"}, requested_model_names=[_CANDIDATE],
+        )
+
+
+def test_nested_evaluated_report_candidate_mismatch_rejected():
+    """An evaluated nested per-source report whose winning candidate is not
+    the ablation's own declared candidate_name must be rejected — the
+    fixed-model ablation design requires every evaluated row to share the
+    same winning candidate."""
+    results = _minimal_results()
+    mismatched = build_robustness_report(
+        task="cancer_prediction", model="logistic", strategy="erm", requested_strategy="erm",
+        strategy_applicable=True, held_out_source="a", eligibility={"status": "eligible"},
+        development_sources=["x"], metrics={"auroc": 0.7}, seed=1, evaluated=True,
+        is_module_based_candidate=False,
+        preprocessing_fingerprint="a" * 64, gene_list_fingerprint="a" * 64, model_fingerprint="b" * 64,
+        source_policy_fingerprint="a" * 64, source_split_manifest_fingerprint="a" * 64,
+        environment_fingerprint="a" * 64, dataset_manifest_fingerprint="a" * 64,
+    ).to_dict()
+    results["erm"]["per_seed"][1]["per_source"]["a"] = mismatched
+    with pytest.raises(AblationReportValidationError):
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [1], results, _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )
+
+
+def test_nested_evaluated_report_applied_strategy_must_equal_variant():
+    """An evaluated nested per-source report whose APPLIED strategy does not
+    equal its own result's variant name must be rejected — e.g. a
+    self-consistent 'coral'-applying report filed under the 'erm' variant
+    slot, which would misattribute CORAL evidence to the ERM row."""
+    results = _minimal_results()
+    coral_report = build_robustness_report(
+        task="cancer_prediction", model=_CANDIDATE, strategy="coral", requested_strategy="coral",
+        strategy_applicable=True, held_out_source="a", eligibility={"status": "eligible"},
+        development_sources=["x"], metrics={"auroc": 0.7}, seed=1, evaluated=True,
+        is_module_based_candidate=True,
+        preprocessing_fingerprint="a" * 64, gene_list_fingerprint="a" * 64, model_fingerprint="b" * 64,
+        module_fingerprint="a" * 64, source_policy_fingerprint="a" * 64,
+        source_split_manifest_fingerprint="a" * 64, environment_fingerprint="a" * 64,
+        dataset_manifest_fingerprint="a" * 64,
+    ).to_dict()
+    results["erm"]["per_seed"][1]["per_source"]["a"] = coral_report
+    with pytest.raises(AblationReportValidationError):
+        build_ablation_report(
+            "cancer", "auroc", _VARIANTS, [1], results, _minimal_paired_comparison(),
+            candidate_name=_CANDIDATE, requested_model_names=[_CANDIDATE],
+        )

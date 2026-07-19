@@ -1545,7 +1545,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (1147 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py`, `test_ablation_report.py` |
+| `tests/*` | All modules covered (1162 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py`, `test_ablation_report.py` |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -1826,6 +1826,75 @@ undefined metric is reported as undefined, never as `0.0`. Unknown-species
 metadata always resolves to `species_mismatch`, never to
 assumed-compatible.
 
+### Model/strategy support matrix, and requested vs. applied strategy
+
+| Candidate kind | Supported strategies |
+|---|---|
+| Classical baseline (`prevalence`, `logistic`, `random_forest`, ...) | `erm` only |
+| Pooling-based (non-module) MIL (`neural`, `mean_mil`, `max_mil`, `attention_mil`) | `erm` only |
+| `pathway_hierarchical_mil` (module-based) | `erm`, `source_balanced`, `coral`, `mmd`, `domain_adversarial` |
+
+Only `pathway_hierarchical_mil` has a training-time attachment point for
+anything other than plain ERM — `benchmarks/candidate_registry.py`'s
+`SUPPORTED_STRATEGIES_BY_KIND`/`resolve_strategy_application` is the single
+canonical place this matrix is expressed. This matters because the general
+source-held-out path (`run_cancer_source_held_out`) does MODEL SELECTION:
+for each held-out source, it picks whichever candidate (classical, pooling
+MIL, or pathway) had the best development-only OOF AUROC — and that winner
+is not always `pathway_hierarchical_mil`, even when a non-ERM strategy was
+requested for the run. A classical or pooling-MIL winner cannot receive
+CORAL/MMD/source-balanced/domain-adversarial training at all, regardless of
+what was requested.
+
+To keep this honest, every robustness report distinguishes:
+
+- **`requested_strategy`** — what the caller asked for.
+- **`strategy`** — what the winning candidate ACTUALLY applied. Equals
+  `requested_strategy` only when the winner's registry-derived candidate
+  kind supports it; otherwise it is always `"erm"`, because that is
+  genuinely what happened.
+- **`strategy_applicable`** / **`strategy_applicability_reason`** — whether
+  the requested strategy could be applied, and why/why not.
+
+A report can therefore legitimately read `requested_strategy: "coral"`,
+`strategy: "erm"`, `strategy_applicable: false` — meaning: a CORAL run was
+requested, a classical baseline won that source's model-selection sweep,
+and the reported metric reflects an ordinary ERM fit, not CORAL. Such a
+result is not, and must never be treated as, evidence for CORAL.
+`validate_robustness_report` enforces the whole consistency: a non-module
+winner's `strategy` must be `"erm"`; a `pathway_hierarchical_mil` winner's
+`strategy` must equal `requested_strategy` (its training path always
+receives and genuinely applies whatever was requested); and only a report
+whose `strategy` (applied) is actually `"domain_adversarial"` may carry a
+real domain-head/vocabulary identity.
+
+### Fixed-model domain-robustness ablation vs. general model selection
+
+`--domain-robustness-ablation` (`benchmarks/domain_robustness_ablation.py`)
+compares training STRATEGIES, not candidate MODELS — for the cancer task it
+therefore fixes every variant (ERM included) to the single candidate
+`pathway_hierarchical_mil`, the only one capable of running every declared
+strategy, rather than re-running the classical-vs-MIL-vs-pathway
+model-selection sweep per variant. A caller-supplied `model_names`/
+`--models` list has no effect on which candidate this ablation evaluates
+for the cancer task (it is still recorded, for provenance, in the report's
+`requested_model_names` field) — mixing "which model is best" with "which
+strategy is best" would let a classical baseline that merely won one
+variant's OOF sweep silently stand in for every strategy variant, which is
+exactly the attribution bug this fixed-candidate design prevents
+structurally. General classical-vs-MIL-vs-pathway model comparisons belong
+to the plain `--domain-strategy` path instead. The paired comparison against
+ERM additionally requires, per (source, seed) pair, that both sides'
+winning candidate match the ablation's declared `candidate_name`, that the
+variant side's `strategy_applicable` is true, and that preprocessing/
+module/split identity fingerprints agree between the two sides — a
+mismatch on any of these excludes that pair from the comparison (counted
+and reasoned in `excluded_pairs`) rather than silently averaging
+incompatible results. Task A's ablation has no such fixed-candidate
+concern: only ERM is ever evaluated for smoke, so `candidate_name` is a
+structured `not_applicable` value there and the ERM variant still sweeps
+`model_names` as a model-SELECTION comparison, not a strategy comparison.
+
 ### Domain-robust training strategies
 
 `benchmarks/domain_losses.py` implements, for `pathway_hierarchical_mil`
@@ -1954,8 +2023,13 @@ the aggregate's source count.
   `erm` are therefore not evaluated for Task A and are recorded as
   `not_evaluable` by the ablation runner rather than silently skipped.
   Task B (cancer) source-held-out evaluation covers classical baselines,
-  the pooling-based MIL models, and `pathway_hierarchical_mil` (including
-  every domain-robustness strategy) uniformly.
+  the pooling-based MIL models, and `pathway_hierarchical_mil` as candidates
+  in the same model-selection sweep, but only `pathway_hierarchical_mil` can
+  ever actually apply a non-ERM domain-robustness strategy — see "Model/
+  strategy support matrix" above. A classical or pooling-MIL winner under a
+  requested non-ERM strategy is reported honestly (`strategy: "erm"`,
+  `strategy_applicable: false`), never mislabeled as having run that
+  strategy.
 - With only two dataset sources in the synthetic CI context (and a small
   number of real GEO/TCGA sources in the real dataset manifest), the
   aggregate cross-source statistics (median, IQR, worst/best-source) have
@@ -1999,25 +2073,34 @@ the aggregate's source count.
   class distribution, and a weak-label policy fingerprint. Missing
   `smoke_type_known` metadata is a typed `LabelSchemaError`, never silently
   treated as "every label is verified".
-- The robustness report schema is versioned `2.0`: every report — including
+- The robustness report schema is versioned `3.0`: every report — including
   ineligible/not-evaluated branches — carries all twelve identity fields
   (`dataset_manifest_fingerprint`, `source_policy_fingerprint`,
   `source_split_manifest_fingerprint`, `preprocessing_fingerprint`,
   `gene_list_fingerprint`, `module_fingerprint`, `model_fingerprint`,
   `domain_head_fingerprint`, `domain_vocabulary_fingerprint`,
   `calibration_fingerprint`, `threshold_policy_fingerprint`,
-  `environment_fingerprint`) plus `seed`. A field that is genuinely
+  `environment_fingerprint`) plus `seed`, plus (schema v3, new) the
+  requested-vs-applied strategy fields `requested_strategy`, `strategy`
+  (applied), `strategy_applicable`, `strategy_applicability_reason` — see
+  "Model/strategy support matrix" above. A field that is genuinely
   inapplicable (e.g. a classical baseline's module fingerprint) is the
   structured `{"status": "not_applicable", "reason": ...}` value — never a
   bare `None` — and `validate_robustness_report` rejects a bare `None`, a
-  malformed (non-SHA-256) hash, or an `evaluated=True` report missing a
-  mandatory model/preprocessing/gene identity, an adversarial-strategy
-  report missing its domain-head/vocabulary identities, or a
-  calibration-bearing report missing its calibration/threshold identities.
-  `validate_report_fingerprint_unchanged` detects any post-write tampering
-  with a report's own fields. `_environment_fingerprint()` now raises a
-  typed `EnvironmentSnapshotError` rather than silently recording `None`
-  when a core package's version cannot be collected.
+  malformed (non-SHA-256) hash, an `evaluated=True` report missing a
+  mandatory model/preprocessing/gene identity, a non-module candidate whose
+  applied `strategy` is not `"erm"`, a module-based candidate whose applied
+  `strategy` disagrees with `requested_strategy`, a report whose applied
+  `strategy` is `"domain_adversarial"` but is missing its domain-head/
+  vocabulary identities, or a calibration-bearing report missing its
+  calibration/threshold identities. `validate_report_fingerprint_unchanged`
+  detects any post-write tampering with a report's own fields.
+  `_environment_fingerprint()` raises a typed `EnvironmentSnapshotError`
+  rather than silently recording `None` when a core package's version
+  cannot be collected. The domain-robustness ablation report schema is
+  separately versioned `2.0` (bumped for the `candidate_name`/
+  `requested_model_names` fields and the per-variant applied-strategy/
+  candidate consistency checks described above).
 - Source-aware strategies (CORAL, MMD, source-balanced sampling,
   domain-adversarial training, source-predictability diagnostics) reject a
   blank, placeholder (`""`, `"unknown"`, `"none"`, `"nan"`, ...), or

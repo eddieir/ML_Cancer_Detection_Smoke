@@ -2183,6 +2183,69 @@ addressed as follows:
   `strategy == "domain_adversarial"` AND the winner is module-based;
   a classical-baseline winner under that strategy correctly records
   not-applicable domain-head/vocabulary identities instead.
+- **Requested vs. applied strategy attribution (schema v3).** The
+  candidate-kind fix above closed the module-fingerprint/domain-head gaps,
+  but left a deeper attribution bug: `run_cancer_source_held_out` only ever
+  passes `domain_robustness_config` to `generate_subject_oof_predictions`/
+  `fit_final_candidate_on_dev_pool` when the winning candidate is
+  `PATHWAY_MODEL_NAME` — correct, since only that adapter has any
+  attachment point for a non-ERM strategy — but the report still recorded
+  `strategy=domain_cfg["strategy"]` (the REQUESTED strategy) unconditionally,
+  regardless of which candidate actually won. A `coral`/`mmd`/
+  `source_balanced`/`domain_adversarial` run whose OOF sweep happened to
+  pick a classical baseline was therefore reported as if that baseline had
+  applied the requested strategy, when it was actually trained with plain
+  ERM. `benchmarks/candidate_registry.py` gained
+  `SUPPORTED_STRATEGIES_BY_KIND`/`resolve_strategy_application(name,
+  requested_strategy)` — the canonical capability matrix (classical/
+  non-module MIL: ERM only; pathway module-based MIL: every strategy) — and
+  `RobustnessReport` gained `requested_strategy`, `strategy_applicable`,
+  `strategy_applicability_reason`, with `strategy` REDEFINED to mean the
+  APPLIED strategy rather than the requested one (schema bumped `2.0` ->
+  `3.0`). `run_cancer_source_held_out`'s winning-candidate branch now calls
+  `resolve_strategy_application(best_name, domain_cfg["strategy"])` and
+  threads the result through `build_robustness_report` instead of the bare
+  requested string. `validate_robustness_report` enforces the whole
+  consistency for every evaluated report: a non-module winner's `strategy`
+  must be `"erm"` (and `strategy_applicable` reflects whether
+  `requested_strategy` was itself `"erm"`); a module-based winner's
+  `strategy` must equal `requested_strategy` and `strategy_applicable` must
+  be `True` (its training path always genuinely applies whatever was
+  requested); and the pre-existing domain-adversarial domain-head/
+  vocabulary requirement now keys off the APPLIED `strategy` field, which
+  by the above consistency check can only be `"domain_adversarial"` for a
+  module-based winner — the earlier `and derived_is_module_based` guard
+  becomes redundant with this and was removed. `build_robustness_report`
+  defaults `requested_strategy`/`strategy_applicable` from `strategy` when
+  not given, so every call site that does not itself select across
+  candidate kinds (ineligible branches, the no-candidate-selected branch,
+  every Task A smoke branch, which is ERM-only) is unaffected.
+- **Fixed-model domain-robustness ablation.** A second, related bug:
+  `run_domain_robustness_ablation`'s cancer branch passed the caller's full
+  `model_names` list into `run_cancer_source_held_out` for every strategy
+  variant, so each variant independently ran its own classical-vs-MIL-vs-
+  pathway model-selection sweep — the ERM "reference" and the `coral`
+  variant, for instance, could each be won by a different candidate,
+  making the "paired" comparison not actually paired on architecture. The
+  cancer branch now always fixes `model_names` to
+  `[FIXED_CANCER_ABLATION_CANDIDATE]` (`pathway_hierarchical_mil`),
+  ignoring the caller-supplied list for candidate selection (it is still
+  recorded in the new `requested_model_names` field for provenance); a new
+  `_reject_non_fixed_candidate_winners` defensively raises if any evaluated
+  per-source report's winner is not the fixed candidate. `ablation_report`'s
+  schema (bumped `1.0` -> `2.0`) gained a required `candidate_name` field
+  (a real string for cancer; a structured `not_applicable` value for
+  smoke, which still sweeps `model_names` for its ERM-only variant) and,
+  per evaluated nested report, checks that its `model` matches
+  `candidate_name` and its applied `strategy` matches the variant name it
+  was filed under. The paired-comparison function
+  (`_paired_comparison_multi_seed`) now reads full per-source report dicts
+  (not bare metric floats) so it can exclude, per (source, seed) pair
+  BEFORE averaging: a candidate mismatch between the two sides, a variant
+  side whose `strategy_applicable` is `False`, or a mismatch in
+  `preprocessing_fingerprint`/`module_fingerprint`/
+  `source_split_manifest_fingerprint` — each exclusion reason is counted
+  in the comparison's `excluded_pairs` rather than silently dropped.
 - **Complete smoke OOF coverage, enforced.** `_smoke_candidate_dev_score`
   now validates every OOF probability row (`_validate_oof_probability_row`:
   correct `num_classes` dimension, all-finite, sums to 1 within tolerance —
