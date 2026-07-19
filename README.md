@@ -1545,7 +1545,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (574 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`) |
+| `tests/*` | All modules covered (1162 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py`, `test_ablation_report.py` |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -1735,13 +1735,485 @@ A real (non-synthetic) run requires a supplied gene-module file
 model refuses to construct with an actionable configuration error rather
 than silently substituting the synthetic diagnostic scheme.
 
-**Scope note.** An adversarial domain-training head and a model-specific
-calibration fit (the existing generic post-hoc calibrator is reused
-unchanged instead) remain unimplemented — see ARCHITECTURE.md §15.7/§15.8
-for the full, explicit list. All results produced against synthetic data
-anywhere in this repository (including this model's tests) are
-software-correctness checks, not scientific evidence, and no result from
-this model has been produced against real data or the frozen test set.
+**Scope note.** A model-specific calibration fit (the existing generic
+post-hoc calibrator is reused unchanged instead) remains unimplemented. The
+domain-adversarial training head mentioned here in earlier phases is now
+implemented — see "Phase 6 — Domain robustness and biological validation"
+below. All results produced against synthetic data anywhere in this
+repository (including this model's tests) are software-correctness checks,
+not scientific evidence, and no result from this model has been produced
+against real data or the frozen test set.
+
+## Phase 6 — Domain robustness and biological validation
+
+Phase 5 established that `pathway_hierarchical_mil` can be trained and
+evaluated through the same protocol as every other candidate. Phase 6 asks a
+different question: does whatever it learns on the development sources
+carry over to a source it never saw during development? This section
+distinguishes that question sharply from "did the model fit the data it was
+given."
+
+### Source-held-out evaluation vs. the frozen final test
+
+These are two different, non-interchangeable things:
+
+- **The frozen final test** (`benchmarks/test_guard.py`) is this
+  repository's one-shot, durably-guarded evaluation against subjects held
+  out before any development work began. It may be evaluated exactly once
+  per scientific identity, ever.
+- **Source-held-out evaluation** (`benchmarks/source_held_out.py`) is a
+  repeatable, development-only DIAGNOSTIC: for each dataset source present
+  in the train+val pool, train on every other source and evaluate on the
+  held-out one. It never reads `context.test_bags`, never resolves
+  `split_manifest.test_subjects`, and never acquires or references
+  `FrozenTestGuard` — running it any number of times, for any number of
+  sources, has no effect on the frozen test's one-shot guarantee, and it
+  does not need or use `--disable-frozen-test-guard`.
+
+Held-out-source results are development evidence about robustness to
+acquisition-source shift. They are not a substitute for, and must not be
+described as equivalent to, the frozen test result.
+
+### Why source shift matters here
+
+Single-cell/microarray transcriptomics datasets differ by processing
+batch, platform, donor population, and library preparation — a model that
+distinguishes smoke-exposure or cancer status well within one source can be
+partly (or entirely) relying on structure specific to that source's
+acquisition pipeline rather than the underlying biology. Source-held-out
+evaluation is the standard way to get development-only evidence about
+whether that has happened, though a small number of sources (this
+repository currently has at most a handful of distinct GEO/TCGA sources per
+task) limits how strong that evidence can ever be — see "Honest limitations"
+below.
+
+### Running it (synthetic, software-only)
+
+```
+python -m benchmarks.runner --synthetic --fast --task smoke \
+    --models majority pathway_hierarchical_mil --leave-one-source-out
+python -m benchmarks.runner --synthetic --fast --task cancer \
+    --models prevalence pathway_hierarchical_mil --domain-strategy coral --coral-weight 0.1
+python -m benchmarks.runner --synthetic --fast --task cancer \
+    --models prevalence pathway_hierarchical_mil --domain-robustness-ablation
+```
+
+`--leave-one-source-out` is the pre-existing (Phase 1) Task-A/classical-
+baseline-only diagnostic (`benchmarks/ood.py`) and is unchanged.
+`--domain-strategy {erm,source_balanced,coral,mmd,domain_adversarial}` (with
+`--source-balanced`, `--coral-weight`, `--mmd-weight`,
+`--domain-loss-weight`, `--gradient-reversal-lambda`) and
+`--domain-robustness-ablation` run the richer, both-task, all-model-kind
+protocol in `benchmarks/source_held_out.py` and
+`benchmarks/domain_robustness_ablation.py`, writing
+`<run_dir>/metrics/domain_robustness_{smoke,cancer}.json` (and, if
+`--robustness-report <path>` is given, a copy at that path). Every one of
+these commands above has actually been run against the synthetic context
+during this phase's development — none of the numbers they print are
+fabricated — but a synthetic run proves the software runs correctly, not
+that the model generalizes across real acquisition sources.
+
+### Source eligibility
+
+Not every dataset source is automatically eligible to serve as a held-out
+external-domain evaluation set. `benchmarks/source_eligibility.py` assigns
+each source one of: `eligible`, `not_evaluable`, `insufficient_classes`,
+`insufficient_outcomes` (still eligible — only AUROC/AUPRC are undefined),
+`species_mismatch`, `controlled_access_unavailable`, or
+`excluded_by_policy`. An ineligible source is recorded with its reason and
+skipped — it never crashes the sweep over the other sources, and an
+undefined metric is reported as undefined, never as `0.0`. Unknown-species
+metadata always resolves to `species_mismatch`, never to
+assumed-compatible.
+
+### Model/strategy support matrix, and requested vs. applied strategy
+
+| Candidate kind | Supported strategies |
+|---|---|
+| Classical baseline (`prevalence`, `logistic`, `random_forest`, ...) | `erm` only |
+| Pooling-based (non-module) MIL (`neural`, `mean_mil`, `max_mil`, `attention_mil`) | `erm` only |
+| `pathway_hierarchical_mil` (module-based) | `erm`, `source_balanced`, `coral`, `mmd`, `domain_adversarial` |
+
+Only `pathway_hierarchical_mil` has a training-time attachment point for
+anything other than plain ERM — `benchmarks/candidate_registry.py`'s
+`SUPPORTED_STRATEGIES_BY_KIND`/`resolve_strategy_application` is the single
+canonical place this matrix is expressed. This matters because the general
+source-held-out path (`run_cancer_source_held_out`) does MODEL SELECTION:
+for each held-out source, it picks whichever candidate (classical, pooling
+MIL, or pathway) had the best development-only OOF AUROC — and that winner
+is not always `pathway_hierarchical_mil`, even when a non-ERM strategy was
+requested for the run. A classical or pooling-MIL winner cannot receive
+CORAL/MMD/source-balanced/domain-adversarial training at all, regardless of
+what was requested.
+
+To keep this honest, every robustness report distinguishes:
+
+- **`requested_strategy`** — what the caller asked for.
+- **`strategy`** — what the winning candidate ACTUALLY applied. Equals
+  `requested_strategy` only when the winner's registry-derived candidate
+  kind supports it; otherwise it is always `"erm"`, because that is
+  genuinely what happened.
+- **`strategy_applicable`** / **`strategy_applicability_reason`** — whether
+  the requested strategy could be applied, and why/why not.
+
+A report can therefore legitimately read `requested_strategy: "coral"`,
+`strategy: "erm"`, `strategy_applicable: false` — meaning: a CORAL run was
+requested, a classical baseline won that source's model-selection sweep,
+and the reported metric reflects an ordinary ERM fit, not CORAL. Such a
+result is not, and must never be treated as, evidence for CORAL.
+`validate_robustness_report` enforces the whole consistency: a non-module
+winner's `strategy` must be `"erm"`; a `pathway_hierarchical_mil` winner's
+`strategy` must equal `requested_strategy` (its training path always
+receives and genuinely applies whatever was requested); and only a report
+whose `strategy` (applied) is actually `"domain_adversarial"` may carry a
+real domain-head/vocabulary identity.
+
+### Fixed-model domain-robustness ablation vs. general model selection
+
+`--domain-robustness-ablation` (`benchmarks/domain_robustness_ablation.py`)
+compares training STRATEGIES, not candidate MODELS — for the cancer task it
+therefore fixes every variant (ERM included) to the single candidate
+`pathway_hierarchical_mil`, the only one capable of running every declared
+strategy, rather than re-running the classical-vs-MIL-vs-pathway
+model-selection sweep per variant. A caller-supplied `model_names`/
+`--models` list has no effect on which candidate this ablation evaluates
+for the cancer task (it is still recorded, for provenance, in the report's
+`requested_model_names` field) — mixing "which model is best" with "which
+strategy is best" would let a classical baseline that merely won one
+variant's OOF sweep silently stand in for every strategy variant, which is
+exactly the attribution bug this fixed-candidate design prevents
+structurally. General classical-vs-MIL-vs-pathway model comparisons belong
+to the plain `--domain-strategy` path instead. The paired comparison against
+ERM additionally requires, per (source, seed) pair, that both sides'
+winning candidate match the ablation's declared `candidate_name`, that the
+variant side's `strategy_applicable` is true, and that preprocessing/
+module/split identity fingerprints agree between the two sides — a
+mismatch on any of these excludes that pair from the comparison (counted
+and reasoned in `excluded_pairs`) rather than silently averaging
+incompatible results. Task A's ablation has no such fixed-candidate
+concern: only ERM is ever evaluated for smoke, so `candidate_name` is a
+structured `not_applicable` value there and the ERM variant still sweeps
+`model_names` as a model-SELECTION comparison, not a strategy comparison.
+
+### Domain-robust training strategies
+
+`benchmarks/domain_losses.py` implements, for `pathway_hierarchical_mil`
+only (the one architecture with a subject-embedding attachment point —
+`HierarchicalMILOutput.subject_embeddings`):
+
+- **`erm`** — unchanged empirical risk minimization; the default.
+- **`source_balanced`** — source -> subject -> cell sampling
+  (`data/source_sampling.py`), so a source with more subjects does not
+  dominate training purely because of subject count.
+- **`coral`** — development-only CORAL covariance-alignment penalty across
+  development sources' subject embeddings (Sun & Saenko 2016's formula).
+- **`mmd`** — development-only RBF-kernel maximum-mean-discrepancy penalty
+  across development sources' subject embeddings (Gretton et al.'s
+  two-sample test statistic), median-bandwidth heuristic.
+- **`domain_adversarial`** — a gradient-reversal layer
+  (Ganin & Lempitsky 2015) feeding a development-source classifier head;
+  verified by an explicit test that the reversed gradient is the exact
+  negation of the un-reversed one.
+
+Every regularizer is weighted, defaults to weight `0.0`/disabled, and is
+computed only from development-source subject embeddings — a held-out
+source's representation never enters any of these loss terms (structurally
+true: the loss functions only ever see whatever `sources` list the caller
+passes, and the caller — `source_held_out.py` — never includes the held-out
+source's subjects in a development fit). None of these are described as
+making the model "domain invariant" — they are training-time penalties
+whose actual effect is reported empirically per source in the robustness
+report, never assumed.
+
+### Nested source-aware hyperparameter selection
+
+The final development-pool fit's hyperparameters (including, when
+applicable, the domain-robustness strategy's own weights) are selected via
+`benchmarks/hyperparameter_search.py`'s existing nested, per-fold-refit
+selection restricted to development-source subjects only — the held-out
+source's subjects are excluded from the subject pool passed into selection
+at the call site, not merely down-weighted afterward.
+
+### Calibration and uncertainty under source shift
+
+Calibration and the decision threshold are fit exclusively from
+development out-of-fold predictions (`benchmarks/calibration.py`, reused
+unchanged) and applied to the held-out source's raw probabilities exactly
+once per source (a fresh `FrozenThresholdPolicy` per held-out source — this
+one-shot-per-policy discipline is unrelated to, and does not touch, the
+real frozen-test guard). `benchmarks/uncertainty.py` adds predictive
+entropy, MC-dropout dispersion (explicitly not a calibrated confidence
+interval), and an optional abstention-coverage diagnostic whose threshold
+is selected from development data only; abstention is reported alongside,
+never instead of, the full-population held-out-source metric.
+
+### Domain-shift diagnostics
+
+`benchmarks/domain_shift.py` reports label-free diagnostics computed from
+development-fitted features only: gene/module coverage, subject/cell
+composition, and distribution-shift distance (centroid, energy, CORAL, MMD)
+between development and held-out-source feature distributions, plus an
+optional source-predictability classifier (how much source identity remains
+encoded in a representation, compared against a label-permutation
+baseline). A high source-predictability score is reported as a fact about
+the representation, not automatically as model failure; a low one is not
+proof of invariance.
+
+### Biological stability — synthetic-module-scoped
+
+**No real gene-set (GMT) resource ships with this repository.** Every
+concrete module-stability or attention-stability number this phase has
+actually produced (in tests, in CI, in the synthetic CLI runs above) comes
+from `GeneModuleCollection.synthetic()` — the same deterministic,
+non-biological placeholder scheme Phase 5 already used — and is therefore a
+**software sensitivity diagnostic, not a biological-plausibility finding**.
+`benchmarks/biological_stability.py`'s real-mode entry point
+(`require_real_modules`) refuses to run against a synthetic module source
+at all, so a real run cannot silently produce a "biological stability"
+result that is actually synthetic. What it measures once a real module
+resource is supplied: module-ablation "model-weighted contribution" scores
+and their rank stability/top-k overlap across folds/seeds, cell-type
+attention distribution and its stability, an attention-vs-cell-type-
+abundance correlation against a permutation null (is attention just
+tracking which cell type is most numerous?), and a cell-order permutation-
+invariance check (verified in this repository: shuffling cell order within
+a bag changes the predicted logit by less than `1e-3`, consistent with the
+pooling architecture's masked-attention construction). Attention weights
+are reported as "pooling weight" / "model-weighted contribution," never as
+biological importance, and a performance drop after removing a module is
+reported as a model-sensitivity finding, never as evidence that module is
+biologically causal.
+
+All three diagnostic families above (domain-shift, uncertainty/abstention,
+and biological stability) are wired directly into every applicable
+per-source robustness report, not just implemented as standalone functions
+— `report.domain_shift`/`report.uncertainty`/`report.biological_stability`
+are populated for every held-out source a candidate was actually fit and
+evaluated for, and stamped `not_applicable`/`not_evaluable` with an explicit
+reason when a diagnostic genuinely does not apply (e.g. biological-stability
+diagnostics for a non-pathway candidate, MC-dropout for a non-neural one).
+The biological-stability section additionally runs a genuinely
+separately-fitted label-permutation null (a second full development-pool
+fit on label-permuted outcomes, never a relabeled copy of the real ranking)
+and a cell-type-label permutation check alongside the existing matched-
+size-random-module control and attention-vs-abundance permutation null.
+
+### Reading the robustness report
+
+`benchmarks/robustness_report.py` defines a versioned JSON schema
+(`schema_version`, always stamped `development_only: true` and
+`frozen_test_accessed: false`), atomic writes with reload verification, and
+cross-source aggregation (`benchmarks/robustness_report.py::
+aggregate_source_reports`) that reports the **worst-source** result
+explicitly rather than only a pooled average, alongside the macro-source
+average, a separate (secondary) subject-weighted average, median, and IQR.
+An ineligible source is listed with its reason, never silently dropped from
+the aggregate's source count.
+
+### Honest limitations
+
+- No real GMT gene-set resource is committed to or referenced by this
+  repository — every biological-stability number produced so far is a
+  synthetic-module software diagnostic (see above).
+- Task A (smoke-type) source-held-out evaluation covers classical
+  baselines and `pathway_hierarchical_mil`'s plain-ERM fit; it does not
+  extend to the pooling-based MIL models or to `MultiSmokeCancerNet`'s
+  cell-level `Trainer` curriculum — that would require a materially larger
+  rework of the per-source refit flow. `--domain-strategy` values other than
+  `erm` are therefore not evaluated for Task A and are recorded as
+  `not_evaluable` by the ablation runner rather than silently skipped.
+  Task B (cancer) source-held-out evaluation covers classical baselines,
+  the pooling-based MIL models, and `pathway_hierarchical_mil` as candidates
+  in the same model-selection sweep, but only `pathway_hierarchical_mil` can
+  ever actually apply a non-ERM domain-robustness strategy — see "Model/
+  strategy support matrix" above. A classical or pooling-MIL winner under a
+  requested non-ERM strategy is reported honestly (`strategy: "erm"`,
+  `strategy_applicable: false`), never mislabeled as having run that
+  strategy.
+- With only two dataset sources in the synthetic CI context (and a small
+  number of real GEO/TCGA sources in the real dataset manifest), the
+  aggregate cross-source statistics (median, IQR, worst/best-source) have
+  very little statistical power — they are reported honestly rather than
+  suppressed, but should not be read as strong evidence either way.
+- Domain-adversarial training's gradient-reversal direction is unit-tested
+  directly; its practical effect on real-source generalization has not
+  been evaluated against real data in this phase.
+- No claim of domain invariance, clinical validity, biomarker discovery, or
+  state-of-the-art performance is made anywhere for this phase's work — see
+  ARCHITECTURE.md §16 for the full scientific-claims policy this repository
+  follows.
+- Source eligibility prefers the canonical dataset manifest
+  (`data/manifest.py`) for species/controlled-access metadata whenever a
+  source is declared there, and raises `SourcePolicyDriftError`
+  (`benchmarks/source_eligibility.py::resolve_source_policy`) if a
+  caller-supplied `species_by_source`/`controlled_access_sources` override
+  contradicts it; a source the manifest does not declare (e.g. a synthetic
+  test source) still resolves from the caller-supplied dicts unchanged.
+- `PathwayHierarchicalAdapter.save_bundle`/`load_bundle` persist and
+  restore a fitted candidate's complete state through a Phase-4-style
+  bundle (`benchmarks/bundle.py`) — model weights, gene modules, the
+  domain-robustness configuration, and (when built) the domain-adversarial
+  head's own weights and fixed development-source vocabulary all round-trip
+  and are cross-checked on load; an altered checkpoint, a missing domain
+  head where the recorded strategy requires one, or a vocabulary mismatch
+  all raise rather than silently loading a partial or inconsistent state.
+- The domain-robustness ablation runner accepts multiple seeds
+  (`run_domain_robustness_ablation(..., seeds=[...])`) and reports a
+  paired comparison against ERM per (source, seed) pair — mean/median
+  difference, win/tie/loss counts, and an explicit `insufficient_evidence`
+  status when fewer than two common (source, seed) pairs were evaluated,
+  never a point estimate presented without its sample size.
+- Task A's smoke-type ground truth for source-held-out evaluation and
+  candidate selection is restricted to `smoke_type_known=True` cells only
+  (unknown and, unless `data.weak_labels.enabled=true`, weak-proxy cells
+  never contribute); a subject whose own verified cells disagree on
+  `smoke_type` raises rather than being resolved by majority vote. Each
+  source-held-out report's `label_state` field records verified/unknown/
+  weak-proxy-only/conflicting/excluded-by-policy subjects, the verified
+  class distribution, and a weak-label policy fingerprint. Missing
+  `smoke_type_known` metadata is a typed `LabelSchemaError`, never silently
+  treated as "every label is verified".
+- The robustness report schema is versioned `3.0`: every report — including
+  ineligible/not-evaluated branches — carries all twelve identity fields
+  (`dataset_manifest_fingerprint`, `source_policy_fingerprint`,
+  `source_split_manifest_fingerprint`, `preprocessing_fingerprint`,
+  `gene_list_fingerprint`, `module_fingerprint`, `model_fingerprint`,
+  `domain_head_fingerprint`, `domain_vocabulary_fingerprint`,
+  `calibration_fingerprint`, `threshold_policy_fingerprint`,
+  `environment_fingerprint`) plus `seed`, plus (schema v3, new) the
+  requested-vs-applied strategy fields `requested_strategy`, `strategy`
+  (applied), `strategy_applicable`, `strategy_applicability_reason` — see
+  "Model/strategy support matrix" above. A field that is genuinely
+  inapplicable (e.g. a classical baseline's module fingerprint) is the
+  structured `{"status": "not_applicable", "reason": ...}` value — never a
+  bare `None` — and `validate_robustness_report` rejects a bare `None`, a
+  malformed (non-SHA-256) hash, an `evaluated=True` report missing a
+  mandatory model/preprocessing/gene identity, a non-module candidate whose
+  applied `strategy` is not `"erm"`, a module-based candidate whose applied
+  `strategy` disagrees with `requested_strategy`, a report whose applied
+  `strategy` is `"domain_adversarial"` but is missing its domain-head/
+  vocabulary identities, or a calibration-bearing report missing its
+  calibration/threshold identities. `validate_report_fingerprint_unchanged`
+  detects any post-write tampering with a report's own fields.
+  `_environment_fingerprint()` raises a typed `EnvironmentSnapshotError`
+  rather than silently recording `None` when a core package's version
+  cannot be collected. The domain-robustness ablation report schema is
+  separately versioned `2.0` (bumped for the `candidate_name`/
+  `requested_model_names` fields and the per-variant applied-strategy/
+  candidate consistency checks described above).
+- Source-aware strategies (CORAL, MMD, source-balanced sampling,
+  domain-adversarial training, source-predictability diagnostics) reject a
+  blank, placeholder (`""`, `"unknown"`, `"none"`, `"nan"`, ...), or
+  cross-subject-conflicting `dataset_source` value with a typed
+  `MissingSourceProvenanceError`/`CrossSourceSubjectConflictError` rather
+  than silently mapping it to a literal "unknown" bucket.
+- `resolve_source_policy` folds manifest-declared assay mode, label-policy
+  version, weak-label-field status, cohort role (real vs. synthetic
+  fixture), and exclusion policy into the SAME dict every caller already
+  fingerprints in full as `source_policy_fingerprint`. `reference_assay_mode`
+  rejects a source whose declared assay disagrees (e.g. bulk TCGA data can
+  never enter this single-cell protocol) via the (previously unused)
+  `ASSAY_MISMATCH` eligibility status.
+- Two additional null/perturbation controls are wired into
+  `biological_stability`: `gene_module_permutation_null` (same random
+  column permutation applied to every module's membership mask — preserves
+  module sizes and the ordered gene universe exactly, destroys the real
+  gene<->module association) and `within_gene_expression_permutation_null`
+  (each gene's expression independently reshuffled across every valid cell
+  in the diagnostic bag set — preserves that gene's own marginal
+  distribution exactly, reads no subject_id or label). `cross_run_stability`
+  reports `insufficient_evidence` by default and only becomes `evaluated`
+  when a caller supplies `stability_extra_seeds`/`extra_seeds`, which
+  trigger GENUINE independent refits (never repeated calls to one already-
+  fitted model) whose module-ablation rankings are compared via
+  `module_ranking_stability`.
+- Task A's multi-class uncertainty/abstention diagnostic
+  (`smoke_uncertainty_report`) selects its development abstention threshold
+  from GENUINE out-of-fold probabilities — `_smoke_candidate_dev_score`'s
+  grouped-CV sweep now returns `oof_by_subject` (each verified development
+  subject predicted only by the one fold it was held out of, columns
+  re-aligned to the full class vocabulary even when a fold's training data
+  missed a class) for whichever candidate wins selection, and that is what
+  drives threshold selection — never the final dev-pool-fitted model's
+  in-sample predictions on its own training pool. Full-population macro-F1
+  remains primary; retained-subset macro-F1 is secondary. Held-out-source
+  labels and expression never influence the threshold.
+- The robustness report schema's `module_fingerprint` requirement is now
+  candidate-kind-aware (`is_module_based_candidate`, stamped by the caller):
+  an evaluated classical baseline or non-module MIL model must record a
+  structured `not_applicable` module identity; only `pathway_hierarchical_
+  mil` must record a real module hash. `domain_head_fingerprint`/
+  `domain_vocabulary_fingerprint` remain required only for
+  `strategy=domain_adversarial`; `calibration_fingerprint`/
+  `threshold_policy_fingerprint` remain required only when a report's
+  `calibration` block is non-empty.
+- Every per-source report is validated (`validate_robustness_report` +
+  `validate_report_fingerprint_unchanged`) before it is allowed to enter an
+  aggregate (`build_aggregate_report`, `run_domain_robustness_ablation`) or
+  reach disk — this is enforced by the production functions themselves,
+  not left to tests to call manually. `validate_aggregate_report` checks
+  the aggregate's own schema/stamps and recursively validates every nested
+  per-source report; `write_aggregate_report` mirrors
+  `write_robustness_report`'s atomic-write-plus-reload-and-validate
+  contract for the aggregate shape.
+- `gene_space_compatibility` no longer reports a self-vs-self "100%
+  compatible" placeholder. This pipeline unifies every source onto one
+  shared gene space at ingestion time, before any per-source raw gene
+  panel would even be distinguishable, so no current caller has a real
+  held-out raw gene panel to compare against — the function now returns a
+  structured `not_evaluable` status (`"reason": "raw source-specific gene
+  contract unavailable"`) by default, and performs a real missing/
+  unexpected/duplicate-mapping/coverage computation whenever a caller does
+  supply one (tested directly against synthetic partial gene panels).
+- `GeneModuleCollection` (`pathway_hierarchical_mil.py`) records
+  `source_name`/`source_version` provenance and a content fingerprint, but
+  does not yet carry a full real-module provenance schema (organism,
+  namespace, mapping-policy, license, checksum). Rather than emit
+  `scope: real_module_sensitivity_analysis` without that contract,
+  `cancer_biological_stability_report` now explicitly REJECTS a non-
+  synthetic module source (`status: "unsupported"`,
+  `scope: "unsupported_real_module_analysis"`) — real-module biological-
+  stability analysis is disabled, not silently under-documented. Synthetic-
+  module results remain `scope: "software_diagnostic_only"`.
+- `dataset_manifest_fingerprint` is now required to be a real hash for
+  every EVALUATED report (`_REQUIRED_WHEN_EVALUATED`) — it can no longer
+  default to `not_applicable` just because no caller threaded a manifest
+  through. `runner.py`'s `_dataset_manifest_entries_for_run` builds an
+  explicit synthetic manifest for `--synthetic` runs (never exempted from
+  the requirement) or loads `configs/datasets.yaml` for real runs, raising
+  `MissingDatasetManifestError` if that seed is absent — never silently
+  falling back to `not_applicable` for a real run. Ineligible/non-evaluated
+  reports get the same real fingerprint whenever a manifest was supplied
+  (computed once, independent of any one source's eligibility);
+  `not_applicable` remains acceptable there only when no manifest was ever
+  supplied.
+- `is_module_based_candidate` is no longer trusted verbatim from the
+  caller. `benchmarks/candidate_registry.py` derives candidate kind
+  (classical baseline / non-module MIL / pathway module-based MIL) from
+  the canonical `baselines.py`/`mil_registry.py` registries and raises a
+  typed `UnknownCandidateNameError` for any unrecognized model name;
+  `validate_robustness_report` recomputes this from the report's own
+  `model` field and rejects any report whose declared
+  `is_module_based_candidate` disagrees with the registry-derived kind.
+- Task A's OOF coverage is now enforced, not just collected.
+  `_smoke_candidate_dev_score` validates every OOF probability row
+  (correct dimension, finite, sums to 1) and rejects a fold that predicts
+  a subject it also trained on; after the sweep, `_oof_coverage_summary`
+  checks whether every verified-label development subject received
+  exactly one OOF prediction and forces the candidate's score to `None`
+  (never selectable) if not. The winning candidate's coverage counts and
+  fingerprints (subject-set/fold-assignment/class-order — never a raw
+  subject-ID list) are persisted in `comparisons` and in
+  `smoke_uncertainty_report`'s output.
+- Domain-robustness ablation output now has its own versioned schema
+  (`benchmarks/ablation_report.py`, `ABLATION_REPORT_SCHEMA_VERSION`):
+  `build_ablation_report` validates every nested per-source report
+  recursively (the same schema-v2 choke point `build_aggregate_report`
+  uses) plus the per-variant/per-seed structure and paired-comparison
+  shape before stamping a whole-report `aggregate_fingerprint`;
+  `write_ablation_report` atomically writes, reloads, and re-validates.
+  `runner.py` persists ablation output through this writer instead of the
+  generic `write_json`.
 
 ## Next steps
 

@@ -5,9 +5,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from benchmarks.runner import main
+from benchmarks.runner import DomainRobustnessCLIConfigurationError, main
+from benchmarks.source_held_out import UnsupportedSmokeDomainStrategyError
 
 
 def _run(args):
@@ -47,10 +50,86 @@ def test_synthetic_smoke_task_with_leave_one_source_out():
     shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
 
 
+def test_malformed_per_source_report_blocks_real_cli_persistence(monkeypatch):
+    """Injects one malformed per-source identity into a REAL CLI run
+    (main(...), not a unit-level call to the validator) and proves the run
+    raises rather than silently persisting a broken robustness-report JSON
+    — schema-v2 validation is enforced by the production path itself, not
+    only by tests that remember to call it."""
+    import benchmarks.runner as runner_module
+    from benchmarks.robustness_report import RobustnessReportValidationError
+
+    real_run_cancer_source_held_out = runner_module.run_cancer_source_held_out
+
+    def _corrupting_run_cancer_source_held_out(*args, **kwargs):
+        reports = real_run_cancer_source_held_out(*args, **kwargs)
+        # Corrupt exactly one real per-source report's identity: a bare
+        # None is never a valid value for any identity field.
+        first_key = next(iter(reports))
+        reports[first_key] = dict(reports[first_key])
+        reports[first_key]["module_fingerprint"] = None
+        return reports
+
+    monkeypatch.setattr(runner_module, "run_cancer_source_held_out", _corrupting_run_cancer_source_held_out)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(RobustnessReportValidationError):
+            main([
+                "--synthetic", "--fast", "--task", "cancer", "--domain-strategy", "erm",
+                "--output", tmp, "--run-id", "corrupted_run",
+            ])
+        # The aggregate report must never have been written — persistence
+        # failed before any bytes reached disk for this file.
+        assert not (Path(tmp) / "corrupted_run" / "metrics" / "domain_robustness_cancer.json").exists()
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
 def test_run_id_collision_raises_not_overwrites():
-    import pytest
     with tempfile.TemporaryDirectory() as tmp:
         _run(["--synthetic", "--fast", "--task", "smoke", "--output", tmp, "--run-id", "dup"])
         with pytest.raises(FileExistsError):
             main(["--synthetic", "--fast", "--task", "smoke", "--output", tmp, "--run-id", "dup"])
+    shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)
+
+
+def test_coral_weight_without_coral_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--coral-weight", "0.1"])
+
+
+def test_mmd_weight_with_non_mmd_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--domain-strategy", "coral", "--mmd-weight", "0.1"])
+
+
+def test_gradient_reversal_lambda_without_adversarial_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--gradient-reversal-lambda", "1.0"])
+
+
+def test_source_balanced_without_source_balanced_strategy_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--domain-strategy", "coral", "--coral-weight", "0.1", "--source-balanced"])
+
+
+def test_robustness_report_without_active_workflow_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(DomainRobustnessCLIConfigurationError):
+            main(["--synthetic", "--fast", "--task", "cancer", "--output", tmp,
+                  "--robustness-report", str(Path(tmp) / "r.json")])
+
+
+def test_smoke_task_rejects_non_erm_domain_strategy():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(UnsupportedSmokeDomainStrategyError):
+            main(["--synthetic", "--fast", "--task", "smoke", "--output", tmp,
+                  "--domain-strategy", "coral", "--coral-weight", "0.1"])
     shutil.rmtree("checkpoints/benchmarks_synthetic", ignore_errors=True)

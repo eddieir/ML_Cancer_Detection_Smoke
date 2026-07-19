@@ -1605,11 +1605,11 @@ non-access check. A second pass (§15.8) additionally wires the model into
 hyperparameter search, the OOF/final-development-fit protocol, and a
 dedicated ablation runner.
 
-An adversarial domain-training head and a model-specific calibration fit
-(as opposed to reusing the existing generic post-hoc calibrator) remain
-unimplemented — natural follow-on work, not silently dropped requirements.
-See the accompanying pull request description for the itemized list
-against the original specification.
+A model-specific calibration fit (as opposed to reusing the existing
+generic post-hoc calibrator) remains unimplemented. An adversarial domain-
+training head was implemented in Phase 6 — see §16.4 — together with
+CORAL/MMD regularizers and the source-held-out evaluation protocol those
+strategies are compared under.
 
 ### 15.8 CLI, nested cross-validation, hyperparameter search, and ablation integration
 
@@ -1697,7 +1697,605 @@ the primary comparison metric, smoke Macro-F1 as a secondary diagnostic
 restricted to subjects with a known majority smoke label) from the same
 fitted model — `existing_attention_mil` has no subject-level smoke
 prediction surface, so its smoke metric is recorded as not evaluated,
-never fabricated. Variants requiring unimplemented features (an
-adversarial domain-training head) are absent, not faked. Every result is
-explicitly marked `development_only`/`software_only`; the frozen test
-split is never touched.
+never fabricated. This ablation predates the domain-adversarial training
+head (§16.4), which is now implemented as a separate, source-held-out-
+specific ablation — see `benchmarks/domain_robustness_ablation.py`. Every
+result is explicitly marked `development_only`/`software_only`; the frozen
+test split is never touched.
+
+## 16. Source-Held-Out Domain Robustness and Biological Stability ("Phase 6")
+
+Phase 6 adds a source-held-out evaluation protocol, optional development-
+only domain-robust training strategies for `pathway_hierarchical_mil`,
+label-free domain-shift and source-predictability diagnostics, and
+synthetic-module-scoped biological-stability diagnostics. It changes
+nothing about `MultiSmokeCancerNet`'s default behavior, the frozen-test
+protocol (§14.7), or any existing candidate's ordinary CV/OOF path unless a
+new Phase 6 flag is explicitly passed.
+
+### 16.1 Source-held-out data flow
+
+`benchmarks/source_held_out.py` implements, for each dataset source present
+in the train+val pool:
+
+```
+All sources in train+val pool
+    -> per source: assess eligibility (source_eligibility.py)
+    -> eligible?
+         no  -> record status + reason, continue to the next source
+         yes -> development_subjects = pool - held_out_source's subjects
+                -> generate_subject_oof_predictions(..., dev_subjects=development_subjects, ...)
+                   (final_evaluation.py, UNMODIFIED — restricting its
+                   dev_subjects argument to development-only subjects is
+                   what makes this a source-safe selection: the function's
+                   own per-OOF-fold nested hyperparameter search never sees
+                   the held-out source at all)
+                -> rank candidates by development-only OOF AUROC/macro-F1
+                -> one nested hyperparameter selection over the FULL
+                   development pool (hyperparameter_search.py, unmodified)
+                -> fit_final_candidate_on_dev_pool(..., dev_subjects=development_subjects, ...)
+                   (final_evaluation.py, UNMODIFIED)
+                -> build_frozen_policy from development OOF predictions
+                   (calibration.py, unmodified)
+                -> evaluate_frozen_test(fitted, context, held_out_subjects, ...)
+                   (final_evaluation.py, UNMODIFIED — despite the name, this
+                   function only transforms+predicts against whatever
+                   subject list it is given; source_held_out.py is the only
+                   caller that gives it a train/val-pool subset instead of
+                   the real frozen test subjects)
+                -> policy.apply_to_test(...) exactly once for this source
+                -> record RobustnessReport (robustness_report.py)
+```
+
+This reuses `final_evaluation.py`'s functions completely unmodified in
+their leakage-relevant behavior (only two new, backward-compatible
+`domain_robustness_config=None` keyword parameters were added, threaded
+through to `build_mil_adapter` — see §16.4) precisely because every one of
+those functions already takes explicit subject-ID-list arguments rather
+than reading `context.train_bags`/`val_bags`/`test_bags` directly. That
+structural property — not a new mechanism — is what makes "development
+sources' subjects" and "held-out source's subjects" safe to substitute for
+"train+val" and "test" here.
+
+### 16.2 Structural separation from the frozen-test guard
+
+`source_held_out.py` never imports `test_guard.py`, never constructs a
+`FrozenTestGuard`, and its public functions take no `run_dir`/
+`output_root`/guard-path argument at all — there is no code path by which
+calling `run_smoke_source_held_out`/`run_cancer_source_held_out` could
+create, acquire, or check a guard file. `evaluate_frozen_test` itself
+(§16.1) carries no guard of its own by design (see its docstring in
+`final_evaluation.py`); `runner.py` is the only call site that pairs it with
+guard acquisition, and it only does so for the real frozen-test stage, not
+for the source-held-out stage. `tests/test_source_held_out.py` verifies
+both the import-graph property (via AST inspection, not just a docstring
+claim) and that no guard directory appears after running either protocol.
+
+### 16.3 Source eligibility and the split manifest
+
+`benchmarks/source_eligibility.py` assigns one of nine statuses per
+(source, task) pair (`eligible`, `not_evaluable`, `diagnostic_only`,
+`excluded_by_policy`, `controlled_access_unavailable`,
+`insufficient_classes`, `insufficient_outcomes`, `species_mismatch`,
+`assay_mismatch`, `gene_contract_mismatch`) — unknown species/label-
+semantics metadata always resolves to `species_mismatch`/
+`excluded_by_policy`, never to assumed-compatible, mirroring §12's
+pre-existing `run_leave_one_source_out` policy. `build_source_held_out_manifest`
+produces a versioned (`schema_version`), fingerprinted manifest
+(`SHA-256` over development/held-out subject-ID lists, never the raw IDs
+themselves) and raises outright if development and held-out subject sets
+are found to overlap — this is a hard precondition, not a soft warning.
+`resolve_source_policy` prefers the canonical dataset manifest
+(`data/manifest.py::DatasetManifestEntry`, keyed by `dataset_id`/
+`accession`) over caller-supplied `species_by_source`/
+`controlled_access_sources` for any source the manifest declares, and
+raises `SourcePolicyDriftError` if a caller override contradicts it — a
+source the manifest does not declare (e.g. a synthetic fixture source)
+still resolves from the caller-supplied dicts unchanged.
+
+### 16.4 Domain-loss placement and the sampler hierarchy
+
+`benchmarks/domain_losses.py`'s CORAL/MMD/domain-adversarial terms attach
+to exactly one point in the architecture:
+`HierarchicalMILOutput.subject_embeddings` (the pooled per-subject
+representation `pathway_hierarchical_mil.py`'s `HierarchicalAttentionPooling`
+already produced before Phase 6). `PathwayHierarchicalAdapter._train_loop`
+(the adapter's single AdamW loop — see §15.8) computes the selected
+strategy's regularizer term after the forward pass and adds it to the
+existing masked multitask loss:
+`total = task_loss + domain_term` (§16.4's `_domain_regularizer`), logged
+separately from `task_loss` via `last_loss_components`. The
+`domain_adversarial` strategy additionally builds a `DomainClassifierHead`
+lazily, once, from whichever development sources appear in the FIRST
+training call (`_maybe_build_domain_head`) — its vocabulary is fixed from
+that point on, and a source name outside it at any later call raises
+`DomainVocabularyError` rather than being silently mapped to an arbitrary
+class. `data/source_sampling.py`'s `SourceBalancedBatchSampler` (the
+`source_balanced` strategy) is a structurally independent sampler from
+`data/sampling.py`'s pre-existing smoke-class-balanced sampler — the two
+solve different imbalance problems and are not composed in this phase.
+
+### 16.5 Fingerprint hierarchy
+
+`RobustnessReport` (`robustness_report.py`) binds together, per held-out-
+source evaluation: `dataset_manifest_fingerprint`,
+`source_split_manifest_fingerprint` (§16.3's manifest), the development
+preprocessing artifact's `preprocessing_fingerprint`
+(`fold_preprocessing.artifact_fingerprint` — the same function every other
+fold/OOF/final-fit record in this repository uses), `module_fingerprint`
+(for `pathway_hierarchical_mil`), `model_fingerprint`
+(`model_state_fingerprint()`, the same helper every adapter/baseline
+already exposes), and `calibration_fingerprint` — the same identity
+hierarchy §7/§14 established, extended with one new manifest type rather
+than a parallel one. It additionally binds `gene_list_fingerprint`
+(the frozen development artifact's ordered gene list), `seed`,
+`source_policy_fingerprint` (§16.3's resolved species/access policy for
+this source), `environment_fingerprint` (`env_versions.py`'s core package
+versions), and, for `pathway_hierarchical_mil`,
+`domain_vocabulary_fingerprint`/`domain_head_fingerprint` — both stamped
+the structured `not_applicable(reason)` value (never a bare string, never
+a bare `None`) for a non-pathway candidate or a strategy with no domain
+head, so a report never silently omits an identity that only applies
+conditionally. See §16.10 for the v2 schema this section now describes.
+
+### 16.6 Calibration/uncertainty boundary
+
+Calibration and threshold selection (`calibration.py`, unmodified) see
+development out-of-fold predictions only, exactly as in the real frozen-
+test protocol (§12); `uncertainty.py`'s abstention-threshold selection is
+likewise restricted, by argument signature, to development
+uncertainty/correctness arrays — it has no parameter through which a
+held-out-source label could reach it.
+
+### 16.7 Reporting schema and failure modes
+
+`RobustnessReport`/`build_aggregate_report` (`robustness_report.py`) always
+stamp `development_only: true` and `frozen_test_accessed: false`;
+`validate_robustness_report` rejects a report missing either stamp or
+carrying the wrong value, and `aggregate_source_reports` reports the
+worst-source result as a first-class field (`worst_source`) rather than
+folding it into a single pooled average, with ineligible sources listed
+(with their reason) but excluded from the evaluated-source count.
+
+### 16.8 Honest scope boundaries
+
+- **No real gene-set (GMT) resource ships with this repository.** Every
+  concrete `biological_stability.py` result produced in this phase's tests,
+  CI, and synthetic CLI runs is computed against
+  `GeneModuleCollection.synthetic()` and is a software sensitivity
+  diagnostic, not biological-plausibility evidence —
+  `require_real_modules` refuses to run the real-mode entry point against a
+  synthetic source, so this cannot be silently misreported.
+- Task A (smoke) source-held-out evaluation does not extend to the
+  pooling-based MIL models or to `MultiSmokeCancerNet`'s cell-level
+  `Trainer` curriculum — only classical baselines and
+  `pathway_hierarchical_mil`'s plain-ERM fit. `domain_robustness_ablation.py`
+  records this honestly (`not_evaluable`) rather than silently omitting
+  those rows.
+- With few dataset sources available (2 in the synthetic CI context; a
+  handful in the real dataset manifest), cross-source aggregate statistics
+  have limited statistical power, reported as such rather than suppressed.
+- No cross-species (human/mouse) source-held-out mode was added in this
+  phase — mouse sources remain excluded from the ordinary human-only
+  protocol via the same `species_mismatch` eligibility status §11/§14
+  already established for human/mouse separation elsewhere.
+
+### 16.9 Diagnostic wiring, bundle persistence, and multi-seed comparison
+
+`benchmarks/source_held_out_diagnostics.py` is the one place domain-shift
+(`domain_shift.py`), uncertainty/abstention (`uncertainty.py`), and
+biological-stability (`biological_stability.py`) functions are actually
+called from the source-held-out protocol — each is invoked once per
+eligible held-out source with the frozen development-fitted preprocessing
+artifact's own transform (never a refit), and every result lands in the
+matching `RobustnessReport` field rather than being computed and discarded.
+Biological-stability diagnostics additionally run a genuinely
+separately-fitted label-permutation null (a second `fit_final_candidate_
+on_dev_pool` call on label-permuted development outcomes) and a
+cell-type-label permutation check, alongside the pre-existing matched-
+size-random-module control and attention-vs-abundance permutation null.
+
+`PathwayHierarchicalAdapter.save_bundle`/`load_bundle` reuse
+`benchmarks/bundle.py`'s existing `write_model_bundle`/
+`load_and_validate_bundle` machinery, folding this adapter's own state
+(gene modules, domain-robustness config, domain head weights, and fixed
+source vocabulary) into the bundle manifest's `extra` field — the same
+hash/fingerprint re-derivation `bundle.py` already performs for every other
+bundle catches a corrupted model checkpoint before this module's own
+additional checks (module fingerprint, domain-head checksum,
+`model_state_fingerprint` recomputation) run.
+
+`domain_robustness_ablation.py`'s `run_domain_robustness_ablation` accepts
+a `seeds` sequence (backward-compatible default: the single `seed`) and
+`_paired_comparison_multi_seed` treats each (source, seed) pair as one
+independent unit — never a cell — reporting mean/median difference,
+win/tie/loss counts, and `insufficient_evidence` below
+`MIN_SOURCE_SEED_PAIRS_FOR_EVIDENCE` common pairs.
+
+### 16.10 Schema v2, source provenance, null controls, and cross-run stability
+
+Following an independent review of the diff underlying §16.1–16.9, the
+report schema and several diagnostics were strengthened further:
+
+- **Schema v2** (`ROBUSTNESS_REPORT_SCHEMA_VERSION = "2.0"`): every report,
+  including every ineligible/not-evaluated branch, now carries all twelve
+  identity fields (see §16.5) plus `seed`, `threshold_policy_fingerprint`
+  (split out from `calibration_fingerprint` — the two halves of
+  `FrozenThresholdPolicy.to_dict()`), and an `evaluated: bool` stamp.
+  `validate_robustness_report` rejects a bare `None` for any identity field,
+  a malformed (non-64-hex-char) hash, an `evaluated=True` report whose
+  model/preprocessing/gene identities are `not_applicable`, a
+  `domain_adversarial` report missing its domain-head/vocabulary identities,
+  or a report with a non-empty `calibration` block but `not_applicable`
+  calibration/threshold identities. `validate_report_fingerprint_unchanged`
+  re-derives `report_fingerprint` from every other field and rejects
+  post-write tampering.
+- **`_environment_fingerprint()`** now calls
+  `collect_core_package_versions(required=True)` and lets a missing core
+  package raise `EnvironmentSnapshotError` (a `RuntimeError` subclass)
+  rather than catching a broad `Exception` and recording `None` — an
+  evaluated report can no longer carry an unknown environment identity.
+- **Verified smoke label contract**: `_verified_smoke_subject_labels` now
+  raises `LabelSchemaError` if `normalized_adata.obs` lacks
+  `smoke_type_known` at all (previously defaulted every cell to
+  "verified"), and separately tracks `unknown_subjects`,
+  `weak_proxy_only_subjects`, and `excluded_by_policy_subjects` (a
+  weak-proxy-only subject is excluded by policy unless
+  `weak_labels_enabled=True`), plus a `weak_label_policy_fingerprint`.
+- **Source provenance**: `_pool_subjects_and_sources` and
+  `domain_losses.validate_source_provenance` (called from
+  `pathway_hierarchical_adapter.py`'s CORAL/MMD/domain-adversarial/
+  source-balanced code paths and from `source_held_out_diagnostics.py`'s
+  `source_predictability_diagnostic` call site) reject a blank or
+  placeholder (`""`, `"unknown"`, `"none"`, `"nan"`, `"null"`, `"n/a"`,
+  `"na"`, case-insensitively) `dataset_source` with
+  `MissingSourceProvenanceError` — a source-aware strategy or diagnostic
+  can no longer silently coerce an unprovenanced subject into a literal
+  `"unknown"` bucket.
+- **Source policy expansion**: `resolve_source_policy`'s returned dict (the
+  SAME dict every caller already fingerprints in full as
+  `source_policy_fingerprint`) now additionally carries `assay_mode`,
+  `label_semantics_version`, `weak_label_status`, `cohort_role`
+  (`synthetic_or_real`), and `exclusion_policy` (`known_limitations`) from
+  the manifest entry when one is declared.
+  `assess_smoke_source_eligibility`/`assess_cancer_source_eligibility`
+  gained `reference_assay_mode`, which rejects an assay-mode mismatch via
+  the (previously unused) `ASSAY_MISMATCH` status — e.g. bulk TCGA data can
+  never enter this single-cell protocol, and `configs/datasets.yaml`
+  already declares TCGA's `assay_type: bulk_rna_seq` distinctly from the
+  single-cell sources' `assay_type: single_cell_rna_seq`.
+- **Domain-shift coverage**: `cancer_domain_shift_report`/
+  `smoke_domain_shift_report` now additionally report
+  `gene_space_compatibility` (self-vs-self by construction — this pipeline
+  unifies every source onto one shared gene space before any per-source
+  split exists, so the field documents that fact rather than reconciling
+  independent raw panels) and `module_coverage` (empty/below-minimum
+  modules) alongside the pre-existing centroid/energy/CORAL/MMD distances
+  and source-predictability diagnostic.
+- **Two additional null controls** in `biological_stability.py`:
+  `gene_module_permutation_null` (the SAME random gene-index permutation
+  applied to every module row of the membership mask — preserves module
+  sizes and the ordered gene universe exactly by construction, destroys the
+  real gene<->module association) and
+  `within_gene_expression_permutation_null` (each gene's expression
+  independently reshuffled across every valid cell in the diagnostic bag
+  set — preserves that gene's own empirical marginal distribution exactly,
+  reads no subject_id or label so it cannot leak subject/held-out-label
+  identity). Both report a mean-absolute-target-logit-difference
+  sensitivity statistic, refactored through a shared
+  `_ablation_scores_with_mask` helper so the null and the real
+  `module_ablation_scores` call share identical forward-pass mechanics.
+- **Cross-run stability**: `cancer_biological_stability_report` gained an
+  `extra_seeds` parameter (threaded from `run_cancer_source_held_out`'s
+  `stability_extra_seeds` and the CLI's `--stability-extra-seeds`, default
+  empty). With no extra seeds, `cross_run_stability` reports
+  `insufficient_evidence` explicitly — never a fabricated "stability" from
+  repeated deterministic calls to the one already-fitted model. With extra
+  seeds, each triggers a GENUINE independent `fit_final_candidate_on_dev_pool`
+  refit on the same development pool at that seed (real, non-permuted
+  labels), and `module_ranking_stability` aggregates the resulting
+  per-run `module_ablation_scores` (Spearman rank correlation, top-k
+  overlap, module selection frequency) across all runs including the
+  primary fit.
+- **Task A multi-class uncertainty**: `PathwayHierarchicalAdapter.
+  predict_smoke_proba` (softmax over `smoke_logits`) and
+  `uncertainty.multiclass_predictive_uncertainty` (entropy, max class
+  probability) feed `source_held_out_diagnostics.smoke_uncertainty_report`.
+  As of §16.11, its development probabilities are GENUINE out-of-fold
+  predictions (`_smoke_candidate_dev_score`'s `oof_by_subject`), not the
+  dev-pool-fitted model's in-sample predictions — see §16.11.
+- **Terminology audit**: a repository-wide grep for
+  biomarker/mechanistic/causal/"clinical validation"/"biological
+  validation" language found no unguarded claim outside the existing,
+  correct disclaimers. `GeneModuleCollection` still records only
+  `source_name`/`source_version`/a content fingerprint — a full real-module
+  provenance schema (organism, namespace, mapping policy, license,
+  checksum) was NOT added in this pass: no real GMT resource ships with or
+  is referenced by this repository to validate such a schema against, and
+  expanding a core model dataclass without one to test against was judged
+  higher-risk than the benefit for this phase. Every concrete module-based
+  result therefore remains `is_synthetic_modules=True`.
+
+### 16.11 Enforced schema validation, candidate-kind identity rules, genuine smoke OOF uncertainty, honest gene coverage, and disabled real-module mode
+
+A further independent review of the §16.10 diff found eight remaining
+issues, addressed as follows:
+
+- **Enforced validation, not test-only.** `build_aggregate_report`
+  (`robustness_report.py`) now calls `validate_per_source_reports` — which
+  runs `validate_robustness_report` + `validate_report_fingerprint_unchanged`
+  on every entry — BEFORE assembling the aggregate, and
+  `validate_aggregate_report` (schema/version/stamps + a recursive check of
+  every nested per-source report) runs again before `build_aggregate_report`
+  returns. `run_domain_robustness_ablation` (a different report shape —
+  per-seed variant results, not a flat `per_source_reports` list) validates
+  every per-source report the same way at construction time, before it
+  enters its own results structure. `runner.py` persists the plain
+  aggregate via the new `write_aggregate_report` (atomic write + reload +
+  full recursive validation, mirroring `write_robustness_report`'s
+  contract) instead of the generic `write_json`; an ablation report (a
+  materially different shape) still uses `write_json`, but its own child
+  reports were already validated at construction. A CLI-level test
+  (`test_malformed_per_source_report_blocks_real_cli_persistence`)
+  monkeypatches `run_cancer_source_held_out` to return one report with
+  `module_fingerprint=None` and asserts a real `main([...])` invocation
+  raises `RobustnessReportValidationError` and never writes the output
+  file — proving the production path enforces this, not only a unit test
+  of the validator.
+- **Candidate-kind-aware identity rules.** Schema v2's
+  `_REQUIRED_WHEN_EVALUATED` no longer includes `module_fingerprint`
+  unconditionally (which rejected every legitimate classical-baseline
+  report). A new `is_module_based_candidate: bool` field (stamped by the
+  caller — `source_held_out.py` sets it `True` only when
+  `best_name == PATHWAY_MODEL_NAME`) drives the rule: an evaluated report
+  with `is_module_based_candidate=True` must record a real
+  `module_fingerprint`; one with `False` must record a structured
+  `not_applicable` module identity — a real hash there is now itself
+  rejected as scientifically meaningless for a candidate with no
+  gene-module structure. `preprocessing_fingerprint`/`gene_list_fingerprint`/
+  `model_fingerprint`/`source_policy_fingerprint`/
+  `source_split_manifest_fingerprint`/`environment_fingerprint` remain
+  required for every evaluated report regardless of candidate kind;
+  `domain_head_fingerprint`/`domain_vocabulary_fingerprint` remain required
+  only for `strategy=domain_adversarial`; `calibration_fingerprint`/
+  `threshold_policy_fingerprint` remain required only when `calibration` is
+  non-empty (cancer reports are always calibrated; smoke reports never
+  are).
+- **Genuine out-of-fold smoke uncertainty.** `_smoke_candidate_dev_score`
+  (`source_held_out.py`) now returns `oof_by_subject` — a per-subject,
+  fixed-`num_classes`-width probability vector collected from whichever
+  grouped-CV fold that subject was held out of (never a fold it also
+  trained on; a subject appearing in more than one fold's validation set
+  raises `RuntimeError` rather than silently overwriting an entry).
+  `_align_proba_to_full_classes` re-embeds a fold's `predict_proba` output
+  (whose columns cover only `model.classes_`, since a small fold can
+  legitimately miss a class) into the full, fixed class axis. The winning
+  candidate's `oof_by_subject` (captured during the same dev-only sweep
+  that selected it, never recomputed against the final dev-pool-fitted
+  model) is what `smoke_uncertainty_report` uses to select its abstention
+  threshold — `oof_by_subject` itself is popped out of `candidate_scores`/
+  `comparisons` before those are embedded in the persisted report, since it
+  carries raw subject IDs. `smoke_uncertainty_report`'s "in-sample, not
+  out-of-fold" disclosure note is removed; it now documents the OOF
+  guarantee instead.
+- **Honest gene coverage.** `domain_shift.gene_space_compatibility` no
+  longer accepts a bare self-vs-self call — `present_genes=None` (the
+  default at every current call site, since this pipeline unifies every
+  source onto one shared gene space at ingestion time, before any
+  per-source raw panel would even be distinguishable) returns
+  `{"status": "not_evaluable", "reason": "raw source-specific gene contract
+  unavailable"}` rather than a fabricated 100%-compatible result. When a
+  caller DOES supply a real `present_genes` list, the function performs a
+  real missing/unexpected/duplicate-mapping/order/coverage computation
+  (tested directly with a synthetic gene panel deliberately missing several
+  required genes, confirming reduced coverage while the required
+  development gene list itself is never mutated).
+  `cancer_domain_shift_report`/`smoke_domain_shift_report` gained an
+  optional `held_out_raw_gene_list` pass-through parameter for whenever
+  raw per-source gene identities do become available; no current caller
+  supplies one.
+- **Disabled real-module mode.** `cancer_biological_stability_report` now
+  checks module-source syntheticness FIRST: a non-synthetic (real) module
+  source returns `{"status": "unsupported", "scope":
+  "unsupported_real_module_analysis", ...}` immediately, before running any
+  ablation/permutation diagnostic, rather than ever emitting
+  `scope: "real_module_sensitivity_analysis"` — `GeneModuleCollection` does
+  not yet implement the full provenance contract (organism, namespace,
+  mapping policy, license, checksum, ordered module fingerprint, coverage
+  policy) real-module analysis would require, so real-module analysis is
+  disabled entirely rather than partially documented.
+- **Perturbation call-order proof.** `within_gene_expression_permutation_
+  null`'s docstring now states explicitly that it reads held-out
+  EXPRESSION for post-fit sensitivity analysis, never held-out LABELS, and
+  runs strictly after candidate selection/final fit/calibration freeze/
+  held-out prediction generation.
+  `test_perturbation_diagnostics_run_only_after_development_freeze`
+  (`tests/test_source_held_out_diagnostics.py`) poisons the held-out bags'
+  expression, runs `cancer_biological_stability_report` against them, and
+  asserts the already-fitted candidate's `selected_params`/
+  `preprocessing_artifact_fingerprint`/`model_state_fingerprint` are
+  byte-for-byte unchanged — perturbation diagnostics cannot feed back into
+  model ranking or strategy selection because they never touch the fitted
+  candidate's own state.
+- **Test-suite audit for tautological assertions.** The one
+  `assert reloaded["report_fingerprint"] == fp1 or True` (a always-true
+  expression) was replaced with independent checks of `report_fingerprint`
+  (a content hash, re-derived and compared against `report.fingerprint()`)
+  and `file_sha256` (`write_robustness_report`'s return value, a hash of
+  the serialized file's raw bytes) — the two are asserted unequal, since
+  they hash different inputs. An AST-based sweep of every test function
+  touched across this and the two prior remediation passes found no other
+  unconditional, tautological, or assert-free test beyond legitimate
+  "must not raise" smoke checks.
+
+### 16.12 Real dataset-manifest identity, registry-derived candidate kind, complete smoke OOF coverage, and a versioned ablation schema
+
+A third independent review of the diff found six remaining issues,
+addressed as follows:
+
+- **Real dataset-manifest identity for every evaluated report.**
+  `dataset_manifest_fingerprint` was previously allowed to default to
+  `not_applicable("no dataset manifest supplied")` even for an evaluated
+  report, since no CLI caller ever actually threaded
+  `dataset_manifest_entries` through to `run_cancer_source_held_out`/
+  `run_smoke_source_held_out`. It is now in `_REQUIRED_WHEN_EVALUATED`
+  (`robustness_report.py`) — an evaluated report with a `not_applicable`
+  dataset-manifest identity is rejected outright. `runner.py` gained
+  `_dataset_manifest_entries_for_run(context, synthetic)`: for
+  `--synthetic` runs it builds `_synthetic_dataset_manifest_entries`, an
+  explicit, internally-constructed `DatasetManifestEntry` per synthetic
+  source (`synthetic_or_real="synthetic_fixture"`) — synthetic mode is
+  never exempted, it fingerprints its own explicit synthetic manifest
+  instead of a real one; for real runs it loads `configs/datasets.yaml`
+  via `data.manifest.build_dataset_manifest` and raises
+  `MissingDatasetManifestError` if that seed file is absent, rather than
+  silently falling back to a `not_applicable` identity for a real run.
+  This is threaded into both task runners' `loso_kwargs` and forwarded
+  through `run_domain_robustness_ablation`'s new
+  `dataset_manifest_entries` parameter. Ineligible/non-evaluated reports
+  still get the SAME real fingerprint whenever a manifest was supplied
+  (it is computed once, independent of any one source's eligibility) —
+  `not_applicable` remains acceptable there only when no manifest was
+  ever supplied at all.
+- **Candidate kind derived from the model registry, never a caller
+  flag.** `is_module_based_candidate` was previously trusted verbatim
+  from whatever the caller stamped. A new module,
+  `benchmarks/candidate_registry.py`, derives candidate kind
+  (classical baseline / non-module MIL / pathway module-based MIL)
+  purely from the canonical registries `baselines.py`
+  (`CANCER_BASELINES`/`SMOKE_BASELINES`) and `mil_registry.py`
+  (`POOLING_BASED_NAMES`/`PATHWAY_MODEL_NAME`) already declare, and raises
+  `UnknownCandidateNameError` (a typed `ValueError`) for any name absent
+  from every registry — never a silent default. `validate_robustness_report`
+  now recomputes `is_module_based` from the report's own `model` field and
+  rejects any disagreement with the report's persisted
+  `is_module_based_candidate` value — a report may still record its own
+  declared kind, but validation checks it against the registry rather than
+  trusting it. Live-running the `domain_adversarial` strategy's cancer
+  workflow during this pass's own verification surfaced a related latent
+  bug: the adversarial identity check previously fired on the bare
+  `strategy` string alone, so a `domain_adversarial` run whose winning
+  candidate happened to be a classical baseline (only
+  `pathway_hierarchical_mil` has a domain-adversarial head at all) could
+  never pass validation. The check now additionally gates on the
+  registry-derived candidate kind — `domain_head_fingerprint`/
+  `domain_vocabulary_fingerprint` are required only when
+  `strategy == "domain_adversarial"` AND the winner is module-based;
+  a classical-baseline winner under that strategy correctly records
+  not-applicable domain-head/vocabulary identities instead.
+- **Requested vs. applied strategy attribution (schema v3).** The
+  candidate-kind fix above closed the module-fingerprint/domain-head gaps,
+  but left a deeper attribution bug: `run_cancer_source_held_out` only ever
+  passes `domain_robustness_config` to `generate_subject_oof_predictions`/
+  `fit_final_candidate_on_dev_pool` when the winning candidate is
+  `PATHWAY_MODEL_NAME` — correct, since only that adapter has any
+  attachment point for a non-ERM strategy — but the report still recorded
+  `strategy=domain_cfg["strategy"]` (the REQUESTED strategy) unconditionally,
+  regardless of which candidate actually won. A `coral`/`mmd`/
+  `source_balanced`/`domain_adversarial` run whose OOF sweep happened to
+  pick a classical baseline was therefore reported as if that baseline had
+  applied the requested strategy, when it was actually trained with plain
+  ERM. `benchmarks/candidate_registry.py` gained
+  `SUPPORTED_STRATEGIES_BY_KIND`/`resolve_strategy_application(name,
+  requested_strategy)` — the canonical capability matrix (classical/
+  non-module MIL: ERM only; pathway module-based MIL: every strategy) — and
+  `RobustnessReport` gained `requested_strategy`, `strategy_applicable`,
+  `strategy_applicability_reason`, with `strategy` REDEFINED to mean the
+  APPLIED strategy rather than the requested one (schema bumped `2.0` ->
+  `3.0`). `run_cancer_source_held_out`'s winning-candidate branch now calls
+  `resolve_strategy_application(best_name, domain_cfg["strategy"])` and
+  threads the result through `build_robustness_report` instead of the bare
+  requested string. `validate_robustness_report` enforces the whole
+  consistency for every evaluated report: a non-module winner's `strategy`
+  must be `"erm"` (and `strategy_applicable` reflects whether
+  `requested_strategy` was itself `"erm"`); a module-based winner's
+  `strategy` must equal `requested_strategy` and `strategy_applicable` must
+  be `True` (its training path always genuinely applies whatever was
+  requested); and the pre-existing domain-adversarial domain-head/
+  vocabulary requirement now keys off the APPLIED `strategy` field, which
+  by the above consistency check can only be `"domain_adversarial"` for a
+  module-based winner — the earlier `and derived_is_module_based` guard
+  becomes redundant with this and was removed. `build_robustness_report`
+  defaults `requested_strategy`/`strategy_applicable` from `strategy` when
+  not given, so every call site that does not itself select across
+  candidate kinds (ineligible branches, the no-candidate-selected branch,
+  every Task A smoke branch, which is ERM-only) is unaffected.
+- **Fixed-model domain-robustness ablation.** A second, related bug:
+  `run_domain_robustness_ablation`'s cancer branch passed the caller's full
+  `model_names` list into `run_cancer_source_held_out` for every strategy
+  variant, so each variant independently ran its own classical-vs-MIL-vs-
+  pathway model-selection sweep — the ERM "reference" and the `coral`
+  variant, for instance, could each be won by a different candidate,
+  making the "paired" comparison not actually paired on architecture. The
+  cancer branch now always fixes `model_names` to
+  `[FIXED_CANCER_ABLATION_CANDIDATE]` (`pathway_hierarchical_mil`),
+  ignoring the caller-supplied list for candidate selection (it is still
+  recorded in the new `requested_model_names` field for provenance); a new
+  `_reject_non_fixed_candidate_winners` defensively raises if any evaluated
+  per-source report's winner is not the fixed candidate. `ablation_report`'s
+  schema (bumped `1.0` -> `2.0`) gained a required `candidate_name` field
+  (a real string for cancer; a structured `not_applicable` value for
+  smoke, which still sweeps `model_names` for its ERM-only variant) and,
+  per evaluated nested report, checks that its `model` matches
+  `candidate_name` and its applied `strategy` matches the variant name it
+  was filed under. The paired-comparison function
+  (`_paired_comparison_multi_seed`) now reads full per-source report dicts
+  (not bare metric floats) so it can exclude, per (source, seed) pair
+  BEFORE averaging: a candidate mismatch between the two sides, a variant
+  side whose `strategy_applicable` is `False`, or a mismatch in
+  `preprocessing_fingerprint`/`module_fingerprint`/
+  `source_split_manifest_fingerprint` — each exclusion reason is counted
+  in the comparison's `excluded_pairs` rather than silently dropped.
+- **Complete smoke OOF coverage, enforced.** `_smoke_candidate_dev_score`
+  now validates every OOF probability row (`_validate_oof_probability_row`:
+  correct `num_classes` dimension, all-finite, sums to 1 within tolerance —
+  raising `IncompleteOOFCoverageError`/`RuntimeError` for any violation,
+  since none can legitimately happen given `_align_proba_to_full_classes`'
+  own construction) and checks a poisoned fold cannot predict a subject
+  that was also in its own training set (`RuntimeError` if so). After every
+  fold runs, `_oof_coverage_summary` computes whether EVERY verified-label
+  development subject received exactly one OOF prediction
+  (`complete: bool`) plus `expected_oof_subject_count`/
+  `realized_oof_subject_count`/`missing_oof_subject_count` and three
+  fingerprints (`oof_subject_set_fingerprint`, `fold_assignment_fingerprint`,
+  `class_order_fingerprint` — counts and hashes only, never a raw subject-ID
+  list, since this evidence is persisted verbatim into `comparisons`).
+  Whenever coverage is incomplete, the candidate's score is forced to
+  `None` — it can never win selection, and the winning candidate's
+  `oof_coverage` summary is threaded into `smoke_uncertainty_report`'s
+  output, so an incomplete-coverage candidate can never have its
+  abstention threshold selected from a reduced convenience subset.
+- **Versioned ablation report schema + validated writer.** A new module,
+  `benchmarks/ablation_report.py`, defines `ABLATION_REPORT_SCHEMA_VERSION`
+  and `build_ablation_report`/`validate_ablation_report`/
+  `validate_ablation_report_fingerprint_unchanged`/`write_ablation_report`,
+  mirroring `robustness_report.py`'s validate-before-persist contract for
+  the ablation report's own materially different top-level shape
+  (`task`/`variants`/`seeds`/`results` keyed by variant then seed/
+  `paired_comparison_vs_erm`/`aggregate_fingerprint`). `validate_ablation_report`
+  checks `development_only=True`/`frozen_test_accessed=False`, that
+  `results` keys exactly match the declared `variants` list and every
+  variant's `per_seed` keys exactly match the declared `seeds` list, that
+  every per-seed result is either a `not_evaluable` record with a reason or
+  a `{"per_source": ..., "aggregate": ...}` pair whose `per_source` reports
+  are recursively validated through `validate_per_source_reports` (the
+  same schema-v2 choke point `build_aggregate_report` uses), and that
+  `paired_comparison_vs_erm` is either a top-level `insufficient_evidence`
+  record or a per-variant map of `evaluated`/`insufficient_evidence`
+  results with their own required fields.
+  `validate_ablation_report_fingerprint_unchanged` re-derives
+  `aggregate_fingerprint` over every other field and rejects any
+  disagreement — detecting tampering with top-level metadata, any single
+  variant/seed result, any single nested per-source report, or the paired
+  comparison. `run_domain_robustness_ablation` now returns
+  `build_ablation_report(...)`'s output instead of assembling a plain
+  dict, and `runner.py` persists ablation reports via
+  `write_ablation_report` (atomic write + reload + full recursive
+  validation) instead of the generic `write_json` — neither the ablation
+  report nor the plain aggregate report is ever persisted through an
+  unvalidated path.
+- **Gene coverage remained honest — no code change needed.** No current
+  call site supplies `held_out_raw_gene_list` to `cancer_domain_shift_report`/
+  `smoke_domain_shift_report`, so `gene_space_compatibility` reports
+  `not_evaluable` in every live run, exactly as designed. This section
+  reconfirms rather than changes that behavior.
