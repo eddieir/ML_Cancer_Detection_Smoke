@@ -151,29 +151,34 @@ def test_evaluated_report_with_all_required_identities_passes():
         preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
         model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
         source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
     )
     validate_robustness_report(d)
 
 
 def test_evaluated_classical_baseline_requires_not_applicable_module_fingerprint():
-    """A classical baseline (is_module_based_candidate=False, the default)
-    must record a structured not_applicable module_fingerprint — a real
-    hash there would be scientifically meaningless for a model with no
-    gene-module structure."""
+    """A classical baseline (model="prevalence", a registry-derived
+    non-module candidate) must record a structured not_applicable
+    module_fingerprint — a real hash there would be scientifically
+    meaningless for a model with no gene-module structure."""
     d = _report(
-        "sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        "sourceA", 0.8, model="prevalence", evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
         model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
         source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
     )
     validate_robustness_report(d)  # module_fingerprint defaults to not_applicable — passes
 
 
 def test_evaluated_classical_baseline_with_real_module_hash_rejected():
     d = _report(
-        "sourceA", 0.8, evaluated=True, preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        "sourceA", 0.8, model="prevalence", evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
         module_fingerprint=_HASH_A,  # a classical baseline has no module structure to hash
         model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
         source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
     )
     with pytest.raises(RobustnessReportValidationError):
         validate_robustness_report(d)
@@ -185,6 +190,68 @@ def test_evaluated_module_based_candidate_missing_module_fingerprint_rejected():
         preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
         model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
         source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_report_declared_kind_disagreeing_with_registry_rejected():
+    """model="prevalence" (a registry-derived classical baseline) declaring
+    is_module_based_candidate=True must be rejected — a candidate cannot
+    falsely declare a kind the model registry does not derive for it."""
+    d = _report(
+        "sourceA", 0.8, model="prevalence", evaluated=True, is_module_based_candidate=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_report_pathway_candidate_falsely_declaring_non_module_rejected():
+    """model="pathway_hierarchical_mil" (a registry-derived module-based
+    candidate) declaring is_module_based_candidate=False must be
+    rejected — a pathway candidate cannot hide its module structure."""
+    d = _report(
+        "sourceA", 0.8, evaluated=True, is_module_based_candidate=False,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(RobustnessReportValidationError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_report_unknown_model_name_raises_typed_registry_error():
+    """A model name absent from every canonical registry must raise a
+    typed error rather than silently default to any candidate kind."""
+    from benchmarks.candidate_registry import UnknownCandidateNameError
+
+    d = _report(
+        "sourceA", 0.8, model="some_never_registered_model", evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+    )
+    with pytest.raises(UnknownCandidateNameError):
+        validate_robustness_report(d)
+
+
+def test_evaluated_report_missing_dataset_manifest_fingerprint_rejected():
+    """An evaluated report must never record a not_applicable dataset
+    manifest identity — a dataset was actually loaded and a model actually
+    fit against it, so the manifest fingerprint must be a real hash."""
+    d = _report(
+        "sourceA", 0.8, model="prevalence", evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        # dataset_manifest_fingerprint left at its not_applicable default
     )
     with pytest.raises(RobustnessReportValidationError):
         validate_robustness_report(d)
@@ -192,9 +259,11 @@ def test_evaluated_module_based_candidate_missing_module_fingerprint_rejected():
 
 def test_adversarial_report_missing_domain_head_identity_rejected():
     d = _report(
-        "sourceA", 0.8, strategy="domain_adversarial", evaluated=True,
+        "sourceA", 0.8, strategy="domain_adversarial", evaluated=True, is_module_based_candidate=True,
         preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
-        model_fingerprint=_HASH_B,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
     )
     # domain_head_fingerprint/domain_vocabulary_fingerprint left as the
     # default not_applicable — a domain_adversarial report must record both.
@@ -202,11 +271,32 @@ def test_adversarial_report_missing_domain_head_identity_rejected():
         validate_robustness_report(d)
 
 
+def test_adversarial_strategy_with_classical_baseline_winner_accepts_not_applicable_domain_head():
+    """strategy='domain_adversarial' can still legitimately be won by a
+    classical baseline (that source's OOF sweep simply favored logistic
+    over pathway_hierarchical_mil) — only pathway_hierarchical_mil has a
+    domain-adversarial head at all, so a not_applicable domain_head/
+    vocabulary identity must be ACCEPTED when the winning candidate is not
+    module-based, even though the requested strategy is domain_adversarial."""
+    d = _report(
+        "sourceA", 0.8, model="logistic", strategy="domain_adversarial", evaluated=True,
+        preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
+        # module_fingerprint, domain_head_fingerprint, domain_vocabulary_fingerprint
+        # all left at their not_applicable defaults.
+    )
+    validate_robustness_report(d)
+
+
 def test_calibrated_report_missing_calibration_identity_rejected():
     d = _report(
-        "sourceA", 0.8, evaluated=True, calibration={"threshold": 0.5},
+        "sourceA", 0.8, evaluated=True, is_module_based_candidate=True, calibration={"threshold": 0.5},
         preprocessing_fingerprint=_HASH_A, gene_list_fingerprint=_HASH_A, module_fingerprint=_HASH_A,
-        model_fingerprint=_HASH_B,
+        model_fingerprint=_HASH_B, source_policy_fingerprint=_HASH_A,
+        source_split_manifest_fingerprint=_HASH_A, environment_fingerprint=_HASH_A,
+        dataset_manifest_fingerprint=_HASH_A,
     )
     # calibration_fingerprint/threshold_policy_fingerprint left as the
     # default not_applicable while a calibration block is present.

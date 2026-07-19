@@ -9,9 +9,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from benchmarks.domain_robustness_ablation import run_domain_robustness_ablation
-from benchmarks.runner import build_synthetic_context
+from benchmarks.runner import _synthetic_dataset_manifest_entries, build_synthetic_context
 
-_BENCH_CFG = {"species_by_source": {"sourceA": "human", "sourceB": "human"}, "reference_species": "human"}
+_DATASET_MANIFEST_ENTRIES = _synthetic_dataset_manifest_entries(build_synthetic_context(seed=0, fast=True))
+
+_BENCH_CFG = {
+    "species_by_source": {"sourceA": "human", "sourceB": "human"}, "reference_species": "human",
+    "dataset_manifest_entries": _DATASET_MANIFEST_ENTRIES,
+}
 
 
 @pytest.fixture(autouse=True)

@@ -584,6 +584,63 @@ def _align_proba_to_full_classes(proba: np.ndarray, model_classes: Sequence[int]
     return out
 
 
+class IncompleteOOFCoverageError(RuntimeError):
+    """Raised by _validate_oof_probability_row for an integrity violation
+    that can never legitimately happen given _align_proba_to_full_classes'
+    construction (wrong dimension, non-finite values, a row that doesn't
+    sum to 1) — always a genuine bug, never an expected candidate-
+    ineligibility outcome."""
+
+
+def _validate_oof_probability_row(sid: str, proba: np.ndarray, num_classes: int) -> None:
+    if proba.shape != (num_classes,):
+        raise IncompleteOOFCoverageError(
+            f"_smoke_candidate_dev_score: subject {sid!r} OOF probability vector has shape "
+            f"{proba.shape} != ({num_classes},) — a genuine dimension bug, never an expected outcome."
+        )
+    if not np.all(np.isfinite(proba)):
+        raise IncompleteOOFCoverageError(
+            f"_smoke_candidate_dev_score: subject {sid!r} OOF probability vector contains NaN/inf "
+            "values — a genuine bug, never an expected outcome."
+        )
+    if not np.isclose(float(proba.sum()), 1.0, atol=1e-6):
+        raise IncompleteOOFCoverageError(
+            f"_smoke_candidate_dev_score: subject {sid!r} OOF probability vector sums to "
+            f"{float(proba.sum())!r}, not 1 (within tolerance) — a genuine bug, never an expected outcome."
+        )
+
+
+def _oof_coverage_summary(
+    oof_by_subject: Dict[str, np.ndarray], expected_subjects: Sequence[str],
+    fold_assignment_fingerprint: str, class_order_fingerprint: str,
+) -> Dict:
+    """
+    Persisted coverage evidence for one candidate's OOF sweep: expected vs
+    realized subject counts, a fingerprint of the realized OOF subject set,
+    the fold train/val assignment fingerprint, and the (fixed-by-
+    construction) class-order fingerprint. "complete" is False whenever any
+    expected (verified-label) development subject never received an OOF
+    prediction (its containing fold was infeasible) — the CALLER must treat
+    complete=False as candidate-ineligible and never select an uncertainty
+    threshold from the reduced subset that IS present.
+    """
+    # Never embed raw subject IDs in what this function returns — it is
+    # persisted verbatim into candidate_scores/comparisons (see
+    # run_smoke_source_held_out) — only counts and fingerprints.
+    expected = sorted(expected_subjects)
+    realized = sorted(oof_by_subject)
+    missing = sorted(set(expected) - set(realized))
+    return {
+        "expected_oof_subject_count": len(expected),
+        "realized_oof_subject_count": len(realized),
+        "complete": not missing,
+        "missing_oof_subject_count": len(missing),
+        "oof_subject_set_fingerprint": _sha256_json(realized),
+        "fold_assignment_fingerprint": fold_assignment_fingerprint,
+        "class_order_fingerprint": class_order_fingerprint,
+    }
+
+
 def _smoke_candidate_dev_score(
     context, name: str, dev_subjects: Sequence[str], label_by_subject: Dict[str, int],
     num_cell_types: int, num_classes: int, n_hvgs: int, device: str, seed: int,
@@ -601,24 +658,45 @@ def _smoke_candidate_dev_score(
     out of) — never a fold it also trained on — so evidence["oof_by_subject"]
     is a genuine out-of-fold probability vector (fixed num_classes columns,
     see _align_proba_to_full_classes) per subject with a defined fold
-    prediction, never an in-sample probability. A subject whose every
-    containing fold was skipped (empty train/val bags after the min-cells/
-    known-label mask) legitimately has no OOF entry — the caller must not
-    assume every dev_subject appears in oof_by_subject.
+    prediction, never an in-sample probability.
+
+    COMPLETE-COVERAGE REQUIREMENT: every verified-label development subject
+    must receive EXACTLY ONE OOF prediction. If any fold is infeasible
+    (empty train/val bags after the min-cells/known-label mask) and this
+    leaves even one labeled subject without an OOF entry, this function
+    returns (None, evidence) with evidence["oof_coverage"]["complete"]=False
+    — the candidate is marked INELIGIBLE, never silently scored/selected
+    from the reduced subset that IS present. Malformed coverage that could
+    never legitimately happen given this function's own construction
+    (duplicate OOF assignment, a fold predicting a subject it also trained
+    on, wrong probability dimension, non-finite values, a row that doesn't
+    sum to 1) raises IncompleteOOFCoverageError/RuntimeError — a genuine
+    bug, never an expected outcome.
 
     Returns (mean_macro_f1_or_None, evidence_dict). evidence_dict always has
-    an "oof_by_subject" key (possibly empty) so a caller can rely on its
-    presence without a hasattr/get-with-default dance.
+    "oof_by_subject" and "oof_coverage" keys.
     """
     labeled_dev_subjects = sorted(s for s in dev_subjects if s in label_by_subject)
     oof_by_subject: Dict[str, np.ndarray] = {}
+    empty_coverage = {
+        "expected_oof_subject_count": len(labeled_dev_subjects), "realized_oof_subject_count": 0,
+        "complete": False, "missing_oof_subject_count": len(labeled_dev_subjects),
+        "oof_subject_set_fingerprint": _sha256_json([]), "fold_assignment_fingerprint": _sha256_json(None),
+        "class_order_fingerprint": _sha256_json(list(range(num_classes))),
+    }
     if len(labeled_dev_subjects) < 2:
-        return None, {"error": "fewer than 2 verified-label development subjects", "oof_by_subject": oof_by_subject}
+        return None, {"error": "fewer than 2 verified-label development subjects", "oof_by_subject": oof_by_subject,
+                       "oof_coverage": empty_coverage}
     y_full = np.array([label_by_subject[s] for s in labeled_dev_subjects])
     if len(set(y_full.tolist())) < 2:
-        return None, {"error": "development pool has only one verified smoke class", "oof_by_subject": oof_by_subject}
+        return None, {"error": "development pool has only one verified smoke class", "oof_by_subject": oof_by_subject,
+                       "oof_coverage": empty_coverage}
 
     folds = grouped_kfold(np.array(labeled_dev_subjects), y_full, n_folds=n_dev_folds, seed=seed)
+    class_order_fingerprint = _sha256_json(list(range(num_classes)))
+    fold_assignment_fingerprint = _sha256_json(
+        [{"fold": i, "train": sorted(f["train"]), "val": sorted(f["val"])} for i, f in enumerate(folds)]
+    )
     fold_scores, fold_records = [], []
     seen_oof_subjects: set = set()
     for fold_idx, fold in enumerate(folds):
@@ -674,6 +752,14 @@ def _smoke_candidate_dev_score(
                 f"{name!r} is not a supported Task A source-held-out candidate — "
                 f"supported names are {sorted(_SUPPORTED_SMOKE_CANDIDATES)}."
             )
+        trained_on = set(fold["train"])
+        leaked = set(va_subjects) & trained_on
+        if leaked:
+            raise RuntimeError(
+                f"_smoke_candidate_dev_score: fold {fold_idx} predicted subject(s) {sorted(leaked)} that "
+                "were also members of its OWN training set — grouped_kfold must produce disjoint "
+                "train/val subject sets; this indicates a genuine leakage bug, never an expected outcome."
+            )
         fold_scores.append(report["macro_f1"])
         fold_records.append({"fold": fold_idx, "macro_f1": report["macro_f1"], "hyperparameter_search": hp_search})
         for sid, proba_row in zip(va_subjects, proba_va_aligned):
@@ -683,14 +769,27 @@ def _smoke_candidate_dev_score(
                     "than one fold — grouped_kfold must assign every subject to exactly one validation "
                     "fold; this indicates a fold-construction bug, never an expected outcome."
                 )
+            _validate_oof_probability_row(sid, proba_row, num_classes)
             seen_oof_subjects.add(sid)
             oof_by_subject[sid] = proba_row
 
+    coverage = _oof_coverage_summary(
+        oof_by_subject, labeled_dev_subjects, fold_assignment_fingerprint, class_order_fingerprint,
+    )
     if not fold_scores:
         return None, {"error": "no development fold produced a defined macro-F1", "folds": fold_records,
-                       "oof_by_subject": oof_by_subject}
+                       "oof_by_subject": oof_by_subject, "oof_coverage": coverage}
+    if not coverage["complete"]:
+        return None, {
+            "error": f"{coverage['missing_oof_subject_count']} verified-label development subject(s) "
+                     "never received an OOF prediction (their containing fold was infeasible) — candidate "
+                     "marked INELIGIBLE under the complete-coverage requirement; never silently selecting "
+                     "an uncertainty threshold from a reduced convenience subset",
+            "folds": fold_records, "oof_by_subject": {}, "oof_coverage": coverage,
+        }
     return float(np.mean(fold_scores)), {
         "folds": fold_records, "n_folds_scored": len(fold_scores), "oof_by_subject": oof_by_subject,
+        "oof_coverage": coverage,
     }
 
 
@@ -798,6 +897,7 @@ def run_smoke_source_held_out(
         candidate_scores: Dict[str, Dict] = {}
         best_name, best_score = None, -np.inf
         best_oof_by_subject: Dict[str, np.ndarray] = {}
+        best_oof_coverage: Dict = {}
         for name in model_names:
             score, evidence = _smoke_candidate_dev_score(
                 context, name, dev_subjects, dev_label_by_subject, num_cell_types, num_classes,
@@ -807,12 +907,16 @@ def run_smoke_source_held_out(
             # probability vectors — never let it flow into candidate_scores/
             # comparisons, which are embedded verbatim in the persisted
             # report; it is retained here only for the WINNING candidate's
-            # internal uncertainty computation below.
+            # internal uncertainty computation below. oof_coverage (counts
+            # and fingerprints only, no raw subject IDs) IS safe to persist
+            # verbatim and remains in evidence for every candidate.
             oof_by_subject = evidence.pop("oof_by_subject", {})
+            oof_coverage = evidence.get("oof_coverage", {})
             candidate_scores[name] = {"development_macro_f1": score, **evidence}
             if score is not None and score > best_score:
                 best_name, best_score = name, score
                 best_oof_by_subject = oof_by_subject
+                best_oof_coverage = oof_coverage
 
         if best_name is None:
             reports[held_out_source] = build_robustness_report(
@@ -936,9 +1040,12 @@ def run_smoke_source_held_out(
         # Development-only OOF probabilities from the SAME dev-only nested
         # grouped-CV sweep that selected best_name (best_oof_by_subject,
         # captured above) — never the final dev-pool-fitted model's
-        # in-sample predictions. A subject with no OOF entry (every fold
-        # containing it was skipped) is simply absent from this array, not
-        # imputed.
+        # in-sample predictions. best_name can only have won when
+        # _smoke_candidate_dev_score reported COMPLETE OOF coverage (every
+        # verified-label development subject received exactly one OOF
+        # prediction) — an incomplete-coverage candidate always scores
+        # None and can never be selected, so best_oof_by_subject here is
+        # never a reduced convenience subset.
         oof_dev_subjects = sorted(best_oof_by_subject)
         if oof_dev_subjects:
             dev_proba_oof = np.stack([best_oof_by_subject[s] for s in oof_dev_subjects])
@@ -948,6 +1055,7 @@ def run_smoke_source_held_out(
 
         smoke_uncertainty = smoke_uncertainty_report(
             dev_proba_oof, dev_labels_oof, held_out_proba, held_out_labels_for_uncertainty, num_classes,
+            oof_coverage=best_oof_coverage,
         )
 
         manifest = build_source_held_out_manifest(

@@ -58,6 +58,7 @@ from .test_guard import FrozenTestGuard, FrozenTestGuardDisabledInRealModeError,
 from data.transforms import assert_batch_correction_safe
 from .domain_losses import resolve_domain_robustness_config
 from .domain_robustness_ablation import run_domain_robustness_ablation
+from .ablation_report import write_ablation_report
 from .robustness_report import aggregate_source_reports, build_aggregate_report, write_aggregate_report
 from .source_held_out import UnsupportedSmokeDomainStrategyError, run_cancer_source_held_out, run_smoke_source_held_out
 
@@ -183,6 +184,70 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
     )
 
 
+class MissingDatasetManifestError(RuntimeError):
+    """Raised when the source-held-out domain-robustness protocol is invoked
+    for a real (non-synthetic) run but no dataset manifest seed can be
+    found — every EVALUATED robustness report requires a real
+    dataset_manifest_fingerprint (see robustness_report.py), so this path
+    must fail loudly rather than silently falling back to a not_applicable
+    identity for a real run."""
+
+
+def _synthetic_dataset_manifest_entries(context):
+    """
+    An explicit, internally-constructed manifest for --synthetic runs —
+    one DatasetManifestEntry per synthetic source declared in this
+    context's own benchmarks.species_by_source config — fingerprinted
+    exactly like a real manifest would be (see data/manifest.py). Synthetic
+    mode is never exempted from the dataset-manifest-identity requirement;
+    it fingerprints this explicit synthetic manifest instead of a real one.
+    """
+    from data.manifest import DatasetManifestEntry
+
+    species_by_source = context.config.get("benchmarks", {}).get("species_by_source", {}) or {}
+    sources = sorted(species_by_source) or ["sourceA", "sourceB"]
+    entries = []
+    for src in sources:
+        entry = DatasetManifestEntry(
+            dataset_id=src, accession=src,
+            source_url="synthetic://benchmarks.runner.build_synthetic_context",
+            official_record_url="synthetic://benchmarks.runner.build_synthetic_context",
+            species=species_by_source.get(src, "human"), assay_type="synthetic_fixture",
+            matrix_representation="dense_float32_synthetic", subject_identifier_field="subject_id",
+            license_or_access_level="internal_synthetic_fixture", controlled_access=False,
+            synthetic_or_real="synthetic_fixture",
+        )
+        entry.validate()
+        entries.append(entry)
+    return entries
+
+
+def _dataset_manifest_entries_for_run(context, synthetic: bool):
+    """
+    The one function every CLI-driven source-held-out/ablation call path
+    goes through to obtain its dataset_manifest_entries — synthetic runs
+    get an explicit synthetic manifest (never exempted), real runs load
+    the checked-in configs/datasets.yaml seed (the same seed
+    data/manifest.py's own CLI builds data/processed/dataset_manifest.json
+    from). A real run with no manifest seed present is refused outright
+    rather than silently recording a not_applicable dataset-manifest
+    identity for an evaluated report.
+    """
+    if synthetic:
+        return _synthetic_dataset_manifest_entries(context)
+    from data.manifest import build_dataset_manifest
+
+    seed_path = Path("configs/datasets.yaml")
+    if not seed_path.exists():
+        raise MissingDatasetManifestError(
+            f"no dataset manifest seed found at {seed_path} — the source-held-out domain-robustness "
+            "protocol requires a real dataset_manifest_fingerprint for every evaluated report and "
+            "cannot proceed without configs/datasets.yaml (use --synthetic to exercise this path "
+            "with an explicit synthetic manifest instead)."
+        )
+    return build_dataset_manifest(str(seed_path))
+
+
 def build_real_context(config_path: str) -> ExperimentContext:
     import yaml
     from preprocess import run_pipeline_split_aware
@@ -239,7 +304,7 @@ def _domain_robustness_config_from_args(context, args) -> dict:
     return resolve_domain_robustness_config(base)
 
 
-def run_smoke_task(context, args, run_dir) -> dict:
+def run_smoke_task(context, args, run_dir, synthetic: bool = False) -> dict:
     eligibility = {"smoke_classification": check_task_a_eligibility(context)}
     if not eligibility["smoke_classification"].eligible:
         print(f"[benchmarks] Task A NOT_EVALUABLE: {eligibility['smoke_classification'].reasons}")
@@ -279,6 +344,7 @@ def run_smoke_task(context, args, run_dir) -> dict:
             species_by_source=bench_cfg.get("species_by_source"),
             reference_species=bench_cfg.get("reference_species"),
             reference_assay_mode=bench_cfg.get("reference_assay_mode"),
+            dataset_manifest_entries=_dataset_manifest_entries_for_run(context, synthetic),
         )
         if getattr(args, "domain_robustness_ablation", False):
             domain_robustness_report = run_domain_robustness_ablation(
@@ -302,17 +368,16 @@ def run_smoke_task(context, args, run_dir) -> dict:
             )
         # An ablation report has a materially different top-level shape
         # (variants/per-seed results, not a single per_source_reports list)
-        # — its own child reports are already validated inside
-        # run_domain_robustness_ablation at construction time, so it is
-        # written with the generic (but still atomic/reload-verified)
-        # write_json. The plain aggregate report goes through
-        # write_aggregate_report, which re-validates the WHOLE aggregate
-        # (schema/stamps + every nested per-source report) at write time —
-        # never persisted through an unvalidated path.
+        # — it goes through its OWN versioned schema/writer
+        # (ablation_report.write_ablation_report), which re-validates the
+        # WHOLE structure (including every nested per-source report,
+        # recursively) at write time. The plain aggregate report goes
+        # through write_aggregate_report instead. Neither shape is ever
+        # persisted through the generic, unvalidated write_json path.
         if is_ablation_report:
-            write_json(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
+            write_ablation_report(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
             if getattr(args, "robustness_report", None):
-                write_json(Path(args.robustness_report), domain_robustness_report)
+                write_ablation_report(Path(args.robustness_report), domain_robustness_report)
         else:
             write_aggregate_report(run_dir / "metrics" / "domain_robustness_smoke.json", domain_robustness_report)
             if getattr(args, "robustness_report", None):
@@ -502,6 +567,7 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
             species_by_source=bench_cfg.get("species_by_source"),
             reference_species=bench_cfg.get("reference_species"),
             reference_assay_mode=bench_cfg.get("reference_assay_mode"),
+            dataset_manifest_entries=_dataset_manifest_entries_for_run(context, synthetic),
         )
         if getattr(args, "domain_robustness_ablation", False):
             domain_robustness_report = run_domain_robustness_ablation(
@@ -519,14 +585,15 @@ def run_cancer_task(context, args, run_dir, synthetic: bool = False) -> dict:
                 "cancer_prediction", args.models[0], domain_cfg["strategy"],
                 list(per_source.values()), primary_metric="auroc",
             )
-        # See run_smoke_task's identical branch for why ablation reports
-        # (a different top-level shape) use write_json while the plain
-        # aggregate goes through write_aggregate_report's full recursive
-        # validation at write time.
+        # See run_smoke_task's identical branch: ablation reports (a
+        # different top-level shape) go through their own versioned
+        # schema/writer (write_ablation_report), the plain aggregate
+        # through write_aggregate_report — both fully re-validate at write
+        # time; neither uses the generic, unvalidated write_json path.
         if is_ablation_report:
-            write_json(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
+            write_ablation_report(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
             if getattr(args, "robustness_report", None):
-                write_json(Path(args.robustness_report), domain_robustness_report)
+                write_ablation_report(Path(args.robustness_report), domain_robustness_report)
         else:
             write_aggregate_report(run_dir / "metrics" / "domain_robustness_cancer.json", domain_robustness_report)
             if getattr(args, "robustness_report", None):
@@ -858,7 +925,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_manifest = _run_manifest(context, args.seeds, synthetic, run_dir.name)
 
     if args.task == "smoke":
-        outcome = run_smoke_task(context, args, run_dir)
+        outcome = run_smoke_task(context, args, run_dir, synthetic=synthetic)
     else:
         outcome = run_cancer_task(context, args, run_dir, synthetic=synthetic)
 

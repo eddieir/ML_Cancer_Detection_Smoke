@@ -2127,3 +2127,112 @@ issues, addressed as follows:
   touched across this and the two prior remediation passes found no other
   unconditional, tautological, or assert-free test beyond legitimate
   "must not raise" smoke checks.
+
+### 16.12 Real dataset-manifest identity, registry-derived candidate kind, complete smoke OOF coverage, and a versioned ablation schema
+
+A third independent review of the diff found six remaining issues,
+addressed as follows:
+
+- **Real dataset-manifest identity for every evaluated report.**
+  `dataset_manifest_fingerprint` was previously allowed to default to
+  `not_applicable("no dataset manifest supplied")` even for an evaluated
+  report, since no CLI caller ever actually threaded
+  `dataset_manifest_entries` through to `run_cancer_source_held_out`/
+  `run_smoke_source_held_out`. It is now in `_REQUIRED_WHEN_EVALUATED`
+  (`robustness_report.py`) — an evaluated report with a `not_applicable`
+  dataset-manifest identity is rejected outright. `runner.py` gained
+  `_dataset_manifest_entries_for_run(context, synthetic)`: for
+  `--synthetic` runs it builds `_synthetic_dataset_manifest_entries`, an
+  explicit, internally-constructed `DatasetManifestEntry` per synthetic
+  source (`synthetic_or_real="synthetic_fixture"`) — synthetic mode is
+  never exempted, it fingerprints its own explicit synthetic manifest
+  instead of a real one; for real runs it loads `configs/datasets.yaml`
+  via `data.manifest.build_dataset_manifest` and raises
+  `MissingDatasetManifestError` if that seed file is absent, rather than
+  silently falling back to a `not_applicable` identity for a real run.
+  This is threaded into both task runners' `loso_kwargs` and forwarded
+  through `run_domain_robustness_ablation`'s new
+  `dataset_manifest_entries` parameter. Ineligible/non-evaluated reports
+  still get the SAME real fingerprint whenever a manifest was supplied
+  (it is computed once, independent of any one source's eligibility) —
+  `not_applicable` remains acceptable there only when no manifest was
+  ever supplied at all.
+- **Candidate kind derived from the model registry, never a caller
+  flag.** `is_module_based_candidate` was previously trusted verbatim
+  from whatever the caller stamped. A new module,
+  `benchmarks/candidate_registry.py`, derives candidate kind
+  (classical baseline / non-module MIL / pathway module-based MIL)
+  purely from the canonical registries `baselines.py`
+  (`CANCER_BASELINES`/`SMOKE_BASELINES`) and `mil_registry.py`
+  (`POOLING_BASED_NAMES`/`PATHWAY_MODEL_NAME`) already declare, and raises
+  `UnknownCandidateNameError` (a typed `ValueError`) for any name absent
+  from every registry — never a silent default. `validate_robustness_report`
+  now recomputes `is_module_based` from the report's own `model` field and
+  rejects any disagreement with the report's persisted
+  `is_module_based_candidate` value — a report may still record its own
+  declared kind, but validation checks it against the registry rather than
+  trusting it. Live-running the `domain_adversarial` strategy's cancer
+  workflow during this pass's own verification surfaced a related latent
+  bug: the adversarial identity check previously fired on the bare
+  `strategy` string alone, so a `domain_adversarial` run whose winning
+  candidate happened to be a classical baseline (only
+  `pathway_hierarchical_mil` has a domain-adversarial head at all) could
+  never pass validation. The check now additionally gates on the
+  registry-derived candidate kind — `domain_head_fingerprint`/
+  `domain_vocabulary_fingerprint` are required only when
+  `strategy == "domain_adversarial"` AND the winner is module-based;
+  a classical-baseline winner under that strategy correctly records
+  not-applicable domain-head/vocabulary identities instead.
+- **Complete smoke OOF coverage, enforced.** `_smoke_candidate_dev_score`
+  now validates every OOF probability row (`_validate_oof_probability_row`:
+  correct `num_classes` dimension, all-finite, sums to 1 within tolerance —
+  raising `IncompleteOOFCoverageError`/`RuntimeError` for any violation,
+  since none can legitimately happen given `_align_proba_to_full_classes`'
+  own construction) and checks a poisoned fold cannot predict a subject
+  that was also in its own training set (`RuntimeError` if so). After every
+  fold runs, `_oof_coverage_summary` computes whether EVERY verified-label
+  development subject received exactly one OOF prediction
+  (`complete: bool`) plus `expected_oof_subject_count`/
+  `realized_oof_subject_count`/`missing_oof_subject_count` and three
+  fingerprints (`oof_subject_set_fingerprint`, `fold_assignment_fingerprint`,
+  `class_order_fingerprint` — counts and hashes only, never a raw subject-ID
+  list, since this evidence is persisted verbatim into `comparisons`).
+  Whenever coverage is incomplete, the candidate's score is forced to
+  `None` — it can never win selection, and the winning candidate's
+  `oof_coverage` summary is threaded into `smoke_uncertainty_report`'s
+  output, so an incomplete-coverage candidate can never have its
+  abstention threshold selected from a reduced convenience subset.
+- **Versioned ablation report schema + validated writer.** A new module,
+  `benchmarks/ablation_report.py`, defines `ABLATION_REPORT_SCHEMA_VERSION`
+  and `build_ablation_report`/`validate_ablation_report`/
+  `validate_ablation_report_fingerprint_unchanged`/`write_ablation_report`,
+  mirroring `robustness_report.py`'s validate-before-persist contract for
+  the ablation report's own materially different top-level shape
+  (`task`/`variants`/`seeds`/`results` keyed by variant then seed/
+  `paired_comparison_vs_erm`/`aggregate_fingerprint`). `validate_ablation_report`
+  checks `development_only=True`/`frozen_test_accessed=False`, that
+  `results` keys exactly match the declared `variants` list and every
+  variant's `per_seed` keys exactly match the declared `seeds` list, that
+  every per-seed result is either a `not_evaluable` record with a reason or
+  a `{"per_source": ..., "aggregate": ...}` pair whose `per_source` reports
+  are recursively validated through `validate_per_source_reports` (the
+  same schema-v2 choke point `build_aggregate_report` uses), and that
+  `paired_comparison_vs_erm` is either a top-level `insufficient_evidence`
+  record or a per-variant map of `evaluated`/`insufficient_evidence`
+  results with their own required fields.
+  `validate_ablation_report_fingerprint_unchanged` re-derives
+  `aggregate_fingerprint` over every other field and rejects any
+  disagreement — detecting tampering with top-level metadata, any single
+  variant/seed result, any single nested per-source report, or the paired
+  comparison. `run_domain_robustness_ablation` now returns
+  `build_ablation_report(...)`'s output instead of assembling a plain
+  dict, and `runner.py` persists ablation reports via
+  `write_ablation_report` (atomic write + reload + full recursive
+  validation) instead of the generic `write_json` — neither the ablation
+  report nor the plain aggregate report is ever persisted through an
+  unvalidated path.
+- **Gene coverage remained honest — no code change needed.** No current
+  call site supplies `held_out_raw_gene_list` to `cancer_domain_shift_report`/
+  `smoke_domain_shift_report`, so `gene_space_compatibility` reports
+  `not_evaluable` in every live run, exactly as designed. This section
+  reconfirms rather than changes that behavior.

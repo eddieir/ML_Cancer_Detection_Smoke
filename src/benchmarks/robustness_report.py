@@ -60,13 +60,21 @@ _IDENTITY_FIELDS = (
 # Fields that, for an EVALUATED report (a model was actually fit and applied
 # to the held-out source), must be a real hash regardless of candidate kind
 # — never not_applicable and never None. module_fingerprint is deliberately
-# NOT here: it is only required when is_module_based_candidate=True (see
-# validate_robustness_report) — a classical baseline or non-module MIL
-# candidate has no gene-module structure to fingerprint, and requiring one
-# unconditionally would reject every legitimate classical-baseline report.
+# NOT here: it is only required when the candidate's REGISTRY-DERIVED kind
+# is pathway-module-based (see validate_robustness_report / candidate_
+# registry.py) — a classical baseline or non-module MIL candidate has no
+# gene-module structure to fingerprint, and requiring one unconditionally
+# would reject every legitimate classical-baseline report.
+#
+# dataset_manifest_fingerprint IS required here: an evaluated report means a
+# dataset was actually loaded and a model actually fit against it, so a
+# not_applicable dataset-manifest identity would mean the evaluation ran
+# with literally no record of what it ran on. Synthetic runs must fingerprint
+# their own explicit synthetic manifest rather than being exempted.
 _REQUIRED_WHEN_EVALUATED = (
     "preprocessing_fingerprint", "gene_list_fingerprint", "model_fingerprint",
     "source_policy_fingerprint", "source_split_manifest_fingerprint", "environment_fingerprint",
+    "dataset_manifest_fingerprint",
 )
 
 _REQUIRED_FIELDS = (
@@ -171,29 +179,60 @@ def validate_robustness_report(d: Dict) -> None:
             raise RobustnessReportValidationError(
                 f"robustness report is marked evaluated=True but field(s) {missing_evaluated} are "
                 "not_applicable — an evaluated report must record real model/preprocessing/gene/"
-                "policy/environment identities regardless of candidate kind."
+                "policy/environment/dataset-manifest identities regardless of candidate kind."
             )
-        if d.get("is_module_based_candidate"):
+        # Candidate kind is RECOMPUTED from the canonical model registry
+        # (candidate_registry.py) — never trusted from the report's own
+        # is_module_based_candidate flag. An unrecognized model name raises
+        # UnknownCandidateNameError (a typed ValueError subclass) rather than
+        # defaulting to any kind. The report may still PERSIST its own
+        # is_module_based_candidate value, but validation rejects any
+        # disagreement with the registry-derived kind outright.
+        from .candidate_registry import is_module_based
+
+        derived_is_module_based = is_module_based(d["model"])
+        declared_is_module_based = bool(d.get("is_module_based_candidate"))
+        if declared_is_module_based != derived_is_module_based:
+            raise RobustnessReportValidationError(
+                f"robustness report declares is_module_based_candidate={declared_is_module_based!r} "
+                f"for model={d['model']!r}, but the canonical model registry derives "
+                f"is_module_based={derived_is_module_based!r} for that name — a candidate cannot "
+                "self-declare its own kind; it is derived from the model registry and checked here."
+            )
+        if derived_is_module_based:
             if is_not_applicable(d["module_fingerprint"]):
                 raise RobustnessReportValidationError(
-                    "robustness report is_module_based_candidate=True but module_fingerprint is "
-                    "not_applicable — a module-based/pathway candidate must record a real module "
-                    "identity."
+                    "robustness report's model is a registry-derived module-based/pathway candidate "
+                    "but module_fingerprint is not_applicable — a module-based/pathway candidate must "
+                    "record a real module identity."
                 )
         else:
             if not is_not_applicable(d["module_fingerprint"]):
                 raise RobustnessReportValidationError(
-                    "robustness report is_module_based_candidate=False but module_fingerprint is a "
-                    "real hash — a classical baseline or non-module MIL candidate has no gene-module "
-                    "structure and must record a structured not_applicable() reason instead."
+                    "robustness report's model is a registry-derived non-module candidate but "
+                    "module_fingerprint is a real hash — a classical baseline or non-module MIL "
+                    "candidate has no gene-module structure and must record a structured "
+                    "not_applicable() reason instead."
                 )
         strategy = d.get("strategy")
-        if strategy == "domain_adversarial":
+        # Only pathway_hierarchical_mil actually has a domain-adversarial
+        # attachment point (see mil_registry.py) — a domain_adversarial run
+        # can still legitimately select a classical baseline or non-module
+        # MIL candidate as its winner (e.g. that source's OOF sweep simply
+        # favored logistic regression over the pathway model), and such a
+        # winner has no domain head to fingerprint regardless of the
+        # STRATEGY that was requested. Gating on the registry-derived
+        # candidate kind (not the bare strategy string) avoids rejecting
+        # every legitimate classical-baseline winner under
+        # strategy=domain_adversarial.
+        if strategy == "domain_adversarial" and derived_is_module_based:
             for f in ("domain_head_fingerprint", "domain_vocabulary_fingerprint"):
                 if is_not_applicable(d[f]):
                     raise RobustnessReportValidationError(
-                        f"robustness report strategy='domain_adversarial' but {f!r} is not_applicable "
-                        "— an adversarial report must record real domain-head/vocabulary identities."
+                        f"robustness report strategy='domain_adversarial' with a module-based/pathway "
+                        f"winning candidate but {f!r} is not_applicable — an adversarial report whose "
+                        "winning candidate actually has a domain head must record real domain-head/"
+                        "vocabulary identities."
                     )
         if d.get("calibration"):
             for f in ("calibration_fingerprint", "threshold_policy_fingerprint"):

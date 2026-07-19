@@ -188,7 +188,7 @@ def cancer_uncertainty_report(
 def smoke_uncertainty_report(
     dev_proba: Optional[np.ndarray], dev_labels: Optional[np.ndarray],
     held_out_proba: Optional[np.ndarray], held_out_labels: Optional[np.ndarray],
-    num_classes: int, target_coverage: float = 0.8,
+    num_classes: int, target_coverage: float = 0.8, oof_coverage: Optional[Dict] = None,
 ) -> Dict:
     """
     Multi-class (Task A) analogue of cancer_uncertainty_report: predictive
@@ -225,6 +225,7 @@ def smoke_uncertainty_report(
                 "nested grouped-CV sweep that selected this candidate — never the final dev-pool-"
                 "fitted model's in-sample predictions; held-out-source labels are never read by the "
                 "threshold-selection step regardless.",
+        "oof_coverage": oof_coverage or {},
     }
     if selection.get("status") == "selected":
         threshold = selection["uncertainty_threshold"]

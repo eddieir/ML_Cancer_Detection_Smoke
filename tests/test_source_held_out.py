@@ -13,8 +13,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from benchmarks.runner import build_synthetic_context
-from benchmarks.robustness_report import is_not_applicable, validate_robustness_report
+from benchmarks.runner import _synthetic_dataset_manifest_entries, build_synthetic_context
+from benchmarks.robustness_report import RobustnessReportValidationError, is_not_applicable, validate_robustness_report
 from benchmarks.source_held_out import (
     ConflictingSmokeLabelError,
     CrossSourceSubjectConflictError,
@@ -25,7 +25,17 @@ from benchmarks.source_held_out import (
     run_smoke_source_held_out,
 )
 
-_BENCH_CFG = {"species_by_source": {"sourceA": "human", "sourceB": "human"}, "reference_species": "human"}
+# One fixed synthetic dataset manifest (sourceA/sourceB, matching every
+# synthetic context's own species_by_source config regardless of seed) —
+# every evaluated report now requires a real dataset_manifest_fingerprint
+# (see robustness_report.py), so this is threaded into every source-held-out
+# call below via _BENCH_CFG.
+_DATASET_MANIFEST_ENTRIES = _synthetic_dataset_manifest_entries(build_synthetic_context(seed=0, fast=True))
+
+_BENCH_CFG = {
+    "species_by_source": {"sourceA": "human", "sourceB": "human"}, "reference_species": "human",
+    "dataset_manifest_entries": _DATASET_MANIFEST_ENTRIES,
+}
 
 
 @pytest.fixture(scope="module")
@@ -87,6 +97,42 @@ def test_smoke_reports_are_uncalibrated_with_not_applicable_calibration_identiti
             assert not r["calibration"]
             assert is_not_applicable(r["calibration_fingerprint"])
             assert is_not_applicable(r["threshold_policy_fingerprint"])
+    assert evaluated_any
+
+
+def test_evaluated_reports_have_real_dataset_manifest_fingerprint(ctx):
+    """Every EVALUATED report must carry a real (non-not_applicable)
+    dataset_manifest_fingerprint when dataset_manifest_entries was
+    supplied — including ineligible/non-evaluated branches, since the
+    manifest fingerprint is computed once from the caller-supplied entries,
+    independent of any one source's eligibility."""
+    from benchmarks.robustness_report import is_not_applicable
+
+    reports = run_cancer_source_held_out(ctx, ["prevalence"], device="cpu", n_oof_folds=2, **_BENCH_CFG)
+    evaluated_any = False
+    for src, r in reports.items():
+        validate_robustness_report(r)
+        assert not is_not_applicable(r["dataset_manifest_fingerprint"])
+        if r.get("evaluated"):
+            evaluated_any = True
+    assert evaluated_any
+
+
+def test_evaluated_report_without_dataset_manifest_entries_fails_validation(ctx):
+    """The production enforcement point: an evaluated report built WITHOUT
+    dataset_manifest_entries ever having been supplied gets a
+    not_applicable dataset_manifest_fingerprint, which validate_robustness_
+    report must now reject — proving the requirement is enforced, not
+    merely documented."""
+    cfg_without_manifest = {"species_by_source": {"sourceA": "human", "sourceB": "human"},
+                             "reference_species": "human"}
+    reports = run_cancer_source_held_out(ctx, ["prevalence"], device="cpu", n_oof_folds=2, **cfg_without_manifest)
+    evaluated_any = False
+    for src, r in reports.items():
+        if r.get("evaluated"):
+            evaluated_any = True
+            with pytest.raises(RobustnessReportValidationError):
+                validate_robustness_report(r)
     assert evaluated_any
 
 
@@ -401,6 +447,173 @@ def test_smoke_uncertainty_threshold_unaffected_by_held_out_expression_corruptio
     # model selection/preprocessing must also be untouched by held-out expression corruption
     assert reports_before["sourceB"]["model"] == reports_after["sourceB"]["model"]
     assert reports_before["sourceB"]["preprocessing_fingerprint"] == reports_after["sourceB"]["preprocessing_fingerprint"]
+
+
+def test_smoke_candidate_dev_score_reports_complete_oof_coverage():
+    """The normal-path invariant: when every fold succeeds, oof_coverage
+    reports complete=True with expected==realized subject counts and
+    real fingerprints for the subject set/fold assignment/class order."""
+    from benchmarks.source_held_out import _smoke_candidate_dev_score
+
+    ctx = build_synthetic_context(seed=20, fast=True)
+    normalized_adata = ctx.normalized_adata_for_refit
+    obs = normalized_adata.obs
+    dev_subjects = sorted(set(obs["subject_id"].astype(str)))
+    label_by_subject = {
+        s: int(obs.loc[(obs["subject_id"].astype(str) == s).values, "smoke_type"].iloc[0]) for s in dev_subjects
+    }
+    num_cell_types = ctx.config.get("model", {}).get("num_cell_types", 4)
+    n_hvgs = ctx.preprocessing_artifact.n_hvgs
+
+    score, evidence = _smoke_candidate_dev_score(
+        ctx, "majority", dev_subjects, label_by_subject, num_cell_types, 3, n_hvgs,
+        device="cpu", seed=1, n_dev_folds=3, n_inner_folds=2,
+    )
+    coverage = evidence["oof_coverage"]
+    assert score is not None
+    assert coverage["complete"] is True
+    assert coverage["expected_oof_subject_count"] == coverage["realized_oof_subject_count"]
+    assert coverage["missing_oof_subject_count"] == 0
+    for key in ("oof_subject_set_fingerprint", "fold_assignment_fingerprint", "class_order_fingerprint"):
+        assert isinstance(coverage[key], str) and len(coverage[key]) == 64
+
+
+def test_oof_coverage_summary_flags_missing_subjects_incomplete():
+    from benchmarks.source_held_out import _oof_coverage_summary
+
+    oof_by_subject = {"a": np.array([1.0, 0.0, 0.0]), "b": np.array([0.0, 1.0, 0.0])}
+    coverage = _oof_coverage_summary(oof_by_subject, ["a", "b", "c"], "fold_fp", "class_fp")
+    assert coverage["complete"] is False
+    assert coverage["expected_oof_subject_count"] == 3
+    assert coverage["realized_oof_subject_count"] == 2
+    assert coverage["missing_oof_subject_count"] == 1
+    assert "missing_oof_subjects" not in coverage  # no raw subject-ID list in the persisted summary
+
+
+def test_oof_coverage_summary_complete_when_every_expected_subject_realized():
+    from benchmarks.source_held_out import _oof_coverage_summary
+
+    oof_by_subject = {"a": np.array([1.0, 0.0]), "b": np.array([0.0, 1.0])}
+    coverage = _oof_coverage_summary(oof_by_subject, ["a", "b"], "fold_fp", "class_fp")
+    assert coverage["complete"] is True
+    assert coverage["missing_oof_subject_count"] == 0
+
+
+def test_validate_oof_probability_row_accepts_valid_row():
+    from benchmarks.source_held_out import _validate_oof_probability_row
+
+    _validate_oof_probability_row("s1", np.array([0.2, 0.3, 0.5]), 3)  # must not raise
+
+
+def test_validate_oof_probability_row_rejects_wrong_dimension():
+    from benchmarks.source_held_out import IncompleteOOFCoverageError, _validate_oof_probability_row
+
+    with pytest.raises(IncompleteOOFCoverageError):
+        _validate_oof_probability_row("s1", np.array([0.5, 0.5]), 3)
+
+
+def test_validate_oof_probability_row_rejects_non_finite():
+    from benchmarks.source_held_out import IncompleteOOFCoverageError, _validate_oof_probability_row
+
+    with pytest.raises(IncompleteOOFCoverageError):
+        _validate_oof_probability_row("s1", np.array([np.nan, 0.5, 0.5]), 3)
+    with pytest.raises(IncompleteOOFCoverageError):
+        _validate_oof_probability_row("s1", np.array([np.inf, 0.5, 0.5]), 3)
+
+
+def test_validate_oof_probability_row_rejects_non_unit_sum():
+    from benchmarks.source_held_out import IncompleteOOFCoverageError, _validate_oof_probability_row
+
+    with pytest.raises(IncompleteOOFCoverageError):
+        _validate_oof_probability_row("s1", np.array([0.2, 0.2, 0.2]), 3)
+
+
+def test_smoke_candidate_dev_score_detects_subject_predicted_by_its_own_training_fold(monkeypatch):
+    """A poisoned fold (val subject also present in its own train subject
+    set) must raise, never silently produce a leaked OOF prediction."""
+    import benchmarks.source_held_out as soh
+
+    ctx = build_synthetic_context(seed=21, fast=True)
+    normalized_adata = ctx.normalized_adata_for_refit
+    obs = normalized_adata.obs
+    dev_subjects = sorted(set(obs["subject_id"].astype(str)))
+    label_by_subject = {
+        s: int(obs.loc[(obs["subject_id"].astype(str) == s).values, "smoke_type"].iloc[0]) for s in dev_subjects
+    }
+    num_cell_types = ctx.config.get("model", {}).get("num_cell_types", 4)
+    n_hvgs = ctx.preprocessing_artifact.n_hvgs
+
+    real_grouped_kfold = soh.grouped_kfold
+
+    def _poisoned_grouped_kfold(*args, **kwargs):
+        folds = real_grouped_kfold(*args, **kwargs)
+        # Force the first fold's validation set to include one of its OWN
+        # training subjects — a poisoned-policy proof, not an expected
+        # outcome.
+        poisoned = dict(folds[0])
+        poisoned["val"] = list(poisoned["val"]) + [poisoned["train"][0]]
+        return [poisoned] + list(folds[1:])
+
+    monkeypatch.setattr(soh, "grouped_kfold", _poisoned_grouped_kfold)
+    with pytest.raises(RuntimeError, match="training set"):
+        soh._smoke_candidate_dev_score(
+            ctx, "majority", dev_subjects, label_by_subject, num_cell_types, 3, n_hvgs,
+            device="cpu", seed=1, n_dev_folds=3, n_inner_folds=2,
+        )
+
+
+def test_smoke_candidate_dev_score_detects_duplicate_oof_assignment_across_folds(monkeypatch):
+    """A poisoned fold assignment where the SAME subject is a validation
+    subject in two different folds must raise, never silently overwrite
+    one fold's OOF entry with another's."""
+    import benchmarks.source_held_out as soh
+
+    ctx = build_synthetic_context(seed=22, fast=True)
+    normalized_adata = ctx.normalized_adata_for_refit
+    obs = normalized_adata.obs
+    dev_subjects = sorted(set(obs["subject_id"].astype(str)))
+    label_by_subject = {
+        s: int(obs.loc[(obs["subject_id"].astype(str) == s).values, "smoke_type"].iloc[0]) for s in dev_subjects
+    }
+    num_cell_types = ctx.config.get("model", {}).get("num_cell_types", 4)
+    n_hvgs = ctx.preprocessing_artifact.n_hvgs
+
+    real_grouped_kfold = soh.grouped_kfold
+
+    def _poisoned_grouped_kfold(*args, **kwargs):
+        folds = real_grouped_kfold(*args, **kwargs)
+        if len(folds) < 2:
+            return folds
+        # Force fold 1's validation set to also contain fold 0's first
+        # validation subject — that subject now appears in two different
+        # folds' validation sets.
+        dup_subject = folds[0]["val"][0]
+        poisoned_fold_1 = dict(folds[1])
+        poisoned_fold_1["val"] = list(poisoned_fold_1["val"]) + [dup_subject]
+        poisoned_fold_1["train"] = [s for s in poisoned_fold_1["train"] if s != dup_subject]
+        return [folds[0], poisoned_fold_1] + list(folds[2:])
+
+    monkeypatch.setattr(soh, "grouped_kfold", _poisoned_grouped_kfold)
+    with pytest.raises(RuntimeError, match="more than one fold"):
+        soh._smoke_candidate_dev_score(
+            ctx, "majority", dev_subjects, label_by_subject, num_cell_types, 3, n_hvgs,
+            device="cpu", seed=1, n_dev_folds=3, n_inner_folds=2,
+        )
+
+
+def test_smoke_source_held_out_never_selects_a_candidate_with_incomplete_oof_coverage():
+    """Structural invariant across the whole run_smoke_source_held_out
+    sweep: every comparisons entry with oof_coverage.complete=False must
+    have development_macro_f1=None — an incomplete-coverage candidate can
+    never be the selected winner. Uses a fresh, unmutated context (module-
+    scoped `ctx` may have been corrupted in place by an earlier test)."""
+    ctx = build_synthetic_context(seed=23, fast=True)
+    reports = run_smoke_source_held_out(ctx, ["majority", "logistic"], device="cpu", **_BENCH_CFG)
+    for src, r in reports.items():
+        for comparison in r.get("comparisons", []):
+            coverage = comparison.get("oof_coverage")
+            if coverage and coverage.get("complete") is False:
+                assert comparison.get("development_macro_f1") is None
 
 
 @pytest.fixture(autouse=True)

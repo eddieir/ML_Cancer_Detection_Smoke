@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .ablation_report import build_ablation_report
 from .robustness_report import aggregate_source_reports, validate_per_source_reports
 from .source_held_out import run_cancer_source_held_out, run_smoke_source_held_out
 
@@ -44,6 +45,7 @@ def run_domain_robustness_ablation(
     species_by_source: Optional[Dict[str, str]] = None,
     reference_species: Optional[str] = None,
     reference_assay_mode: Optional[str] = None,
+    dataset_manifest_entries=None,
 ) -> Dict:
     """
     Runs the SAME source-held-out protocol once per domain-robustness
@@ -72,6 +74,7 @@ def run_domain_robustness_ablation(
                     context, model_names, device=device, domain_robustness_config=cfg, seed=s,
                     incompatible_sources=incompatible_sources, species_by_source=species_by_source,
                     reference_species=reference_species, reference_assay_mode=reference_assay_mode,
+                    dataset_manifest_entries=dataset_manifest_entries,
                 )
             else:
                 # Task A's source-held-out protocol (source_held_out.py)
@@ -90,6 +93,7 @@ def run_domain_robustness_ablation(
                     context, model_names, device=device, seed=s,
                     incompatible_sources=incompatible_sources, species_by_source=species_by_source,
                     reference_species=reference_species, reference_assay_mode=reference_assay_mode,
+                    dataset_manifest_entries=dataset_manifest_entries,
                 )
             reports_list = list(per_source.values())
             # Validate every per-source report BEFORE it enters this
@@ -103,11 +107,12 @@ def run_domain_robustness_ablation(
         results[variant_name] = {"per_seed": per_seed}
 
     paired = _paired_comparison_multi_seed(results, primary_metric, seeds, baseline="erm")
-    return {
-        "task": task, "primary_metric": primary_metric, "variants": list(variants.keys()), "seeds": seeds,
-        "results": results, "paired_comparison_vs_erm": paired,
-        "development_only": True, "frozen_test_accessed": False,
-    }
+    # build_ablation_report validates the WHOLE structure — including
+    # recursively validating every nested per-source robustness report —
+    # and stamps a fingerprint over the final assembled content before
+    # returning; this is the production enforcement point, not something a
+    # caller/test must remember to invoke separately.
+    return build_ablation_report(task, primary_metric, list(variants.keys()), seeds, results, paired)
 
 
 def _source_seed_values(variant_result: Dict, seeds: Sequence[int]) -> Dict[tuple, float]:

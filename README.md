@@ -1545,7 +1545,7 @@ requirements.txt
 | `src/train.py` (3-phase Trainer) | Implemented, passes synthetic smoke test |
 | `src/evaluate.py` | Implemented, passes synthetic smoke test |
 | `src/inference.py` | Implemented, passes synthetic smoke test |
-| `tests/*` | All modules covered (1114 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py` |
+| `tests/*` | All modules covered (1147 tests, `python3 -m pytest tests/ -q`): `test_model.py`, `test_pipeline.py`, `test_loaders.py`, `test_transforms.py`, `test_transforms_inductive_annotation.py`, `test_labellers.py`, `test_assembly.py`, `test_converters.py`, `test_train.py`, `test_splitting.py`, `test_preprocessing.py`, `test_preprocess_split_aware.py`, `test_rare_class.py`, `test_label_mapping.py`, `test_evaluate.py`, `test_inference.py`, `test_subject_balanced_sampling.py`, `test_smoke_imbalance_loss.py`, `test_phase2_imbalance_integration.py`, plus 25 `test_benchmarks_*.py` files (including `test_benchmarks_atomic_io.py`, `test_benchmarks_model_fingerprint.py`, `test_benchmarks_cell_type_provenance.py`, `test_benchmarks_env_versions.py`, `test_benchmarks_imbalance_ablation.py`, and `test_benchmarks_final_evaluation.py`), and Phase 6's `test_domain_losses.py`, `test_source_balanced_sampling_domain.py`, `test_source_eligibility.py`, `test_source_held_out.py`, `test_source_held_out_diagnostics.py`, `test_domain_shift_diagnostics.py`, `test_biological_stability.py`, `test_uncertainty_diagnostics.py`, `test_robustness_report.py`, `test_pathway_bundle.py`, `test_domain_robustness_ablation.py`, `test_ablation_report.py` |
 | `src/benchmarks/*` (Phase 1 rigorous benchmarking) | Implemented — see [Benchmarking framework](#benchmarking-framework-phase-1-does-the-neural-model-beat-simple-baselines) — passes a fast synthetic end-to-end CLI run; **not yet run against real merged data**, so no real baseline-vs-neural comparison number exists yet |
 | CI | `.github/workflows/tests.yml` runs the full pytest suite (synthetic fixtures only, no dataset downloads) on push to this branch and on PRs into `main` |
 | `notebooks/*` | `01_data_download`, `02_preprocessing`, `03_training`, `04_evaluation` all implemented |
@@ -2092,6 +2092,45 @@ the aggregate's source count.
   `scope: "unsupported_real_module_analysis"`) — real-module biological-
   stability analysis is disabled, not silently under-documented. Synthetic-
   module results remain `scope: "software_diagnostic_only"`.
+- `dataset_manifest_fingerprint` is now required to be a real hash for
+  every EVALUATED report (`_REQUIRED_WHEN_EVALUATED`) — it can no longer
+  default to `not_applicable` just because no caller threaded a manifest
+  through. `runner.py`'s `_dataset_manifest_entries_for_run` builds an
+  explicit synthetic manifest for `--synthetic` runs (never exempted from
+  the requirement) or loads `configs/datasets.yaml` for real runs, raising
+  `MissingDatasetManifestError` if that seed is absent — never silently
+  falling back to `not_applicable` for a real run. Ineligible/non-evaluated
+  reports get the same real fingerprint whenever a manifest was supplied
+  (computed once, independent of any one source's eligibility);
+  `not_applicable` remains acceptable there only when no manifest was ever
+  supplied.
+- `is_module_based_candidate` is no longer trusted verbatim from the
+  caller. `benchmarks/candidate_registry.py` derives candidate kind
+  (classical baseline / non-module MIL / pathway module-based MIL) from
+  the canonical `baselines.py`/`mil_registry.py` registries and raises a
+  typed `UnknownCandidateNameError` for any unrecognized model name;
+  `validate_robustness_report` recomputes this from the report's own
+  `model` field and rejects any report whose declared
+  `is_module_based_candidate` disagrees with the registry-derived kind.
+- Task A's OOF coverage is now enforced, not just collected.
+  `_smoke_candidate_dev_score` validates every OOF probability row
+  (correct dimension, finite, sums to 1) and rejects a fold that predicts
+  a subject it also trained on; after the sweep, `_oof_coverage_summary`
+  checks whether every verified-label development subject received
+  exactly one OOF prediction and forces the candidate's score to `None`
+  (never selectable) if not. The winning candidate's coverage counts and
+  fingerprints (subject-set/fold-assignment/class-order — never a raw
+  subject-ID list) are persisted in `comparisons` and in
+  `smoke_uncertainty_report`'s output.
+- Domain-robustness ablation output now has its own versioned schema
+  (`benchmarks/ablation_report.py`, `ABLATION_REPORT_SCHEMA_VERSION`):
+  `build_ablation_report` validates every nested per-source report
+  recursively (the same schema-v2 choke point `build_aggregate_report`
+  uses) plus the per-variant/per-seed structure and paired-comparison
+  shape before stamping a whole-report `aggregate_fingerprint`;
+  `write_ablation_report` atomically writes, reloads, and re-validates.
+  `runner.py` persists ablation output through this writer instead of the
+  generic `write_json`.
 
 ## Next steps
 
