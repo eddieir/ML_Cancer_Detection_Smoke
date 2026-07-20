@@ -38,6 +38,7 @@ def _adata(n_subjects=10, cells_per_subject=20, n_genes=50, seed=0, offset=0.0, 
     genes = [f"G{i}" for i in range(n_genes)]
     obs = pd.DataFrame({
         "subject_id": subject_ids, "batch": ["source_0"] * n, "species": species,
+        "is_pseudo_bulk": [False] * n,
     }, index=[f"c{i}" for i in range(n)])
     return ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=genes))
 

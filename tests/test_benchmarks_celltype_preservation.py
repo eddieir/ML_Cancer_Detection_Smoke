@@ -92,6 +92,7 @@ def _hand_built_normalized_adata(n_subjects=8, cells_per_subject=15, g=10, n_ct=
     obs = pd.DataFrame({
         "subject_id": subject_ids, "smoke_type": smoke_types, "cell_type_id": cell_types,
         "malignancy": 0.0, "malignancy_known": False, "exposure_dose": -1.0, "source": sources,
+        "is_pseudo_bulk": False,
     })
     return ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(g)])), subject_ids
 

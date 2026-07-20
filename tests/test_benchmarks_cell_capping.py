@@ -29,6 +29,7 @@ def _make_cell_dataset(subjects_and_counts, g=6, seed=0):
     return CellLevelDataset(
         gene_matrix=X, smoke_labels=np.array(smoke), malignancy_labels=np.zeros(len(smoke), dtype="float32"),
         cell_type_ids=np.zeros(len(smoke), dtype=int), subject_ids=np.array(subj_ids, dtype=object),
+        is_pseudo_bulk=np.zeros(len(smoke), dtype=bool),
     )
 
 

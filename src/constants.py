@@ -87,3 +87,35 @@ ASSAY_MODE_SINGLE_CELL = "human_single_cell"
 ASSAY_MODE_BULK_TCGA   = "bulk_tcga"
 VALID_ASSAY_MODES = frozenset({ASSAY_MODE_SINGLE_CELL, ASSAY_MODE_BULK_TCGA})
 DEFAULT_ASSAY_MODE = ASSAY_MODE_SINGLE_CELL
+
+# ─── Assay policy (experiment-level single-cell/bulk/multimodal gate) ──────
+# Row-level assay provenance (is_pseudo_bulk, assay_mode above) says what a
+# given observation IS; assay_policy says what an EXPERIMENT is allowed to
+# accept. See data/assay_policy.py, the single enforcement module every
+# source-loading, preprocessing, dataset-construction, training, evaluation,
+# bundle, and inference boundary in this project must consult before
+# accepting a row. Never compare dataset/source NAMES to decide whether a
+# row is safe — always consult is_pseudo_bulk on the row itself.
+ASSAY_POLICY_SINGLE_CELL_ONLY = "single_cell_only"
+ASSAY_POLICY_BULK_ONLY        = "bulk_only"
+ASSAY_POLICY_MULTIMODAL       = "multimodal"
+VALID_ASSAY_POLICIES = frozenset({
+    ASSAY_POLICY_SINGLE_CELL_ONLY, ASSAY_POLICY_BULK_ONLY, ASSAY_POLICY_MULTIMODAL,
+})
+# single_cell_only is the only policy with a real, trainable pipeline today
+# — see data/assay_policy.py::BulkTrainingNotImplementedError/
+# MultimodalTrainingNotImplementedError for the other two.
+DEFAULT_ASSAY_POLICY = ASSAY_POLICY_SINGLE_CELL_ONLY
+# Bumped whenever the *meaning* of assay_policy enforcement changes (not on
+# every code edit) — recorded on every PreprocessingArtifact/bundle/report so
+# a reload can tell an artifact fit under an older enforcement contract from
+# one fit under the current one. See data/assay_policy.py.
+#
+# "2": missing row-level is_pseudo_bulk provenance now fails closed
+# (MissingAssayProvenanceError) in fit_preprocessing/apply_preprocessing/
+# CellLevelDataset/CellLevelDataset.from_dir, instead of defaulting to
+# all-real-cells outside an explicit diagnostic_mode; require_trainable()
+# is now enforced at every production training entry point rather than
+# only at the loading/manifest boundary. An artifact/bundle recorded with
+# version "1" was fit under the older, more permissive contract.
+ASSAY_POLICY_VERSION = "2"

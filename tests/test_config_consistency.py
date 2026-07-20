@@ -116,6 +116,22 @@ def test_experiment_mode_human_only_by_default():
     assert cfg["data"]["experiment_mode"] == "human_only"
 
 
+def test_assay_policy_default_matches_code():
+    from constants import DEFAULT_ASSAY_POLICY
+
+    cfg = _load_config()
+    assert cfg["data"]["assay_policy"] == DEFAULT_ASSAY_POLICY
+
+
+def test_bulk_sources_disabled_by_default_and_excludes_from_single_cell_lists():
+    cfg = _load_config()
+    bulk = cfg["data"]["bulk_sources"]
+    assert bulk["enabled"] is False
+    bulk_names = {row[2] for row in bulk["datasets"]}
+    for path, *_ in cfg["data"]["microarray_sources"]:
+        assert not any(name in path for name in bulk_names)
+
+
 # ─── Phase 5 — pathway hierarchical MIL defaults ────────────────────────────
 
 def test_pathway_hierarchical_mil_disabled_by_default():

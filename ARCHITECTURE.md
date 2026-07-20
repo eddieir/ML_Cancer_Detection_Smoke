@@ -1215,38 +1215,158 @@ species when explicitly requested, but there is no pretraining loop or
 domain-adaptation training procedure built on top of them in this change.
 Both remain disabled by default.
 
-### 14.5 Bulk/single-cell boundary
+### 14.5 Bulk/single-cell boundary (assay policy)
 
-`src/constants.py` defines `human_single_cell`/`bulk_tcga` assay modes.
-Every loader stamps `obs["assay_mode"]`, defaulting to `human_single_cell`;
-`data/converters.py::convert_tcga` is the only producer of
-`assay_mode="bulk_tcga"` (written into its `samples_meta.csv` output,
-picked up by `data/loaders.py::load_microarray`). Enforcement:
+`src/data/assay_policy.py` is the single, versioned, experiment-level gate
+governing whether a row of loaded expression data may enter a given run
+(GitHub issue #13). It is keyed on `obs["is_pseudo_bulk"]` — the row-level
+fact of whether an observation is a real cell — never on a source name, an
+accession string, or `obs["assay_mode"]` (a narrower, TCGA-specific tag;
+see below). Three policies (`constants.ASSAY_POLICY_*`,
+`data.assay_policy` in config, default `single_cell_only`):
 
-- `configs/default.yaml`'s `microarray_sources` no longer lists TCGA-LUAD/
-  TCGA-LUSC — they moved to `data.tcga.bulk_sources`, a separate config key
-  the default single-cell loading path never reads.
-- `preprocess.py::_load_all_sources` additionally checks every loaded
-  source's `assay_mode` column directly and raises `AssayModeError`
-  (`data/assay_mode.py`) if any `bulk_tcga` row is present — a defensive
-  check against a config that still manually lists a bulk source under
-  `scrna_sources`/`microarray_sources`, not just reliance on the config
-  default being correct.
-- `preprocess.py::load_tcga_bulk_dataset` is the only sanctioned way to
-  load TCGA's bulk matrices: it requires `data.tcga.enabled=true`,
-  validates every loaded source actually carries `assay_mode="bulk_tcga"`,
-  and raises `BulkTrainingNotImplementedError` if asked for a trainable
-  dataset (`require_trainable=True`) — this project has no bulk RNA-seq
-  model or training loop, and that gap is a raised error, not a silent
-  fallback onto the single-cell model.
-- TCGA's `sample_type`-derived malignancy (tumor vs. solid-tissue-normal)
-  is written only into this bulk path's `samples_meta.csv`; it is never
-  reachable from a single-cell `CellLevelDataset`/MIL bag because the
-  bulk CSV itself never enters `_load_all_sources`.
+- **`single_cell_only`** (default) — rejects any `is_pseudo_bulk=True` row.
+- **`bulk_only`** — rejects any real (`is_pseudo_bulk=False`) row. Loading/
+  validating a bulk manifest works; `require_trainable()` raises a typed
+  `BulkTrainingNotImplementedError` — there is no bulk model or training
+  loop in this project.
+- **`multimodal`** — not implemented. `resolve_assay_capabilities()` raises
+  a typed `MultimodalTrainingNotImplementedError` immediately for this
+  policy; there is deliberately no "accept mixed rows" fallback.
+
+**Why the previous TCGA-only check missed GSE994/GSE123352/CANUCK.**
+`src/constants.py` also defines a narrower `human_single_cell`/`bulk_tcga`
+`assay_mode` tag. Every loader stamps `obs["assay_mode"]`, defaulting to
+`human_single_cell`; `data/converters.py::convert_tcga` is the only
+producer of `assay_mode="bulk_tcga"`. The pre-issue-13 pipeline only
+rejected rows tagged `bulk_tcga` — but `load_microarray` stamps
+`is_pseudo_bulk=True` on GSE994/GSE123352/GSE307690 without ever setting
+`assay_mode="bulk_tcga"` (no `samples_meta.csv` override exists for them),
+so that name/tag-keyed check silently passed them into the single-cell
+matrix. `assay_policy.py`'s `is_pseudo_bulk`-keyed check closes that gap;
+the TCGA-specific `assay_mode=="bulk_tcga"` check is kept as an
+independent, additional signal, not the sole mechanism.
+
+**Enforcement boundaries** (each raises `AssayPolicyError`, a subclass of
+the pre-existing `data/assay_mode.py::AssayModeError`, independently — a
+hand-built or corrupted AnnData is checked the same way real pipeline
+output is):
+
+- `preprocess.py::_load_all_sources` — checks every loaded source's
+  `is_pseudo_bulk` column against `data.assay_policy` before appending it
+  to the merge list; also keeps the original `assay_mode=="bulk_tcga"`
+  check as a second signal.
+- `data/assembly.py::merge_sources`/`assemble_subject_bags`/
+  `export_cell_dataset` — each independently re-checks `is_pseudo_bulk`
+  against `assay_policy`, and now REQUIRES the column in real
+  (`diagnostic_mode=False`, the default) mode: a genuinely MISSING
+  `is_pseudo_bulk` column raises `MissingAssayProvenanceError` rather than
+  defaulting to all-`False`, matching `fit_preprocessing`/
+  `apply_preprocessing`/`CellLevelDataset`. Only an explicit
+  `diagnostic_mode=True` caller may fall back to a synthetic all-False
+  array (stamped `uns["diagnostic_mode"]=True` on the merged output, and
+  `diagnostic_mode`/`assay_policy`/`assay_policy_version` on every bag and
+  in `export_cell_dataset`'s `dataset_metadata.json`), so a hand-built or
+  corrupted AnnData passed directly to any of these three functions can no
+  longer smuggle unlabelled rows through as "every row is a real cell".
+  `export_cell_dataset` validates before writing anything, so a rejected
+  call leaves no partial output directory on disk. `assemble_subject_bags`/
+  `export_cell_dataset` also call `require_trainable(assay_policy)`
+  directly, since a per-cell MIL bag or cell-level export has no meaning
+  under `bulk_only`/`multimodal` regardless of `diagnostic_mode`.
+- `data/preprocessing.py::fit_preprocessing` — REQUIRES `is_pseudo_bulk` on
+  the train partition unless `diagnostic_mode=True`; a missing column
+  raises `MissingAssayProvenanceError` rather than defaulting to
+  all-real-cells. `apply_preprocessing`/`assert_assay_compatible` apply the
+  same requirement to transform/inference input, and additionally check
+  the input's `is_pseudo_bulk` against the artifact's own `assay_policy`
+  once present.
+- `train.py::CellLevelDataset.__init__` — REQUIRES an `is_pseudo_bulk`
+  array unless `diagnostic_mode=True` (only then does it default to
+  all-`False`, for a deliberately synthetic fixture); values are parsed by
+  `data/assay_policy.py::parse_strict_bool_array` and validated against
+  `assay_policy`, and `require_trainable(assay_policy)` is enforced for
+  every real construction (this class is single-cell training only —
+  `bulk_only`/`multimodal` are rejected, not merely validated row-by-row).
+  `subset_by_subjects`/`concat_cell_datasets`
+  (`benchmarks/cross_validation.py`)/`cap_cell_dataset`
+  (`benchmarks/features.py`) all preserve `is_pseudo_bulk`/`assay_policy`.
+  `from_dir()` requires `cell_metadata.csv` with `subject_id`/`source`/
+  `is_pseudo_bulk` columns in real mode and raises the typed
+  `LegacyCellDatasetDirectoryError` for an export that predates them.
+- `benchmarks/fold_preprocessing.py::build_fold_cell_dataset` — inherits
+  the `apply_preprocessing` check and threads `is_pseudo_bulk` into the
+  fold's `CellLevelDataset`.
+- `benchmarks/context.py::ExperimentContext.from_pipeline_result` — calls
+  `data/preprocessing.py::assert_real_assay_provenance`, which rejects a
+  `PreprocessingArtifact` with `assay_policy=None` (missing/legacy) for any
+  real (non-synthetic) context, mirroring `validate_cell_type_provenance`'s
+  existing fail-closed pattern.
+- `benchmarks/bundle.py::write_model_bundle`/`load_and_validate_bundle` —
+  the bundle manifest records `assay_policy` (defaulting to the referenced
+  artifact's own value; an explicit mismatch is rejected at write time);
+  reload cross-checks the manifest's recorded value against the loaded
+  artifact's. `validate_bundle_input_modality()` rejects an input whose
+  `is_pseudo_bulk` doesn't match the bundle's declared policy, and is now
+  wired into real inference via `inference.py::Predictor.from_bundle()` —
+  the supported bundle-backed construction path loads and validates the
+  manifest, and stores it on the returned `Predictor` so every subsequent
+  raw-array prediction is checked against it before any model execution.
+  AnnData inference through `Predictor.predict_h5ad` remains protected via
+  `apply_preprocessing`/`assert_assay_compatible` as before.
+  `Predictor.predict_subject`/`predict_batch` (raw-array input) now REQUIRE
+  keyword-only `input_modality`/`input_assay_policy`/`is_pseudo_bulk`
+  (`predict_batch` additionally requires `diagnostic_mode` to agree across
+  every subject in the call) — a raw NumPy matrix carries no biological
+  provenance of its own, so these are never inferred from matrix shape,
+  gene count, cell-type IDs, subject ID, or bundle/artifact metadata. Both
+  validate the full declared contract (modality/policy consistency, row
+  count, strict-parsed `is_pseudo_bulk`, the artifact's own recorded
+  `assay_policy`, and — if this `Predictor` came from `from_bundle()` —
+  the bundle manifest) before any tensor is created or the model runs;
+  `predict_batch` validates every subject in the batch before predicting
+  any of them, so one invalid subject anywhere rejects the whole batch
+  with zero partial predictions. `Predictor.from_config()` similarly
+  rejects a legacy/incomplete `PreprocessingArtifact` (`assay_policy is
+  None`) for real inference, raising `CellTypeProvenanceError` unless the
+  caller explicitly passes `unsafe_legacy_mode=True` — every prediction
+  produced by an unsafe-legacy or `diagnostic_mode=True` call is stamped
+  `"diagnostic": True` in its result and must never be treated as a
+  scientific/production output.
+- `preprocess.py::run_pipeline`/`run_pipeline_split_aware` and
+  `ExperimentContext.from_pipeline_result` call
+  `data/assay_policy.py::require_trainable` before doing any real work —
+  `assay_policy='bulk_only'` raises `BulkTrainingNotImplementedError` and
+  `'multimodal'` raises `MultimodalTrainingNotImplementedError` immediately,
+  never after a model has been constructed. The same call is repeated (as
+  defense in depth against a hand-built `ExperimentContext`) in
+  `Trainer.from_config`, `Trainer.from_experiment_context`,
+  `run_smoke_cv`/`run_cancer_cv`, `generate_subject_oof_predictions`,
+  `fit_final_candidate_on_dev_pool`, and both source-held-out entry points.
+- `preprocess.py::load_tcga_bulk_dataset` remains the only sanctioned way
+  to load TCGA's bulk matrices (`data.tcga.enabled=true` required) and
+  still raises `BulkTrainingNotImplementedError` for
+  `require_trainable=True`.
+
+**`PreprocessingArtifact` fields** (all part of `scientific_fingerprint()`,
+so changing the assay policy — or fitting against a different observed
+assay-mode mix — changes the fingerprint): `assay_policy`,
+`assay_policy_version`, `observed_assay_modes`,
+`pseudo_bulk_rows_present_at_fit`, `training_data_modality`,
+`allowed_inference_modality`.
+
+**Config**: `configs/default.yaml`'s `data.microarray_sources` no longer
+lists GSE994/GSE123352/GSE307690 — they moved to `data.bulk_sources`
+(`enabled: false`, a `datasets` list), a disabled-by-default block kept
+only as a dataset-manifest/download/conversion record, parallel to
+`data.tcga.bulk_sources`. `data.assay_policy: single_cell_only` is the
+explicit default.
 
 `data/assay_mode.py::assert_no_pseudo_bulk_rows`/`assert_no_single_cell_rows`
-remain available as generic guards for any additional single-cell-only or
-bulk-only code path that needs the same check.
+remain available as the narrower, `assay_mode`-tag-specific guards they
+always were; `data/assay_policy.py::assert_rows_match_policy` is the
+general, `is_pseudo_bulk`-keyed mechanism every boundary above actually
+uses.
 
 ### 14.6 Controlled-access boundary (NLST)
 

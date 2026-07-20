@@ -1,26 +1,28 @@
 """
-data/assay_mode.py — explicit single_cell / bulk_tcga assay-mode guard.
+data/assay_mode.py — explicit single_cell / bulk_tcga assay-mode vocabulary
+and row-level guard, kept for the TCGA-specific "assay_mode" tag.
 
-KNOWN EXISTING LIMITATION (see README.md's "Bulk/single-cell separation"
-section): this project's current default pipeline (preprocess.py::
-run_pipeline / run_pipeline_split_aware, as configured by
-configs/default.yaml's `microarray_sources`) already merges TCGA-LUAD/
-TCGA-LUSC pseudo-bulk samples (data/loaders.py::load_microarray,
-is_pseudo_bulk=True) into the SAME AnnData used to build CellLevelDataset
-— i.e. bulk RNA-seq "samples" are currently treated as single MIL-bag
-"cells" alongside real single-cell data. This is a pre-existing, documented
-design choice (see qc_filter/normalize's explicit pseudo-bulk branches)
-that this module does not retroactively change — undoing it touches the
-default training data composition, model dimensions, and every benchmark
-that currently runs against the merged data, which is out of scope for
-this change.
+HISTORICAL NOTE (see GitHub issue #13 and README.md's "Bulk/single-cell
+separation" section): before issue #13, the default pipeline
+(preprocess.py::_load_all_sources) only rejected rows whose obs["assay_mode"]
+was explicitly "bulk_tcga" — TCGA's own tag. GSE994, GSE123352, and
+GSE307690/CANUCK are also pseudo-bulk (data/loaders.py::load_microarray,
+is_pseudo_bulk=True) but were never stamped assay_mode="bulk_tcga" (only
+TCGA's converter writes that tag), so that name-keyed check silently let
+them into the same AnnData used to build CellLevelDataset. That gap is now
+closed by data/assay_policy.py, which enforces the experiment-level assay
+policy against obs["is_pseudo_bulk"] directly — the actual row-level fact
+of whether a row is a real cell — rather than the assay_mode tag or a
+source/accession name. See data/assay_policy.py's module docstring for the
+full enforcement surface.
 
-What this module provides is the explicit assay-mode vocabulary
-(constants.ASSAY_MODE_SINGLE_CELL / ASSAY_MODE_BULK_TCGA) and a guard
-function any NEW single-cell-only code path can call to refuse pseudo-bulk
-rows explicitly instead of silently accepting them — see
-assert_no_pseudo_bulk_rows(). Adopting this guard in the existing default
-pipeline is tracked as follow-up work, not done here.
+This module still provides the narrower assay_mode vocabulary
+(constants.ASSAY_MODE_SINGLE_CELL / ASSAY_MODE_BULK_TCGA) and its own
+is_pseudo_bulk guard functions, used as an additional, independent check
+specifically for TCGA's assay_mode tag (see preprocess.py::
+_load_all_sources's second check) and by data/assay_policy.py's
+AssayPolicyError, which subclasses AssayModeError for backward
+compatibility with call sites written against the pre-issue-13 guard.
 """
 
 from typing import Sequence

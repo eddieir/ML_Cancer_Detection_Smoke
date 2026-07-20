@@ -42,7 +42,7 @@ def _adata(n_subjects=20, cells_per_subject=15, n_genes=30, seed=0):
     n = len(subject_ids)
     X = rng.random((n, n_genes)).astype("float32")
     genes = [f"G{i}" for i in range(n_genes)]
-    obs = pd.DataFrame({"subject_id": subject_ids, "batch": ["b0"] * n}, index=[f"c{i}" for i in range(n)])
+    obs = pd.DataFrame({"subject_id": subject_ids, "batch": ["b0"] * n, "is_pseudo_bulk": [False] * n}, index=[f"c{i}" for i in range(n)])
     return ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=genes))
 
 

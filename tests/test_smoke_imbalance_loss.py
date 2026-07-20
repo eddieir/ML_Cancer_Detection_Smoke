@@ -271,6 +271,7 @@ def _cell_dataset(labels, subject_ids, num_classes=6):
         malignancy_labels=np.zeros(n, dtype="float32"),
         cell_type_ids=np.zeros(n, dtype=np.int64),
         subject_ids=np.array(subject_ids, dtype=object),
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
 
 

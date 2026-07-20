@@ -625,7 +625,7 @@ def _tiny_artifact(tmp_path=None, seed=0):
         subject_ids += [f"sub_{i}"] * 5
     n = len(subject_ids)
     X = rng.random((n, n_genes)).astype("float32")
-    obs = pd.DataFrame({"subject_id": subject_ids, "batch": ["b0"] * n}, index=[f"c{i}" for i in range(n)])
+    obs = pd.DataFrame({"subject_id": subject_ids, "batch": ["b0"] * n, "is_pseudo_bulk": [False] * n}, index=[f"c{i}" for i in range(n)])
     adata = ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=list(GENES)))
     return fit_preprocessing(adata, set(subject_ids), n_hvgs=n_genes)
 

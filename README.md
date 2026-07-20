@@ -74,13 +74,127 @@ the policies that keep label handling and preprocessing honest.
 
 | Dataset | Status | Notes |
 |---|---|---|
-| GSE994 | Implemented, verified public download | Bulk microarray; per-sample smoking status parsed from series metadata where it matches a documented pattern, otherwise `smoke_type_known=False` rather than the accession-level default. |
-| GSE123352 | Implemented, verified public download | Bulk RNA-seq, ever/never-smoker status from series metadata under the same known/unknown parsing as GSE994 (not independently re-verified against GEO in this change — no network access in this environment; see `configs/datasets.yaml`). |
+| GSE994 | Implemented, verified public download | Bulk microarray, loaded as one pseudo-bulk row per sample (`is_pseudo_bulk=True`). Kept out of the default single-cell training pipeline — see "Assay separation" below. Per-sample smoking status parsed from series metadata where it matches a documented pattern, otherwise `smoke_type_known=False` rather than the accession-level default. |
+| GSE123352 | Implemented, verified public download | Bulk RNA-seq, same pseudo-bulk/assay-separation treatment as GSE994. Ever/never-smoker status from series metadata under the same known/unknown parsing (not independently re-verified against GEO in this change — no network access in this environment; see `configs/datasets.yaml`). |
 | GSE136831 | Implemented, verified-label default with an explicit opt-in weak proxy | Real per-cell donor IDs and disease status (COPD/IPF/Control). Every cell's smoke label defaults to unknown (`smoke_type_known=False`); COPD status is recorded as a separate, documented weak proxy (`weak_smoke_proxy_*` fields) that only feeds smoke-classification supervision when `data.weak_labels.enabled=true` — see the caveat below. |
 | GSE288003 (mouse) | Implemented, species-separated | Real per-sample e-cig/control condition; excluded from the pipeline entirely unless `data.experiment_mode` is set away from the default `human_only` (see `src/data/species_policy.py`). Ortholog mapping is now a versioned, cacheable artifact (`src/data/ortholog.py`) instead of an uncached live BioMart query. |
-| GSE307690 (CANUCK) | Adapter implemented; sample completeness not independently re-verified in this environment | See `configs/datasets.yaml`'s `known_limitations` for this entry. |
-| TCGA-LUAD / TCGA-LUSC | Adapter implemented; downloading requires a personal GDC token (not present in this environment) | Bulk RNA-seq, kept out of the single-cell pipeline by construction — see the bulk/single-cell note below. |
+| GSE307690 (CANUCK) | Adapter implemented; sample completeness not independently re-verified in this environment | Bulk RNA-seq pseudo-bulk rows, same assay-separation treatment as GSE994/GSE123352. See `configs/datasets.yaml`'s `known_limitations` for this entry. |
+| TCGA-LUAD / TCGA-LUSC | Adapter implemented; downloading requires a personal GDC token (not present in this environment) | Bulk RNA-seq, kept out of the single-cell pipeline by construction — see "Assay separation" below. |
 | NLST | Controlled-access, blocked in this environment | No participant-level file has been obtained or committed. `src/data/nlst_adapter.py` resolves a local path from `NLST_DATA_ROOT` (or `data.nlst.local_root_env`) and validates required columns; with no approved DUA in this environment, real ingestion is unavailable and the adapter says so explicitly rather than substituting a fixture. |
+
+### Assay separation (single-cell vs. bulk)
+
+A bulk microarray/RNA-seq sample loaded as one AnnData row ("pseudo-bulk",
+`is_pseudo_bulk=True` — see `data/loaders.py::load_microarray`) is not a
+cell: it has no real cell type, no per-cell malignancy signal, and no
+biological meaning as one element of a subject's MIL cell bag. Earlier
+versions of this pipeline only rejected rows explicitly tagged
+`assay_mode="bulk_tcga"` (TCGA's own tag), which meant GSE994, GSE123352,
+and GSE307690/CANUCK — pseudo-bulk but never stamped `bulk_tcga` — could
+still enter the same matrix as real single-cell data (GitHub issue #13).
+
+`src/data/assay_policy.py` is now the single, versioned gate for this,
+keyed on the row-level `is_pseudo_bulk` fact rather than a source/accession
+name or the `assay_mode` tag — renaming a converted file cannot bypass it.
+Three experiment-level policies (`data.assay_policy` in
+`configs/default.yaml`):
+
+* **`single_cell_only`** (the default) — accepts real single-cell rows
+  only; any `is_pseudo_bulk=True` row anywhere in the input is rejected.
+* **`bulk_only`** — accepts pseudo-bulk/bulk rows only; rejects real
+  cells. Loading and validating a bulk manifest is supported (TCGA via
+  `preprocess.py::load_tcga_bulk_dataset`); there is no bulk model or
+  training loop, so requesting a trainable bulk dataset raises a typed
+  `BulkTrainingNotImplementedError` rather than silently reusing the
+  single-cell model/loss on bulk expression.
+* **`multimodal`** — not implemented. Requesting it anywhere raises a
+  typed `MultimodalTrainingNotImplementedError`; there is no separate-
+  encoder, modality-aware fusion architecture in this codebase, and this
+  project deliberately does not approximate one by just accepting mixed
+  rows in one run.
+
+Enforcement happens at every boundary that can see a mix of rows: source
+loading (`preprocess.py::_load_all_sources`), `merge_sources`,
+`fit_preprocessing`/`apply_preprocessing`, `CellLevelDataset` construction,
+`assemble_subject_bags`, per-fold preprocessing refits, and model-bundle
+loading — each one independently rejects a policy violation, so a hand-
+built or corrupted AnnData is checked the same way real pipeline output is.
+`PreprocessingArtifact` records `assay_policy`, `assay_policy_version`,
+`observed_assay_modes`, `pseudo_bulk_rows_present_at_fit`,
+`training_data_modality`, and `allowed_inference_modality`, and all of
+these are part of the artifact's scientific fingerprint — a mismatched
+artifact/checkpoint/bundle assay policy is rejected, and an artifact that
+predates this enforcement (`assay_policy=None`) is refused for any real
+(non-synthetic) `ExperimentContext` or bundle rather than assumed safe.
+
+`configs/default.yaml`'s `data.microarray_sources` no longer lists GSE994,
+GSE123352, or GSE307690/CANUCK — they moved to a disabled-by-default
+`data.bulk_sources` block, kept only as a dataset-manifest/download/
+conversion record (download and conversion support is unchanged; only the
+default single-cell training pipeline's source list changed). TCGA remains
+under `data.tcga` (`enabled: false`), unchanged. Even if a config is
+hand-edited to route a pseudo-bulk source back through
+`scrna_sources`/`microarray_sources`, the row-level check still rejects it
+— the config change alone was not the only enforcement mechanism.
+
+No real bulk training exists, and no multimodal architecture exists. This
+change does not add either; it only makes sure bulk data cannot silently
+substitute for single-cell data in the pipeline that does exist. Model
+performance figures produced before this change may have been computed
+against a pipeline that accepted pseudo-bulk rows into the single-cell
+matrix under a permissive config — this document does not restate those
+figures as scientifically comparable to a genuinely single-cell-only run,
+since that has not been separately verified.
+
+**Missing provenance fails closed, not open.** A real (non-diagnostic) run
+that reaches `fit_preprocessing`, `apply_preprocessing`, `CellLevelDataset`
+construction, or `CellLevelDataset.from_dir()` without row-level
+`is_pseudo_bulk` provenance raises `MissingAssayProvenanceError` rather
+than defaulting the missing column to "every row is a real cell". That
+default-to-safe behavior existed for a period during this module's
+development and has been removed — it is not the current behavior of any
+of the functions above. The only sanctioned exception is an explicit,
+narrowly-scoped `diagnostic_mode=True` argument, reserved for deliberately
+synthetic fixtures (unit tests, `--synthetic` CLI runs); it is never
+inferred from a source name, a file path, or the absence of real data, and
+a diagnostic-mode dataset is rejected by `ExperimentContext` validation and
+by every real bundle/report path. `CellLevelDataset.from_dir()` additionally
+refuses to load a legacy exported directory (missing
+`cell_metadata.csv` or its `subject_id`/`source`/`is_pseudo_bulk`
+columns) with a typed `LegacyCellDatasetDirectoryError` — such a directory
+must be regenerated with the current pipeline, not loaded with relaxed
+assumptions.
+
+**Boolean provenance is parsed strictly.** `data/assay_policy.py::
+parse_strict_bool_array` is the one parser used for persisted/user-provided
+`is_pseudo_bulk` values throughout the codebase (loaders, `from_dir()`,
+bundle-input validation). It accepts real booleans and the literal strings
+`"true"/"True"/"1"` / `"false"/"False"/"0"`; it rejects `NaN`, `None`, empty
+strings, and any other value outright — `bool("False")` evaluating to
+`True` is exactly the kind of silent misparse this project does not rely
+on `astype(bool)`/`bool(x)` to avoid.
+
+**Unsupported training modes are blocked before fitting, not just at the
+policy helper.** `data.assay_policy.require_trainable()` is called at
+every production path that can reach a trainable result or a constructed
+model: `preprocess.py::run_pipeline`/`run_pipeline_split_aware` (before any
+source is loaded), `ExperimentContext.from_pipeline_result` (the shared
+validation every CV/OOF/final-fit/source-held-out path builds on),
+`Trainer.from_config`, `Trainer.from_experiment_context`, and the entry
+points of `run_smoke_cv`/`run_cancer_cv`,
+`generate_subject_oof_predictions`, `fit_final_candidate_on_dev_pool`, and
+both source-held-out functions. `assay_policy='bulk_only'` raises
+`BulkTrainingNotImplementedError` and `'multimodal'` raises
+`MultimodalTrainingNotImplementedError` before any model, optimizer, or
+preprocessing fit is constructed — loading/validating a bulk manifest
+(`load_tcga_bulk_dataset`) remains available separately and is unaffected.
+
+**Legacy datasets/artifacts/bundles must be regenerated, not patched
+around.** An exported cell-dataset directory, a `PreprocessingArtifact`, or
+a model bundle produced before this enforcement existed has no reliable
+way to retroactively prove its row-level provenance was correct, so each
+of those loaders refuses to guess — see `LegacyCellDatasetDirectoryError`
+above and `assert_real_assay_provenance()` for the artifact/bundle case.
 
 ### Label integrity
 
@@ -118,10 +232,11 @@ the policies that keep label handling and preprocessing honest.
   `smoke_type="unknown"`/`smoke_type_known=False` for every sample. TCGA is
   primarily bulk RNA-seq: `configs/default.yaml`'s `microarray_sources` no
   longer lists TCGA-LUAD/TCGA-LUSC at all, and every TCGA sample carries
-  `assay_mode="bulk_tcga"` (`src/data/assay_mode.py`), which
+  `is_pseudo_bulk=True` and `assay_mode="bulk_tcga"`, both of which
   `preprocess.py::_load_all_sources` refuses to load into the human
   single-cell pipeline even if a config is misconfigured to reference it —
-  see `preprocess.py::load_tcga_bulk_dataset` for the dedicated bulk
+  see "Assay separation" above for the general row-level mechanism and
+  `preprocess.py::load_tcga_bulk_dataset` for the dedicated bulk
   loading/validation path, which stays disabled by default
   (`data.tcga.enabled=false`) and raises `BulkTrainingNotImplementedError`
   if asked to produce a trainable bulk dataset (no bulk model exists in
@@ -2217,11 +2332,14 @@ the aggregate's source count.
 
 ## Next steps
 
-- Run `python -m benchmarks.runner` against the real merged data (GSE994 +
-  GSE307690 + GSE123352 + GSE136831 once re-converted) for both tasks — the
+- Run `python -m benchmarks.runner` against the real single-cell data
+  (GSE136831, once re-converted, plus any additional real single-cell
+  source under `data.assay_policy=single_cell_only`) for both tasks — the
   framework exists and is tested against synthetic data, but has not been
   run against real data yet, so no real baseline-vs-neural comparison number
-  can be reported honestly today
+  can be reported honestly today. GSE994/GSE123352/GSE307690/CANUCK are
+  bulk (see "Assay separation" above) and cannot be added to this run
+  without a genuinely implemented bulk training pipeline.
 - Wire the neural/MIL adapter into the same one-shot frozen-threshold final
   test evaluation path baselines already use (`benchmarks/runner.py::run_cancer_task`
   currently only does this for baseline models — a documented, not silent, gap)
@@ -2246,8 +2364,12 @@ the aggregate's source count.
 - Phase 3+ of the wider improvement plan (causal modelling, counterfactual
   generation, pathway-constrained learning, foundation-model integration) is
   explicitly out of scope for this benchmarking framework and not started
-- Add explicit bulk-vs-single-cell-vs-MIL experiment-mode separation and
-  species-provenance tracking (GSE288003's mouse→human ortholog mapping
-  still runs unconditionally with no recorded mapped/unmapped gene counts)
+- Bulk-vs-single-cell assay separation is now enforced by policy
+  (`data.assay_policy`, `src/data/assay_policy.py`) and species-provenance
+  is tracked (`src/data/species_policy.py`, mouse subjects namespaced) — a
+  real BULK training pipeline (`assay_policy=bulk_only`) and a genuine
+  multimodal architecture (`assay_policy=multimodal`) remain unimplemented;
+  requesting either currently raises a typed not-implemented error rather
+  than silently reusing the single-cell model/loss
 - Add MIL pooling baselines (mean/max pooling vs. the current gated
   attention) and attention-stability analysis under repeated cell subsampling

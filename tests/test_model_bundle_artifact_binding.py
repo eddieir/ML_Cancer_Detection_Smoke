@@ -35,7 +35,7 @@ def _artifact(n_genes=GENES, seed=0, n_subjects=6):
     n = len(subject_ids)
     X = rng.random((n, n_genes)).astype("float32")
     genes = [f"G{i}" for i in range(n_genes)]
-    obs = pd.DataFrame({"subject_id": subject_ids, "batch": ["b0"] * n}, index=[f"c{i}" for i in range(n)])
+    obs = pd.DataFrame({"subject_id": subject_ids, "batch": ["b0"] * n, "is_pseudo_bulk": [False] * n}, index=[f"c{i}" for i in range(n)])
     adata = ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=genes))
     return fit_preprocessing(adata, set(subject_ids), n_hvgs=n_genes)
 

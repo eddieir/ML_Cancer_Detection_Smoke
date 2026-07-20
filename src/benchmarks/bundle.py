@@ -84,7 +84,16 @@ def write_model_bundle(
     decision_threshold: Optional[float] = None,
     environment_snapshot: Optional[Dict] = None,
     extra: Optional[Dict] = None,
+    assay_policy: Optional[str] = None,
 ) -> Path:
+    """
+    assay_policy defaults to `artifact.assay_policy` when omitted — a
+    bundle's declared assay policy must agree with the preprocessing
+    artifact it references (see data/assay_policy.py, GitHub issue #13);
+    passing an explicit, DIFFERENT value than artifact.assay_policy raises,
+    since that would let a bundle claim a modality contract its own
+    artifact doesn't actually have.
+    """
     """
     Write bundle_dir/bundle_manifest.json (and bundle_dir/
     preprocessing_artifact.json, a copy of `artifact`'s own atomic save —
@@ -102,6 +111,14 @@ def write_model_bundle(
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"write_model_bundle: checkpoint not found at {checkpoint_path}")
+
+    resolved_assay_policy = assay_policy if assay_policy is not None else artifact.assay_policy
+    if assay_policy is not None and artifact.assay_policy is not None and assay_policy != artifact.assay_policy:
+        raise BundleValidationError(
+            f"write_model_bundle: assay_policy={assay_policy!r} does not match the "
+            f"preprocessing artifact's own assay_policy={artifact.assay_policy!r} — a bundle "
+            "must not claim a different assay policy than the artifact it references."
+        )
 
     artifact_path = bundle_dir / "preprocessing_artifact.json"
     artifact.save(artifact_path)
@@ -131,6 +148,7 @@ def write_model_bundle(
         "label_policy": label_policy,
         "species_policy": species_policy,
         "assay_mode": assay_mode,
+        "assay_policy": resolved_assay_policy,
         "dataset_manifest_fingerprint": dataset_manifest_fingerprint,
         "split_fingerprint": split_fingerprint,
         "calibration_state": calibration_state,
@@ -245,10 +263,43 @@ def load_and_validate_bundle(bundle_dir: Union[str, Path], allow_legacy: bool = 
             f"gene_count={art_info.get('gene_count')} — the gene panel was altered after this "
             "bundle was built."
         )
+    manifest_assay_policy = manifest.get("assay_policy")
+    if manifest_assay_policy is not None and artifact.assay_policy is not None \
+            and manifest_assay_policy != artifact.assay_policy:
+        raise BundleValidationError(
+            f"load_and_validate_bundle: bundle_manifest.json records assay_policy="
+            f"{manifest_assay_policy!r}, but its referenced preprocessing artifact has "
+            f"assay_policy={artifact.assay_policy!r} — the artifact was swapped after this "
+            "bundle was built, or the manifest was hand-edited."
+        )
 
     manifest["_artifact"] = artifact
     manifest["_bundle_dir"] = bundle_dir
     return manifest
+
+
+def validate_bundle_input_modality(manifest: Dict, is_pseudo_bulk) -> None:
+    """
+    Reject running inference through this bundle against input whose
+    row-level assay provenance doesn't match what the bundle declares it
+    accepts — checked BEFORE any model execution (see inference.py). A
+    bundle with no recorded assay_policy (pre-issue-13) cannot be checked
+    and is left to whatever legacy-checkpoint policy the caller already
+    applies elsewhere; this function only rejects a KNOWN mismatch.
+    """
+    from data.assay_policy import assert_rows_match_policy, parse_strict_bool_array
+
+    policy = manifest.get("assay_policy")
+    if policy is None:
+        return
+    arr = parse_strict_bool_array(is_pseudo_bulk)
+    try:
+        assert_rows_match_policy(arr, policy, context="bundle inference input")
+    except Exception as exc:  # AssayPolicyError (a ValueError subclass)
+        raise BundleValidationError(
+            f"validate_bundle_input_modality: input is not compatible with this bundle's "
+            f"assay_policy={policy!r}: {exc}"
+        ) from exc
 
 
 def validate_bundle_for_model(manifest: Dict, model) -> None:

@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
-from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
+from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN, DEFAULT_ASSAY_POLICY
 from data.label_mapping import EffectiveLabelMapping
 from data.sampling import (
     SubjectBalancedBatchSampler,
@@ -27,6 +27,14 @@ from model import MultiSmokeCancerNet, MultiTaskLoss
 
 
 # ─── Datasets ─────────────────────────────────────────────────────────────────
+
+class LegacyCellDatasetDirectoryError(ValueError):
+    """Raised by CellLevelDataset.from_dir() in real (non-diagnostic) mode
+    when the on-disk directory predates issue #13's assay-policy metadata
+    (missing cell_metadata.csv, or missing subject_id/source/is_pseudo_bulk
+    columns within it). Regenerate the dataset with the current pipeline —
+    there is no supported way to safely infer the missing provenance."""
+
 
 class CellLevelDataset(Dataset):
     """
@@ -47,6 +55,8 @@ class CellLevelDataset(Dataset):
         split_name:        Optional[str] = None,          # "train" | "val" | "test" | None
         dataset_source:    Optional[np.ndarray] = None,  # [N]  str, e.g. GEO accession per cell
         diagnostic_mode:   bool = False,
+        is_pseudo_bulk:    Optional[np.ndarray] = None,  # [N]  bool — row-level assay provenance (data/assay_policy.py)
+        assay_policy:      str = DEFAULT_ASSAY_POLICY,
     ):
         """
         subject_ids is required for any dataset used in real training/
@@ -56,6 +66,24 @@ class CellLevelDataset(Dataset):
         purely synthetic dataset (e.g. a smoke test with random data and no
         real subjects) — in that mode missing/"unknown" subject_ids are
         allowed and no disjointness guarantee is implied.
+
+        is_pseudo_bulk=None is accepted ONLY when diagnostic_mode=True (a
+        deliberately synthetic fixture), in which case it defaults to
+        all-False. For any real (diagnostic_mode=False, the default)
+        dataset, is_pseudo_bulk=None raises MissingAssayProvenanceError —
+        a missing/omitted provenance array is never assumed to mean "every
+        cell is real". Real callers built from real pipeline output (see
+        preprocess.py::run_pipeline_split_aware) always pass the real
+        per-row array, which is strictly parsed (see
+        data/assay_policy.py::parse_strict_bool_array — "False" as a
+        string is never silently treated as truthy) and then validated
+        against `assay_policy` — a pseudo-bulk row must never reach a
+        CellLevelDataset used for cell-level smoke/malignancy/attention
+        training. CellLevelDataset is single-cell training only: a real
+        (non-diagnostic) construction under assay_policy='bulk_only' or
+        'multimodal' raises (see require_trainable) rather than silently
+        accepting bulk rows into what the rest of this codebase treats as
+        a per-cell training array.
 
         smoke_known=None defaults to all-True — this is the legacy behaviour
         for every existing caller/source that has no verified/unknown
@@ -115,6 +143,35 @@ class CellLevelDataset(Dataset):
             if dataset_source is not None else np.full(n, "unknown", dtype=object)
         )
 
+        # Assay-policy provenance (see data/assay_policy.py, GitHub issue
+        # #13). Strictly parsed and required for every real (non-
+        # diagnostic_mode) dataset — see __init__'s docstring.
+        from data.assay_policy import (
+            assert_rows_match_policy, validate_assay_policy, parse_strict_bool_array,
+            require_trainable, MissingAssayProvenanceError,
+        )
+        validate_assay_policy(assay_policy)
+        self.assay_policy = assay_policy
+        if is_pseudo_bulk is None:
+            if not diagnostic_mode:
+                raise MissingAssayProvenanceError(
+                    "CellLevelDataset requires is_pseudo_bulk for real (non-diagnostic) "
+                    "construction — a missing array is never assumed to mean 'every cell "
+                    "is real'. Pass diagnostic_mode=True only for a deliberately synthetic "
+                    "fixture with no assay provenance."
+                )
+            self.is_pseudo_bulk = np.zeros(n, dtype=bool)
+        else:
+            self.is_pseudo_bulk = parse_strict_bool_array(is_pseudo_bulk, n_hint=n)
+        if not diagnostic_mode:
+            # CellLevelDataset backs cell-level SINGLE-CELL training only —
+            # a bulk_only/multimodal construction must never silently
+            # produce a "trainable-looking" object here.
+            require_trainable(assay_policy)
+            assert_rows_match_policy(
+                self.is_pseudo_bulk, assay_policy, context="CellLevelDataset construction",
+            )
+
     def __len__(self):  return len(self.X)
 
     def __getitem__(self, idx):
@@ -149,28 +206,105 @@ class CellLevelDataset(Dataset):
             subject_ids       = self.subject_ids[mask],
             dataset_source    = self.dataset_source[mask],
             diagnostic_mode   = self.diagnostic_mode,
+            is_pseudo_bulk    = self.is_pseudo_bulk[mask],
+            assay_policy      = self.assay_policy,
         )
 
     @classmethod
     def from_dir(
         cls, processed_dir: Union[str, Path], diagnostic_mode: bool = False,
     ) -> "CellLevelDataset":
-        """Load directly from the directory written by export_cell_dataset()."""
+        """
+        Load directly from the directory written by export_cell_dataset().
+
+        Real mode (diagnostic_mode=False, the default) REQUIRES
+        cell_metadata.csv to exist and to carry subject_id, source, and
+        is_pseudo_bulk columns — a legacy exported directory missing any of
+        these (e.g. exported before issue #13's assay-policy enforcement)
+        raises LegacyCellDatasetDirectoryError with an actionable message
+        rather than silently loading with relaxed assumptions.
+        diagnostic_mode=True keeps the old permissive behaviour for
+        deliberately synthetic on-disk fixtures.
+
+        If dataset_metadata.json (written by export_cell_dataset()) is
+        present, its recorded assay_policy/diagnostic_mode are cross-checked
+        against the row-level cell_metadata.csv provenance and against the
+        caller's own diagnostic_mode — a disagreement (e.g. a hand-edited
+        metadata file, or loading a diagnostic export as diagnostic_mode=
+        False) raises LegacyCellDatasetDirectoryError rather than silently
+        trusting one source over the other.
+        """
+        import json as _json
         import pandas as pd
+        from data.assay_policy import parse_strict_bool_array
+
         d = Path(processed_dir)
         dose_path = d / "exposure_dose.npy"
         malig_known_path = d / "malignancy_known.npy"
         smoke_known_path = d / "smoke_labels_known.npy"
         meta_path = d / "cell_metadata.csv"
+        dataset_meta_path = d / "dataset_metadata.json"
 
         subject_ids = None
         dataset_source = None
-        if meta_path.exists():
+        is_pseudo_bulk = None
+        resolved_assay_policy = DEFAULT_ASSAY_POLICY
+
+        dataset_meta = None
+        if dataset_meta_path.exists():
+            with open(dataset_meta_path) as f:
+                dataset_meta = _json.load(f)
+
+        if not diagnostic_mode:
+            if not meta_path.exists():
+                raise LegacyCellDatasetDirectoryError(
+                    f"CellLevelDataset.from_dir({d}): cell_metadata.csv is missing — real "
+                    "(non-diagnostic) loading requires the metadata file written by "
+                    "export_cell_dataset() (subject_id, source, is_pseudo_bulk columns). "
+                    "Regenerate this dataset with the current pipeline (preprocess.py), or "
+                    "pass diagnostic_mode=True only for a deliberately synthetic fixture."
+                )
+            meta = pd.read_csv(meta_path)
+            required_cols = ("subject_id", "source", "is_pseudo_bulk")
+            missing_cols = [c for c in required_cols if c not in meta.columns]
+            if missing_cols:
+                raise LegacyCellDatasetDirectoryError(
+                    f"CellLevelDataset.from_dir({d}): cell_metadata.csv is missing required "
+                    f"column(s) {missing_cols} — this looks like a legacy export that "
+                    "predates issue #13's assay-policy enforcement. Regenerate this dataset "
+                    "with the current pipeline (preprocess.py) rather than loading it with "
+                    "relaxed/defaulted assumptions."
+                )
+            subject_ids = meta["subject_id"].astype(str).values
+            dataset_source = meta["source"].astype(str).values
+            is_pseudo_bulk = parse_strict_bool_array(meta["is_pseudo_bulk"].values, n_hint=len(meta))
+
+            if dataset_meta is not None:
+                if dataset_meta.get("diagnostic_mode", False):
+                    raise LegacyCellDatasetDirectoryError(
+                        f"CellLevelDataset.from_dir({d}): dataset_metadata.json declares "
+                        "diagnostic_mode=True, but this call requested real (non-diagnostic) "
+                        "loading — a diagnostic export must not be loaded as a real dataset. "
+                        "Pass diagnostic_mode=True explicitly if this is intentional."
+                    )
+                meta_policy = dataset_meta.get("assay_policy")
+                row_bulk_present = bool(is_pseudo_bulk.any())
+                if meta_policy is not None and meta_policy == "single_cell_only" and row_bulk_present:
+                    raise LegacyCellDatasetDirectoryError(
+                        f"CellLevelDataset.from_dir({d}): dataset_metadata.json records "
+                        "assay_policy='single_cell_only' but cell_metadata.csv contains "
+                        "pseudo-bulk row(s) — row-level and dataset-level provenance disagree."
+                    )
+                if meta_policy is not None:
+                    resolved_assay_policy = meta_policy
+        elif meta_path.exists():
             meta = pd.read_csv(meta_path)
             if "subject_id" in meta.columns:
                 subject_ids = meta["subject_id"].astype(str).values
             if "source" in meta.columns:
                 dataset_source = meta["source"].astype(str).values
+            if "is_pseudo_bulk" in meta.columns:
+                is_pseudo_bulk = meta["is_pseudo_bulk"].astype(bool).values
 
         return cls(
             gene_matrix       = np.load(d / "gene_matrix.npy"),
@@ -183,6 +317,8 @@ class CellLevelDataset(Dataset):
             subject_ids       = subject_ids,
             dataset_source    = dataset_source,
             diagnostic_mode   = diagnostic_mode,
+            is_pseudo_bulk    = is_pseudo_bulk,
+            assay_policy      = resolved_assay_policy,
         )
 
     def smoke_class_weights(self, num_classes: int = N_SMOKE_CLASSES) -> torch.Tensor:
@@ -571,6 +707,12 @@ class Trainer:
         if isinstance(config, (str, Path)):
             with open(config) as f:
                 config = yaml.safe_load(f)
+        # Defense in depth: from_config has no ExperimentContext to lean on
+        # (see from_experiment_context / benchmarks/context.py's central
+        # check), so it resolves and enforces the configured assay_policy
+        # itself before a model/optimizer is ever touched.
+        from data.assay_policy import require_trainable as _require_assay_trainable
+        _require_assay_trainable((config.get("data", {}) or {}).get("assay_policy", DEFAULT_ASSAY_POLICY))
         return cls(model, config, device, seed=seed)
 
     @classmethod
@@ -595,6 +737,17 @@ class Trainer:
         config was written for a different HVG count than this context
         actually produced.
         """
+        artifact = getattr(context, "preprocessing_artifact", None)
+        if artifact is not None and getattr(artifact, "assay_policy", None) is not None:
+            # Defense in depth on top of benchmarks/context.py's own
+            # from_pipeline_result check — a hand-built context (e.g. a
+            # lightweight test double) that carries a real artifact must
+            # not be able to reach model construction under an
+            # unsupported policy just because it skipped
+            # ExperimentContext.from_pipeline_result's validation.
+            from data.assay_policy import require_trainable as _require_assay_trainable
+            _require_assay_trainable(artifact.assay_policy)
+
         model_cfg = dict(context.config.get("model", {}))
         configured_input_dim = model_cfg.get("input_dim")
         if configured_input_dim is not None and configured_input_dim != context.input_dim:
@@ -1580,6 +1733,7 @@ if __name__ == "__main__":
         cell_type_ids      = np.random.randint(0, N_CELL_TYPES, n_cells),
         exposure_dose      = dose,
         subject_ids        = cell_subject_ids,
+        diagnostic_mode     = True,  # demo/manual-run block — purely synthetic random data
     )
     train_cell_ds = full_cell_ds.subset_by_subjects(manifest.train_subjects)
     val_cell_ds   = full_cell_ds.subset_by_subjects(manifest.val_subjects)

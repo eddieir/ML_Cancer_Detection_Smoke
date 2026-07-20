@@ -71,12 +71,36 @@ MIL_SEARCH_SPACE = {"pretrain_epochs": [1, 2]}
 DEFAULT_INNER_FOLDS = 2
 
 
+def _require_context_trainable(context) -> None:
+    """
+    Shared enforcement point for every CV/OOF entry function in this module
+    — fail immediately, before touching any fold data or fitting anything,
+    if the context's preprocessing artifact was fit under an assay_policy
+    that cannot back real training (bulk_only/multimodal). Defense in depth
+    on top of benchmarks/context.py::_validate_context, which already
+    rejects this at ExperimentContext.from_pipeline_result time — kept here
+    too so a hand-built context that skipped that path (e.g. a lightweight
+    test double) still cannot reach model fitting.
+    """
+    artifact = getattr(context, "preprocessing_artifact", None)
+    policy = getattr(artifact, "assay_policy", None) if artifact is not None else None
+    if policy is not None:
+        from data.assay_policy import require_trainable
+        require_trainable(policy)
+
+
 def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelDataset:
     """Merge two CellLevelDatasets (e.g. an outer context's train + val
     splits) into one pool. Used by ood.py's per-source held-out evaluation
     and by tests; run_smoke_cv/run_cancer_cv build fold data straight from
     normalized_adata_for_refit instead (see fold_preprocessing.py) so they
     no longer need this for CV itself."""
+    if a.assay_policy != b.assay_policy:
+        from data.assay_policy import AssayPolicyError
+        raise AssayPolicyError(
+            f"concat_cell_datasets: refusing to merge two CellLevelDatasets fit under "
+            f"different assay_policy values ({a.assay_policy!r} vs {b.assay_policy!r})."
+        )
     return CellLevelDataset(
         gene_matrix       = np.concatenate([a.X.numpy(), b.X.numpy()]),
         smoke_labels      = np.concatenate([a.smoke.numpy(), b.smoke.numpy()]),
@@ -87,6 +111,8 @@ def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelD
         subject_ids       = np.concatenate([a.subject_ids, b.subject_ids]),
         dataset_source     = np.concatenate([a.dataset_source, b.dataset_source]),
         diagnostic_mode    = a.diagnostic_mode or b.diagnostic_mode,
+        is_pseudo_bulk     = np.concatenate([a.is_pseudo_bulk, b.is_pseudo_bulk]),
+        assay_policy       = a.assay_policy,
     )
 
 
@@ -270,6 +296,7 @@ def run_smoke_cv(
     fold_s{seed}_f{fold_idx}/ (see fold_preprocessing.py::save_fold_artifact)
     — None (default) preserves the prior in-memory-only behavior exactly.
     """
+    _require_context_trainable(context)
     normalized_adata = require_normalized_adata(context)
     num_classes = context.num_smoke_classes
     num_cell_types = context.config.get("model", {}).get("num_cell_types", 4)
@@ -440,6 +467,7 @@ def run_cancer_cv(
 ) -> Dict:
     """artifact_output_root — see run_smoke_cv's docstring; same optional,
     backward-compatible per-fold persistence behavior for Task B."""
+    _require_context_trainable(context)
     normalized_adata = require_normalized_adata(context)
     all_bags = list(context.train_bags) + list(context.val_bags)
     outcomes_by_subject = {str(b["subject_id"]): b["cancer_label"] for b in all_bags if b.get("cancer_label_known")}
