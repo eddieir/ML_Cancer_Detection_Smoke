@@ -2330,6 +2330,92 @@ the aggregate's source count.
   `runner.py` persists ablation output through this writer instead of the
   generic `write_json`.
 
+## Phase 7 — real-world evidence and clinical-readiness framework
+
+Phases 1-6 established leakage-safe splitting, imbalance handling, label
+semantics, reproducible preprocessing artifacts, pathway-hierarchical MIL,
+and domain-robustness evaluation — all validated against synthetic
+fixtures and, where noted above, one training-set real-data run. Phase 7
+adds a separate framework (`src/evidence/`) for stating, precisely, what
+would count as real-world clinical evidence, and for refusing to report
+evidence that does not exist.
+
+**What this phase adds:**
+- `src/evidence/evidence_contract.py` — a versioned evidence-report schema
+  with seven evidence levels (`synthetic_software_validation` through
+  `regulatory_evidence`), 29 required identity fields per report, and a
+  structured `not_evaluable(...)` object that is the only sanctioned way
+  to represent missing evidence (never `0`, `False`, an empty metric dict,
+  or a "successful" result with a caveat attached).
+- `configs/cohorts.yaml` / `src/evidence/cohort_registry.py` — a canonical
+  registry of every cohort this repository knows about (GSE136831,
+  GSE288003, GSE123352, GSE307690/CANUCK, TCGA-LUAD/LUSC, NLST), recording
+  per-cohort what it can and cannot support: GSE136831's COPD field is a
+  weak exposure proxy, not a verified smoke label; GSE288003 is mouse and
+  stays species-separated; the bulk/pseudo-bulk cohorts (GSE123352,
+  GSE307690, TCGA-LUAD/LUSC) cannot enter single-cell MIL without a bulk
+  pipeline this repository does not have; NLST is controlled-access and
+  unavailable without an authorized local dataset. The registry is
+  cross-checked against `configs/datasets.yaml` for contradictions.
+- `src/evidence/eligibility.py` — deterministic eligibility gates (Step 6)
+  that classify every (task, cohort) pair as impossible, exploratory-only,
+  or eligible for internal/external evaluation, from real on-disk counts
+  only.
+- `src/evidence/audit.py` — a **read-only** audit CLI:
+  ```
+  PYTHONPATH=src python -m evidence.audit \
+      --config configs/default.yaml --cohort-config configs/cohorts.yaml \
+      --output artifacts/evidence/data_audit.json
+  ```
+  It never trains, fits preprocessing, or downloads anything; it reports
+  which datasets have local files, which cohorts are controlled-access and
+  unauthorized, and a per-task eligibility table.
+- `src/evidence/clinical_readiness.py` + `configs/clinical_readiness.yaml`
+  + `docs/CLINICAL_READINESS.md` — a 22-dimension staged clinical-readiness
+  assessment. `assess_clinical_readiness()` can only report
+  `clinically_not_ready` unless every mandatory dimension is independently
+  `complete` with a real evidence reference, and `guard_clinical_claim()`
+  additionally requires a signed external-evidence manifest before any
+  code path may emit a clinical-readiness claim.
+
+**Current audited data availability in this environment (run 2026-07):**
+running the audit CLI above against this repository, with no datasets
+downloaded, reports `overall_status: "blocked_no_real_data"` — every
+cohort's `local_files_present` is `false`, NLST's controlled-access
+authorization check is `false` (no `NLST_DATA_ROOT`), and every
+(task, cohort) row in the eligibility table is `IMPOSSIBLE`, never a
+fabricated eligible/ineligible count. This is the expected result in an
+environment where no multi-gigabyte GEO/TCGA download and no NLST DUA have
+been obtained — the audit's job is to report that honestly, not to
+manufacture a result around it.
+
+**Evidence status, stated plainly:**
+- **Real held-out smoke performance: not established.** The 77.2%/0.27
+  table above is a training-set number from before subject-level
+  splitting existed; it is historical and is not being reinterpreted as
+  held-out evidence.
+- **Real cancer-prediction performance: not established.** No cohort in
+  this repository currently has both compatible single-cell expression
+  input and a genuinely linked subject-level cancer outcome.
+- **External validation: not performed.** No eligible external cohort has
+  been identified (GSE288003 is mouse; the bulk cohorts and TCGA cannot
+  enter the single-cell pipeline without a bulk-pipeline the repository
+  does not have; NLST is inaccessible without a DUA).
+- **Clinical readiness: not established.** See `docs/CLINICAL_READINESS.md`
+  — every mandatory dimension is `not_started` or `blocked`, so
+  `overall_status` is `clinically_not_ready`.
+
+**What Phase 7 does not yet do:** run the three evaluation tracks
+(Track A smoke classification / Track B malignancy classification /
+Track C subject-level cancer prediction) end to end against real data,
+because no real data satisfying the eligibility gates is available in
+this environment; wire a leakage-safe real-data run through
+`src/benchmarks/runner.py`'s existing candidate-comparison/frozen-test
+machinery; or produce the full `artifacts/evidence/<run_id>/` bundle
+structure. `src/evidence/` is infrastructure and honest-blocker reporting,
+not a claim that real evidence has been generated — see
+`docs/EVIDENCE_PROTOCOL.md` for exactly which steps remain and why.
+
 ## Next steps
 
 - Run `python -m benchmarks.runner` against the real single-cell data

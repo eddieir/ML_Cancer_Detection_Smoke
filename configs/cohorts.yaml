@@ -1,0 +1,249 @@
+# configs/cohorts.yaml — Phase 7 canonical cohort and endpoint registry.
+#
+# Extends configs/datasets.yaml (which records raw provenance/checksum
+# facts) with the Phase 7 evidence-eligibility facts: which tasks a cohort
+# can support, in which role, and the specific known constraints that must
+# never be silently bypassed. src/evidence/cohort_registry.py loads and
+# validates this file, and cross-checks it against configs/datasets.yaml
+# for accession/species contradictions.
+#
+# task_support values: "yes" | "no" | "not_currently" (adapter/pipeline
+# support does not exist yet in this repository, independent of whether
+# the data itself could in principle support it).
+
+cohorts:
+  - cohort_id: gse136831
+    accession: GSE136831
+    dataset_id: gse136831            # cross-reference into configs/datasets.yaml
+    version_or_retrieval_date: "GEO series, not re-fetched in this environment"
+    access_level: public
+    species: human
+    assay_type: single_cell_rna_seq
+    single_cell_or_bulk: single_cell
+    biological_tissue: lung
+    subject_identifier_field: Subject_Identity
+    sample_identifier_field: Sample_Identity
+    cell_identifier_field: CellBarcode_Identity
+    verified_smoke_label_fields: []
+    weak_smoke_label_fields: [Disease_Identity]
+    malignancy_label_fields: []
+    cancer_outcome_fields: []
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Vanderbilt/Habermann interstitial lung disease atlas (COPD/IPF/Control) — real per-donor cells/subject IDs, but no verified per-subject cigarette-exposure field."
+      - "Disease_Identity=COPD is a weak exposure proxy only (smoke_label_method=weak_proxy, confidence=low) — never used as a verified cigarette label."
+      - "Cannot independently provide verified cancer outcomes."
+    licensing_access_limitations: "Public GEO series, no DUA required."
+    checksum_rule: "sha256 of each raw_file_names entry under raw_subdir, per src/data/manifest.py."
+    task_support:
+      smoke_classification: not_currently   # unknown labels excluded from supervised smoke metrics by default; weak-label experiment is a separate, explicitly enabled, separately reported path
+      malignancy_classification: "no"
+      subject_level_cancer_prediction: "no"
+      external_validation: "no"
+    role_eligibility: [development]
+    notes:
+      - "Unknown smoke labels are excluded from supervised smoke metrics unless an explicitly enabled weak-label experiment is run, and that experiment's results are reported separately and never merged with primary verified-label results."
+
+  - cohort_id: gse288003
+    accession: GSE288003
+    dataset_id: gse288003
+    version_or_retrieval_date: "GEO series, not re-fetched in this environment"
+    access_level: public
+    species: mouse
+    assay_type: single_cell_rna_seq
+    single_cell_or_bulk: single_cell
+    biological_tissue: lung
+    subject_identifier_field: donor_id
+    sample_identifier_field: GSM_id
+    cell_identifier_field: barcode
+    verified_smoke_label_fields: [condition]
+    weak_smoke_label_fields: []
+    malignancy_label_fields: []
+    cancer_outcome_fields: []
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Mouse data — must remain species-separated per src/data/species_policy.py; default experiment_mode=human_only excludes it entirely."
+      - "Ortholog mapping to human gene symbols uses the existing versioned artifact (src/data/ortholog.py) and is lossy (unmapped/ambiguous genes dropped)."
+      - "Is not human external validation under any circumstance; cannot be silently pooled into human evidence."
+    licensing_access_limitations: "Public GEO series, no DUA required."
+    checksum_rule: "sha256 of per-GSM 10x triples extracted from *_RAW.tar; see src/data/downloaders.py::_extract_tar."
+    task_support:
+      smoke_classification: not_currently   # mouse-only; would require an explicit cross-species domain-adaptation experiment, reported separately
+      malignancy_classification: "no"
+      subject_level_cancer_prediction: "no"
+      external_validation: "no"
+    role_eligibility: [excluded]
+    notes:
+      - "Any domain-adaptation result using this cohort must be reported separately and never described as human external validation."
+
+  - cohort_id: gse123352
+    accession: GSE123352
+    dataset_id: gse123352
+    version_or_retrieval_date: "GEO series, not re-fetched in this environment"
+    access_level: public
+    species: human
+    assay_type: bulk_microarray
+    single_cell_or_bulk: bulk
+    biological_tissue: airway_epithelium
+    subject_identifier_field: sample_id
+    sample_identifier_field: sample_id
+    cell_identifier_field: null
+    verified_smoke_label_fields: [ever_never_smoker]
+    weak_smoke_label_fields: []
+    malignancy_label_fields: []
+    cancer_outcome_fields: []
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Bulk/pseudo-bulk microarray — must not enter single-cell MIL."
+      - "No genuinely supported bulk pipeline currently exists in this repository; evaluable only under one, which does not currently exist."
+    licensing_access_limitations: "Public GEO series, no DUA required."
+    checksum_rule: "sha256 of series-matrix + platform-annotation files under raw_subdir."
+    task_support:
+      smoke_classification: not_currently
+      malignancy_classification: "no"
+      subject_level_cancer_prediction: "no"
+      external_validation: "no"
+    role_eligibility: [excluded]
+    notes:
+      - "Recorded as unavailable for Phase 7 single-cell MIL evidence; historical mixed-assay results involving this cohort are not resurrected."
+
+  - cohort_id: gse307690_canuck
+    accession: GSE307690
+    dataset_id: gse307690_canuck
+    version_or_retrieval_date: "GEO series, not re-fetched in this environment"
+    access_level: public
+    species: human
+    assay_type: bulk_microarray_or_rnaseq
+    single_cell_or_bulk: bulk
+    biological_tissue: airway_epithelium
+    subject_identifier_field: sample_id
+    sample_identifier_field: sample_id
+    cell_identifier_field: null
+    verified_smoke_label_fields: [cannabis_never_smoker]
+    weak_smoke_label_fields: []
+    malignancy_label_fields: []
+    cancer_outcome_fields: []
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Bulk/pseudo-bulk — must not enter single-cell MIL."
+      - "No genuinely supported bulk pipeline currently exists in this repository."
+    licensing_access_limitations: "Public GEO series, no DUA required."
+    checksum_rule: "sha256 of series-matrix + processed-data files under raw_subdir."
+    task_support:
+      smoke_classification: not_currently
+      malignancy_classification: "no"
+      subject_level_cancer_prediction: "no"
+      external_validation: "no"
+    role_eligibility: [excluded]
+    notes:
+      - "Recorded as unavailable for Phase 7 single-cell MIL evidence; historical mixed-assay results involving this cohort are not resurrected."
+
+  - cohort_id: tcga_luad
+    accession: TCGA-LUAD
+    dataset_id: tcga_luad
+    version_or_retrieval_date: "GDC open API, not re-fetched in this environment"
+    access_level: public
+    species: human
+    assay_type: bulk_rna_seq
+    single_cell_or_bulk: bulk
+    biological_tissue: lung
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    verified_smoke_label_fields: []
+    weak_smoke_label_fields: []
+    malignancy_label_fields: [sample_type]
+    cancer_outcome_fields: [sample_type, primary_diagnosis]
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Bulk RNA-seq — tumour/normal status (sample_type) may support a bulk malignancy task only, never single-cell per-cell malignancy labels."
+      - "Does not provide verified smoke type by default; smoke_type is never defaulted to cigarette for TCGA samples."
+      - "Cannot validate the single-cell MIL model without a scientifically defined cross-assay model; none exists in this repository, so cross-assay validation must return not_evaluable rather than implicitly adapting the single-cell model."
+    licensing_access_limitations: "Public open GDC access, no DUA required."
+    checksum_rule: "sha256 of per-case HTSeq/STAR count files; see src/data/downloaders.py::download_tcga."
+    task_support:
+      smoke_classification: "no"
+      malignancy_classification: not_currently   # would require a genuinely supported bulk pipeline, which does not currently exist
+      subject_level_cancer_prediction: "no"
+      external_validation: "no"
+    role_eligibility: [excluded]
+    notes:
+      - "Never treated as single-cell data; never enters per-cell malignancy training."
+
+  - cohort_id: tcga_lusc
+    accession: TCGA-LUSC
+    dataset_id: tcga_lusc
+    version_or_retrieval_date: "GDC open API, not re-fetched in this environment"
+    access_level: public
+    species: human
+    assay_type: bulk_rna_seq
+    single_cell_or_bulk: bulk
+    biological_tissue: lung
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    verified_smoke_label_fields: []
+    weak_smoke_label_fields: []
+    malignancy_label_fields: [sample_type]
+    cancer_outcome_fields: [sample_type, primary_diagnosis]
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Same TCGA bulk/smoking/single-cell limitations as tcga_luad."
+    licensing_access_limitations: "Public open GDC access, no DUA required."
+    checksum_rule: "sha256 of per-case HTSeq/STAR count files; see src/data/downloaders.py::download_tcga."
+    task_support:
+      smoke_classification: "no"
+      malignancy_classification: not_currently
+      subject_level_cancer_prediction: "no"
+      external_validation: "no"
+    role_eligibility: [excluded]
+    notes:
+      - "Never treated as single-cell data; never enters per-cell malignancy training."
+
+  - cohort_id: nlst
+    accession: NLST
+    dataset_id: nlst
+    version_or_retrieval_date: "controlled-access, not retrieved in this environment"
+    access_level: controlled
+    species: human
+    assay_type: clinical_tabular
+    single_cell_or_bulk: not_applicable
+    biological_tissue: not_applicable
+    subject_identifier_field: pid
+    sample_identifier_field: null
+    cell_identifier_field: null
+    verified_smoke_label_fields: [CIGSMOK, CIGAR]
+    weak_smoke_label_fields: []
+    malignancy_label_fields: []
+    cancer_outcome_fields: [candx]
+    outcome_time_horizon: null   # not established without the actual DUA-governed dataset and its documented follow-up schedule
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: false
+    source_limitations:
+      - "Controlled access — requires an approved NCI Data Use Agreement (checked via NLST_DATA_ROOT env var, see src/data/nlst_adapter.py::check_nlst_availability). Not accessed in this environment."
+      - "Missing diagnosis/outcome (candx) stays unknown — never converted to a negative outcome."
+      - "Smoke-history fields (CIGSMOK/CIGAR) alone do not provide expression input — NLST is clinical/tabular, not single-cell/bulk expression data."
+      - "Subject-level cancer prediction with this cohort requires a genuine linkage between eligible expression data and NLST outcomes; no such linkage exists in this repository and none is fabricated."
+      - "No participant-level NLST data is committed to this repository under any circumstance."
+    licensing_access_limitations: "Controlled access, DUA required; see src/data/downloaders.py::print_nlst_instructions."
+    checksum_rule: "sha256 of screen.csv/prsn.csv only if NLST_DATA_ROOT points at an authorized local copy; never computed or committed otherwise."
+    task_support:
+      smoke_classification: "no"          # no expression input at all
+      malignancy_classification: "no"
+      subject_level_cancer_prediction: not_currently   # blocked on authorized access + genuine expression/outcome linkage, neither of which exists here
+      external_validation: "no"
+    role_eligibility: [excluded]
+    notes:
+      - "If linkage is absent (the expected case without an authorized local dataset), state that explicitly rather than fabricating it."

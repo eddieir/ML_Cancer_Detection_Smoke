@@ -1,0 +1,103 @@
+# configs/evidence.yaml — Phase 7 evidence-contract policy.
+#
+# Human-readable mirror of the constants enforced in code by
+# src/evidence/evidence_contract.py. This file documents intent and is
+# checked for drift against the code constants by
+# tests/test_evidence_contract.py — it is not itself parsed at runtime by
+# the contract module (the code is the single source of enforcement); it
+# exists so the policy can be reviewed without reading Python.
+
+schema_version: "1"
+
+evidence_levels:
+  - name: synthetic_software_validation
+    description: >
+      Runs entirely on synthetic fixtures generated for CI/software
+      testing. Proves the pipeline executes correctly end to end. Carries
+      no claim whatsoever about real-world performance.
+  - name: development_only_real_data
+    description: >
+      Real public data, but evaluated only on development
+      (train/validation) subjects — exploratory, used for candidate
+      selection and hyperparameter search. Never a substitute for held-out
+      evidence.
+  - name: internal_held_out_real_data
+    description: >
+      Real data, evaluated once against a frozen test split drawn from the
+      same cohort(s) as development, after the frozen-test guard was
+      acquired. Still not external validation.
+  - name: external_retrospective_validation
+    description: >
+      Real data from a cohort that contributed nothing to training,
+      preprocessing, hyperparameter selection, calibration, threshold
+      selection, or feature/module selection, and shares no subjects with
+      development data.
+  - name: prospective_validation
+    description: >
+      Evaluation against subjects/outcomes collected after the model was
+      frozen, in a prospective (not retrospective-cohort) design. Not
+      implemented by this repository at this time.
+  - name: clinical_utility_validation
+    description: >
+      Evidence that using the model changes clinical decisions or outcomes
+      (e.g. a randomized or quasi-experimental comparison). Not implemented
+      by this repository at this time.
+  - name: regulatory_evidence
+    description: >
+      Evidence assembled and reviewed to a standard suitable for a
+      regulatory submission. Out of scope for this repository; requires
+      expert legal/regulatory review outside of it.
+
+required_identity_fields:
+  - task
+  - endpoint
+  - endpoint_definition
+  - prediction_unit
+  - biological_specimen_type
+  - assay_modality
+  - dataset_accession
+  - cohort_role
+  - species
+  - sample_count
+  - unique_subject_count
+  - class_counts
+  - verified_label_count
+  - unknown_label_count
+  - excluded_subject_count
+  - split_role
+  - split_manifest_fingerprint
+  - dataset_manifest_fingerprint
+  - preprocessing_artifact_fingerprint
+  - model_fingerprint
+  - random_seed
+  - code_commit_sha
+  - environment_fingerprint
+  - synthetic_flag
+  - development_only_flag
+  - frozen_test_access_status
+  - evidence_level
+  - limitations
+  - evaluation_timestamp
+  - report_schema_version
+
+optional_identity_fields:
+  - gene_list_fingerprint
+  - calibration_fingerprint
+  - threshold_fingerprint
+
+not_evaluable_required_keys:
+  - status
+  - reason_code
+  - reason
+  - required_next_action
+
+cohort_roles:
+  - development
+  - internal_test
+  - external_validation
+  - excluded
+
+notes:
+  - "not_evaluable is the only sanctioned representation of missing evidence — never 0, false, an empty metric dict, NaN without explanation, or a warning attached to a fabricated result."
+  - "development_only_flag=true reports can never claim internal_held_out_real_data or stronger."
+  - "external_* evidence levels require cohort_role=external_validation; an internal held-out split is never external validation."
