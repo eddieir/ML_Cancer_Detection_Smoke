@@ -84,6 +84,14 @@ _FINGERPRINT_FIELDS = (
     "cell_type_annotation_compatibility", "missing_gene_policy",
     "duplicate_gene_policy", "unexpected_gene_policy", "minimum_gene_coverage",
     "batch_correction_status",
+    # Assay-policy provenance (see data/assay_policy.py, GitHub issue #13)
+    # — changing the experiment-level assay policy, or fitting against a
+    # different observed mix of assay modes, is a scientific-identity
+    # change and must change this artifact's fingerprint exactly like a
+    # different gene panel or label mapping would.
+    "assay_policy", "assay_policy_version", "observed_assay_modes",
+    "pseudo_bulk_rows_present_at_fit", "training_data_modality",
+    "allowed_inference_modality",
 )
 
 _VALID_BATCH_CORRECTION_STATUSES = frozenset({"disabled", "transductive_diagnostic_only"})
@@ -174,6 +182,37 @@ class PreprocessingArtifact:
     # (data/transforms.py) refuses to let a run in this state reach
     # CV/OOF/final-dev-pool/frozen-test evaluation.
     batch_correction_status:    str = "disabled"
+    # ── Assay-policy provenance (see data/assay_policy.py) ──────────────
+    # assay_policy is None ONLY for artifacts fit before issue #13's
+    # assay-policy enforcement existed — never a claim that such an
+    # artifact is single_cell_only-safe. assert_real_assay_provenance()
+    # below refuses a None value for any real (non-synthetic)
+    # ExperimentContext/bundle, exactly like cell_type_annotation_degraded
+    # being unset is refused rather than treated as "not degraded".
+    assay_policy:                Optional[str] = None
+    # Bumped when the MEANING of assay_policy enforcement changes — see
+    # constants.ASSAY_POLICY_VERSION. An artifact whose assay_policy_version
+    # doesn't match the code's current version is not automatically unsafe,
+    # but is flagged for review rather than silently trusted.
+    assay_policy_version:        Optional[str] = None
+    # Every distinct obs["assay_mode"] value actually observed among the
+    # cells this artifact was fit on — informational provenance, never
+    # itself the enforcement mechanism (is_pseudo_bulk is).
+    observed_assay_modes:        List[str] = field(default_factory=list)
+    # Whether any is_pseudo_bulk=True row was present among the cells this
+    # artifact was fit on. False for every real single_cell_only artifact;
+    # True only for a bulk_only artifact's fit population.
+    pseudo_bulk_rows_present_at_fit: Optional[bool] = None
+    # "single_cell" | "bulk" — the modality this artifact's fit population
+    # actually was. Mirrors assay_policy today (single_cell_only ->
+    # "single_cell", bulk_only -> "bulk") but recorded explicitly so a
+    # future artifact (e.g. a genuine multimodal one) is not forced to
+    # overload assay_policy's own vocabulary to describe its training data.
+    training_data_modality:      Optional[str] = None
+    # The ONLY input modality apply_preprocessing()/inference may feed this
+    # artifact — checked by assert_assay_compatible() below before any
+    # AnnData input is transformed.
+    allowed_inference_modality:  Optional[str] = None
     # Wall-clock creation time (time.time()) — informational only, excluded
     # from scientific_fingerprint() (see _FINGERPRINT_FIELDS above). None
     # for artifacts fit before this field existed.
@@ -327,6 +366,7 @@ def fit_preprocessing(
     unexpected_gene_policy: str = DEFAULT_UNEXPECTED_GENE_POLICY,
     minimum_gene_coverage:  float = DEFAULT_MINIMUM_GENE_COVERAGE,
     batch_correction_status: str = "disabled",
+    assay_policy:            Optional[str] = None,
 ) -> PreprocessingArtifact:
     """
     Fit gene mean/std scaling + smoke-aware HVG selection using ONLY cells
@@ -342,7 +382,10 @@ def fit_preprocessing(
     DEFAULT_* module constants and configs/default.yaml's preprocessing.*
     keys, which must agree with these defaults.
     """
-    from constants import ALL_SMOKE_MARKERS
+    from constants import ALL_SMOKE_MARKERS, DEFAULT_ASSAY_POLICY, ASSAY_POLICY_VERSION
+    from data.assay_policy import assert_rows_match_policy, validate_assay_policy
+
+    resolved_assay_policy = validate_assay_policy(assay_policy or DEFAULT_ASSAY_POLICY)
 
     train_mask = adata.obs[subject_col].astype(str).isin(
         {str(s) for s in train_subject_ids}
@@ -351,6 +394,26 @@ def fit_preprocessing(
         raise ValueError("fit_preprocessing: no cells matched train_subject_ids")
 
     train_adata = adata[train_mask].copy()
+
+    # Assay-policy gate on the exact cells about to be fit — mixed rows
+    # must never influence the scaling statistics or HVG selection, even if
+    # every upstream gate (source loading, merge_sources) was somehow
+    # bypassed (e.g. a caller building `adata` by hand for a test). Missing
+    # obs["is_pseudo_bulk"] defaults to all-real-cells (legacy fixtures) —
+    # see data/assembly.py::merge_sources's docstring for the same pattern.
+    is_bulk_train = (
+        train_adata.obs["is_pseudo_bulk"].values if "is_pseudo_bulk" in train_adata.obs.columns
+        else np.zeros(train_adata.n_obs, dtype=bool)
+    )
+    assert_rows_match_policy(
+        is_bulk_train, resolved_assay_policy, context="fit_preprocessing (train partition)",
+    )
+    observed_modes = (
+        sorted(set(train_adata.obs["assay_mode"].astype(str)))
+        if "assay_mode" in train_adata.obs.columns else []
+    )
+    pseudo_bulk_present = bool(is_bulk_train.any())
+    training_modality = "bulk" if resolved_assay_policy == "bulk_only" else "single_cell"
 
     X = train_adata.X
     if hasattr(X, "toarray"):
@@ -416,6 +479,12 @@ def fit_preprocessing(
         unexpected_gene_policy=unexpected_gene_policy,
         minimum_gene_coverage=minimum_gene_coverage,
         batch_correction_status=batch_correction_status,
+        assay_policy=resolved_assay_policy,
+        assay_policy_version=ASSAY_POLICY_VERSION,
+        observed_assay_modes=observed_modes,
+        pseudo_bulk_rows_present_at_fit=pseudo_bulk_present,
+        training_data_modality=training_modality,
+        allowed_inference_modality=training_modality,
         notes=[
             "Batch correction (Harmony) is NOT part of this artifact: Harmony has "
             "no native train-only-fit / apply-to-new-data transform, so it cannot "
@@ -441,6 +510,7 @@ def apply_preprocessing(adata: ad.AnnData, artifact: PreprocessingArtifact) -> a
     on validation data before/after calling it on test data (or vice
     versa) never changes either result.
     """
+    assert_assay_compatible(artifact, adata)
     diagnostics = verify_compatible(artifact, adata.var_names)
 
     if diagnostics["missing"]:
@@ -637,6 +707,75 @@ def validate_cell_type_provenance(artifact: "PreprocessingArtifact") -> None:
             f"cell_type_annotation_mode='pseudo_bulk_no_cell_type_identity' (no per-cell "
             f"mapping was ever applied), got {fp!r}."
         )
+
+
+def assert_real_assay_provenance(artifact: "PreprocessingArtifact") -> None:
+    """
+    Strict, fail-closed validation of a PreprocessingArtifact's assay-policy
+    provenance for a REAL (non-synthetic) ExperimentContext/bundle — the
+    assay-policy counterpart of validate_cell_type_provenance() above. A
+    MISSING assay_policy is never treated as "single_cell_only and safe":
+    it means this artifact predates issue #13's enforcement (a legacy
+    artifact fit under the old, unenforced mixed-pseudo-bulk pipeline, or
+    from the former mixed policy) and must be rejected, not silently
+    trusted or defaulted.
+    """
+    from constants import VALID_ASSAY_POLICIES
+
+    if artifact.assay_policy not in VALID_ASSAY_POLICIES:
+        raise CellTypeProvenanceError(
+            f"PreprocessingArtifact.assay_policy={artifact.assay_policy!r} is not one of "
+            f"{sorted(VALID_ASSAY_POLICIES)} — missing/None means this artifact predates "
+            "assay-policy enforcement (or was fit under the former mixed single-cell/"
+            "pseudo-bulk pipeline) and is refused for a real run rather than assumed safe. "
+            "Regenerate it with the current pipeline."
+        )
+    if not artifact.assay_policy_version:
+        raise CellTypeProvenanceError(
+            "PreprocessingArtifact.assay_policy_version is missing — an artifact with an "
+            "assay_policy but no recorded enforcement version predates full issue #13 "
+            "provenance tracking and is refused for a real run."
+        )
+    if artifact.pseudo_bulk_rows_present_at_fit is None or artifact.training_data_modality is None:
+        raise CellTypeProvenanceError(
+            "PreprocessingArtifact is missing pseudo_bulk_rows_present_at_fit/"
+            "training_data_modality — incomplete assay provenance is refused for a real run."
+        )
+    if artifact.assay_policy == "single_cell_only" and artifact.pseudo_bulk_rows_present_at_fit:
+        raise CellTypeProvenanceError(
+            "PreprocessingArtifact.assay_policy='single_cell_only' but "
+            "pseudo_bulk_rows_present_at_fit=True — internally contradictory assay "
+            "provenance; this artifact must not be trusted."
+        )
+
+
+def assert_assay_compatible(artifact: "PreprocessingArtifact", adata: ad.AnnData) -> None:
+    """
+    Reject transforming an AnnData whose row-level assay provenance doesn't
+    match what `artifact` was fit for — a bulk-only artifact applied to
+    single-cell input, or vice versa, produces numerically valid but
+    scientifically meaningless output (the wrong scaling statistics/HVG
+    panel for that modality) without this check. Called by
+    apply_preprocessing() whenever `adata` carries an is_pseudo_bulk column
+    (raw-array callers with no obs — see verify_input_matrix — have no
+    provenance to check and are unaffected).
+    """
+    from data.assay_policy import assert_rows_match_policy
+
+    if "is_pseudo_bulk" not in adata.obs.columns:
+        return
+    policy = artifact.assay_policy
+    if policy is None:
+        # Legacy artifact — assert_real_assay_provenance() is responsible
+        # for rejecting it for any real context; a raw apply_preprocessing()
+        # call (e.g. from a diagnostic script) is not blocked here on that
+        # basis alone, but cannot meaningfully be checked against a policy
+        # that was never recorded.
+        return
+    assert_rows_match_policy(
+        adata.obs["is_pseudo_bulk"].values, policy,
+        context=f"apply_preprocessing (artifact assay_policy={policy!r})",
+    )
 
 
 def verify_input_matrix(artifact: PreprocessingArtifact, gene_order: List[str]) -> None:

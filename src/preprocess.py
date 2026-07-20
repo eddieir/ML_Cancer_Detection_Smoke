@@ -18,7 +18,15 @@ from data.transforms import (
 )
 from data.labellers  import transfer_nlst_labels, add_malignancy_labels, compute_smoke_class_weights, apply_weak_smoke_proxies
 from data.assembly   import merge_sources, assemble_subject_bags, export_cell_dataset
-from constants       import N_HVGS_DEFAULT
+from data.assay_policy import (
+    AssayPolicyError,
+    BulkTrainingNotImplementedError,
+    MultimodalTrainingNotImplementedError,
+    assert_rows_match_policy,
+    require_trainable as require_assay_trainable,
+    validate_assay_policy,
+)
+from constants       import N_HVGS_DEFAULT, DEFAULT_ASSAY_POLICY
 
 
 def load_config(config: Union[dict, str, Path]) -> dict:
@@ -42,12 +50,25 @@ def _load_all_sources(cfg: dict) -> list:
     present in configs/default.yaml. Loading it requires explicitly setting
     experiment_mode to "mouse_only", "cross_species_pretraining", or
     "cross_species_domain_adaptation".
+
+    data.assay_policy (default "single_cell_only" — see constants.py,
+    data/assay_policy.py) is the ROW-LEVEL gate for every source loaded
+    here: every AnnData returned by load_scrna/load_microarray is checked
+    against obs["is_pseudo_bulk"] before it is ever appended to `adatas`.
+    This is deliberately NOT a check against assay_mode or a source/
+    accession name — see data/assay_policy.py's module docstring for why a
+    name-based check (the pre-issue-13 behavior) let GSE994/GSE123352/
+    GSE307690 through even though assay_mode='bulk_tcga' rejection was in
+    place. A config that lists a pseudo-bulk CSV under scrna_sources/
+    microarray_sources under the default single_cell_only policy is
+    rejected here regardless of what the file is named.
     """
     from constants import EXPERIMENT_MODE_HUMAN_ONLY
     from data.species_policy import species_allowed, validate_experiment_mode
     from constants import SPECIES_HUMAN, SPECIES_MOUSE
 
     experiment_mode = validate_experiment_mode(cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY))
+    assay_policy = validate_assay_policy(cfg.get("assay_policy", DEFAULT_ASSAY_POLICY))
     adatas = []
 
     def _exists(path: str) -> bool:
@@ -56,22 +77,41 @@ def _load_all_sources(cfg: dict) -> list:
             print(f"[preprocess] skip  {path}  (not found — run downloaders.py / converters.py)")
         return ok
 
-    def _reject_bulk_tcga(a, path: str):
+    def _enforce_assay_policy(a, path: str):
         """
-        Defensive enforcement of the human_single_cell/bulk_tcga boundary
-        (see data/assay_mode.py): even if a config manually lists a
-        bulk_tcga source under scrna_sources/microarray_sources (the
-        sanctioned path is data.tcga.bulk_sources + load_tcga_bulk_dataset
-        instead), this pipeline refuses to merge it into the human
-        single-cell matrix rather than silently accepting it.
+        Row-provenance assay-policy gate applied to every source this
+        function loads (see docstring above). Primarily keyed on
+        obs["is_pseudo_bulk"] (the fix for issue #13: GSE994/GSE123352/
+        GSE307690 are pseudo-bulk but were never stamped assay_mode=
+        'bulk_tcga', so a name/assay_mode-only check missed them). Also
+        keeps the original defensive assay_mode=='bulk_tcga' check as a
+        second, independent signal — a row explicitly tagged bulk_tcga must
+        never enter the single-cell pipeline even if is_pseudo_bulk was
+        (incorrectly) left False by whatever produced it.
         """
-        from data.assay_mode import AssayModeError
-        from constants import ASSAY_MODE_BULK_TCGA
+        if "is_pseudo_bulk" not in a.obs.columns:
+            raise AssayPolicyError(
+                f"{path!r} loaded with no obs['is_pseudo_bulk'] column — every source must "
+                "carry explicit row-level assay provenance before it can enter the pipeline."
+            )
+        try:
+            assert_rows_match_policy(
+                a.obs["is_pseudo_bulk"].values, assay_policy,
+                context=f"source loading: {path!r}",
+            )
+        except AssayPolicyError as exc:
+            raise AssayPolicyError(
+                f"{exc} Configure it under data.bulk_sources / data.tcga.bulk_sources instead "
+                "of data.scrna_sources/data.microarray_sources, or set data.assay_policy to "
+                "'bulk_only' for a dedicated bulk experiment."
+            ) from exc
+
         if "assay_mode" in a.obs.columns:
-            is_bulk = (a.obs["assay_mode"] == ASSAY_MODE_BULK_TCGA).values
-            if is_bulk.any():
-                raise AssayModeError(
-                    f"{path!r} contains {int(is_bulk.sum())} assay_mode='bulk_tcga' row(s) — "
+            from constants import ASSAY_MODE_BULK_TCGA
+            tagged_bulk = (a.obs["assay_mode"] == ASSAY_MODE_BULK_TCGA).values
+            if tagged_bulk.any() and assay_policy == "single_cell_only":
+                raise AssayPolicyError(
+                    f"{path!r} contains {int(tagged_bulk.sum())} assay_mode='bulk_tcga' row(s) — "
                     "bulk TCGA data must never enter the human single-cell pipeline. Remove it "
                     "from data.scrna_sources/data.microarray_sources and configure it under "
                     "data.tcga.bulk_sources instead (see preprocess.py::load_tcga_bulk_dataset)."
@@ -81,12 +121,12 @@ def _load_all_sources(cfg: dict) -> list:
     if species_allowed(experiment_mode, SPECIES_HUMAN):
         for path, stype, scol in cfg.get("scrna_sources", []):
             if _exists(path):
-                a = _reject_bulk_tcga(load_scrna(path, stype, scol), path)
+                a = _enforce_assay_policy(load_scrna(path, stype, scol), path)
                 adatas.append(normalize(qc_filter(harmonize_gene_ids(a))))
 
         for path, stype in cfg.get("microarray_sources", []):
             if _exists(path):
-                a = _reject_bulk_tcga(load_microarray(path, stype), path)
+                a = _enforce_assay_policy(load_microarray(path, stype), path)
                 adatas.append(normalize(harmonize_gene_ids(a)))
 
     if species_allowed(experiment_mode, SPECIES_MOUSE):
@@ -129,20 +169,12 @@ def _load_outcomes(cfg: dict) -> Optional[pd.DataFrame]:
     )
 
 
-class BulkTrainingNotImplementedError(RuntimeError):
-    """Raised by load_tcga_bulk_dataset when a caller asks for a trainable
-    bulk dataset — TCGA bulk RNA-seq loading/validation is implemented, but
-    there is no bulk model/training path in this project yet. This is an
-    explicit, actionable failure, never a silent fallback to merging bulk
-    samples into the single-cell pipeline."""
-
-
 def load_tcga_bulk_dataset(config: Union[dict, str, Path], require_trainable: bool = False) -> dict:
     """
     Dedicated bulk_tcga loading path — the ONLY sanctioned way to load
     TCGA's bulk expression matrices in this project. Never call
     load_microarray on a TCGA CSV from the human single-cell pipeline (see
-    preprocess.py::_load_all_sources's _reject_bulk_tcga guard, which
+    preprocess.py::_load_all_sources's _enforce_assay_policy guard, which
     exists precisely to catch that mistake).
 
     config keys (under data.tcga):
@@ -250,9 +282,13 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     cfg    = load_config(config)
     cfg    = cfg.get("data", cfg)  # configs/default.yaml nests these under "data:"
     adatas = _load_all_sources(cfg)
+    assay_policy = validate_assay_policy(cfg.get("assay_policy", DEFAULT_ASSAY_POLICY))
 
     from constants import EXPERIMENT_MODE_HUMAN_ONLY
-    merged = merge_sources(*adatas, experiment_mode=cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY))
+    merged = merge_sources(
+        *adatas, experiment_mode=cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY),
+        assay_policy=assay_policy,
+    )
     merged = smoke_aware_hvg(merged, n_hvgs=cfg.get("n_hvgs", N_HVGS_DEFAULT))
     merged = batch_correct(merged)
     # cell_type_allow_diagnostic_fallback defaults to False (fail-closed on
@@ -271,7 +307,7 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     merged = add_malignancy_labels(merged, cfg.get("tumor_barcodes"))
     merged = apply_weak_smoke_proxies(merged, enabled=cfg.get("weak_labels", {}).get("enabled", False))
 
-    cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
+    cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"), assay_policy=assay_policy)
 
     outcome_sources = []
     if cfg.get("nlst_outcomes_csv") and Path(cfg["nlst_outcomes_csv"]).exists():
@@ -293,6 +329,7 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     bags = assemble_subject_bags(
         merged, outcomes,
         min_cells_per_subject=cfg.get("min_cells_per_subject", 50),
+        assay_policy=assay_policy,
     )
     return cell_data, bags
 
@@ -407,8 +444,11 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
 
     from constants import EXPERIMENT_MODE_HUMAN_ONLY
     experiment_mode = cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY)
+    assay_policy = validate_assay_policy(cfg.get("assay_policy", DEFAULT_ASSAY_POLICY))
     adatas = _load_all_sources(cfg)
-    merged = merge_sources(*adatas, scale=False, experiment_mode=experiment_mode)   # gene intersection + concat only, NOT scaled
+    merged = merge_sources(  # gene intersection + concat only, NOT scaled
+        *adatas, scale=False, experiment_mode=experiment_mode, assay_policy=assay_policy,
+    )
 
     # ── 2. Final labels BEFORE anything that depends on them ────────────────
     if cfg.get("nlst_csv"):
@@ -559,6 +599,7 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         batch_correction_status=(
             "transductive_diagnostic_only" if allow_transductive else "disabled"
         ),
+        assay_policy=assay_policy,
     )
     artifact.label_mapping = label_mapping.to_dict()
     # Cell-type annotation provenance (which fixed label-name -> ID table
@@ -585,11 +626,12 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     # snapshot — see the comment there for why it must not run twice.
 
     # ── 8. Export + assemble ─────────────────────────────────────────────────
-    cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"))
+    cell_data = export_cell_dataset(merged, cfg.get("out_dir", "data/processed"), assay_policy=assay_policy)
     outcomes  = _load_outcomes(cfg)
     bags = assemble_subject_bags(
         merged, outcomes,
         min_cells_per_subject=cfg.get("min_cells_per_subject", 50),
+        assay_policy=assay_policy,
     )
     n_outcome_known = sum(1 for b in bags if b.get("cancer_label_known"))
     n_outcome_unknown = len(bags) - n_outcome_known
@@ -615,6 +657,8 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
         exposure_dose     = cell_data["exposure_dose"],
         malignancy_known  = cell_data["malignancy_known"],
         subject_ids       = merged.obs["subject_id"].astype(str).values,
+        is_pseudo_bulk     = merged.obs["is_pseudo_bulk"].values,
+        assay_policy       = assay_policy,
     )
     train_cell_dataset = full_cell_dataset.subset_by_subjects(manifest.train_subjects)
     val_cell_dataset   = full_cell_dataset.subset_by_subjects(manifest.val_subjects)

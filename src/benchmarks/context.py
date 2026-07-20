@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from data.label_mapping import EffectiveLabelMapping
-from data.preprocessing import PreprocessingArtifact, validate_cell_type_provenance
+from data.preprocessing import PreprocessingArtifact, validate_cell_type_provenance, assert_real_assay_provenance
 from data.splitting import SplitManifest
 from train import validate_experiment_partitions, SubjectLevelDataset
 
@@ -133,6 +133,12 @@ def _validate_context(
     # (accepted modes, fingerprint matching, the explicit pseudo-bulk
     # exemption).
     validate_cell_type_provenance(preprocessing_artifact)
+
+    # 3c. strict assay-policy provenance for a real pipeline result — same
+    # fail-closed pattern as validate_cell_type_provenance above (missing
+    # is never treated as safe). See data/preprocessing.py::
+    # assert_real_assay_provenance / data/assay_policy.py.
+    assert_real_assay_provenance(preprocessing_artifact)
 
     # 4. artifact's embedded label mapping matches the context's label_mapping
     if preprocessing_artifact.label_mapping is not None:

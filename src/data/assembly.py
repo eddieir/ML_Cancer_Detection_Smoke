@@ -10,11 +10,12 @@ import pandas as pd
 import anndata as ad
 import scanpy as sc
 
-from constants import DOSE_UNKNOWN, SPECIES_HUMAN, DEFAULT_EXPERIMENT_MODE
+from constants import DOSE_UNKNOWN, SPECIES_HUMAN, DEFAULT_EXPERIMENT_MODE, DEFAULT_ASSAY_POLICY
 
 
 def merge_sources(*adatas: ad.AnnData, scale: bool = True,
-                   experiment_mode: str = DEFAULT_EXPERIMENT_MODE) -> ad.AnnData:
+                   experiment_mode: str = DEFAULT_EXPERIMENT_MODE,
+                   assay_policy: str = DEFAULT_ASSAY_POLICY) -> ad.AnnData:
     """
     Concatenate heterogeneous sources on common gene intersection.
     Assigns batch column for downstream Harmony correction.
@@ -36,14 +37,36 @@ def merge_sources(*adatas: ad.AnnData, scale: bool = True,
     'cross_species_domain_adaptation'. This is the single enforcement point
     for the rule that ortholog-mapped mouse expression must never be
     silently treated as the same domain as measured human expression.
+
+    Assay safety (see data/assay_policy.py): every source's
+    obs["is_pseudo_bulk"] is checked against `assay_policy` before
+    concatenating — a defensive second gate independent of preprocess.py::
+    _load_all_sources's own check, so a caller that builds/loads AnnData
+    objects directly (bypassing _load_all_sources entirely, e.g. a hand-
+    constructed or corrupted object in a test or a notebook) still cannot
+    merge pseudo-bulk rows into a single_cell_only run. A source with no
+    obs["is_pseudo_bulk"] column at all (predates this field, e.g. an older
+    synthetic fixture) is treated as all-real-cells for backward
+    compatibility — the same "missing column -> legacy default, not a
+    validated safety claim" pattern this module already uses for
+    obs["species"] above and obs["smoke_type_known"]/["malignancy_known"]
+    elsewhere in this codebase.
     """
     from data.species_policy import assert_single_species_or_explicit
+    from data.assay_policy import assert_rows_match_policy
 
     species_values = [
         (a.obs["species"].iloc[0] if "species" in a.obs.columns and a.n_obs else SPECIES_HUMAN)
         for a in adatas
     ]
     assert_single_species_or_explicit(species_values, experiment_mode)
+
+    for i, a in enumerate(adatas):
+        is_bulk = (
+            a.obs["is_pseudo_bulk"].values if "is_pseudo_bulk" in a.obs.columns
+            else np.zeros(a.n_obs, dtype=bool)
+        )
+        assert_rows_match_policy(is_bulk, assay_policy, context=f"merge_sources source #{i}")
 
     genes = adatas[0].var_names
     for a in adatas[1:]:
@@ -72,16 +95,35 @@ def assemble_subject_bags(
     adata: ad.AnnData,
     cancer_outcomes: Optional[pd.DataFrame] = None,
     min_cells_per_subject: int = 50,
+    assay_policy: str = DEFAULT_ASSAY_POLICY,
 ) -> list:
     """
     Group cells by subject_id into MIL bags for Phase 2/3 training.
     Novel: first MIL bag construction from heterogeneous multi-source
     scRNA-seq smoke data linked to NLST cancer outcomes.
 
+    Assay safety (see data/assay_policy.py): a pseudo-bulk row has no
+    biological meaning as one element of a subject's MIL cell bag (no real
+    cell type, no per-cell malignancy signal) — assay_policy is enforced
+    here as well as at merge_sources()/export_cell_dataset(), so a bag can
+    never silently be built from a mix of real cells and pseudo-bulk
+    "cells" even if this function is called directly on a hand-built or
+    corrupted AnnData. Missing obs["is_pseudo_bulk"] defaults to
+    all-real-cells (legacy fixtures) rather than raising — see
+    merge_sources()'s docstring for the same pattern.
+
     Parameters
     ----------
     cancer_outcomes : DataFrame[subject_id, cancer_label]
     """
+    from data.assay_policy import assert_rows_match_policy
+
+    is_bulk = (
+        adata.obs["is_pseudo_bulk"].values if "is_pseudo_bulk" in adata.obs.columns
+        else np.zeros(adata.n_obs, dtype=bool)
+    )
+    assert_rows_match_policy(is_bulk, assay_policy, context="assemble_subject_bags")
+
     outcome_map: dict = {}
     if cancer_outcomes is not None:
         outcome_map = dict(zip(
@@ -151,8 +193,26 @@ def assemble_subject_bags(
 def export_cell_dataset(
     adata: ad.AnnData,
     out_dir: str = "data/processed",
+    assay_policy: str = DEFAULT_ASSAY_POLICY,
 ) -> dict:
-    """Save numpy arrays for CellLevelDataset (Phase 1 training)."""
+    """
+    Save numpy arrays for CellLevelDataset (Phase 1 training).
+
+    Assay safety (see data/assay_policy.py): the final gate before rows
+    become the numpy files CellLevelDataset.from_dir() reads — a pseudo-
+    bulk row must never reach a "cell-level" training array. Raises before
+    writing anything if any row's obs["is_pseudo_bulk"] is incompatible
+    with assay_policy. Missing obs["is_pseudo_bulk"] defaults to
+    all-real-cells (legacy fixtures) — see merge_sources()'s docstring.
+    """
+    from data.assay_policy import assert_rows_match_policy
+
+    is_bulk = (
+        adata.obs["is_pseudo_bulk"].values if "is_pseudo_bulk" in adata.obs.columns
+        else np.zeros(adata.n_obs, dtype=bool)
+    )
+    assert_rows_match_policy(is_bulk, assay_policy, context="export_cell_dataset")
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 

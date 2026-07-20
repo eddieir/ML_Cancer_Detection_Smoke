@@ -77,6 +77,12 @@ def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelD
     and by tests; run_smoke_cv/run_cancer_cv build fold data straight from
     normalized_adata_for_refit instead (see fold_preprocessing.py) so they
     no longer need this for CV itself."""
+    if a.assay_policy != b.assay_policy:
+        from data.assay_policy import AssayPolicyError
+        raise AssayPolicyError(
+            f"concat_cell_datasets: refusing to merge two CellLevelDatasets fit under "
+            f"different assay_policy values ({a.assay_policy!r} vs {b.assay_policy!r})."
+        )
     return CellLevelDataset(
         gene_matrix       = np.concatenate([a.X.numpy(), b.X.numpy()]),
         smoke_labels      = np.concatenate([a.smoke.numpy(), b.smoke.numpy()]),
@@ -87,6 +93,8 @@ def concat_cell_datasets(a: CellLevelDataset, b: CellLevelDataset) -> CellLevelD
         subject_ids       = np.concatenate([a.subject_ids, b.subject_ids]),
         dataset_source     = np.concatenate([a.dataset_source, b.dataset_source]),
         diagnostic_mode    = a.diagnostic_mode or b.diagnostic_mode,
+        is_pseudo_bulk     = np.concatenate([a.is_pseudo_bulk, b.is_pseudo_bulk]),
+        assay_policy       = a.assay_policy,
     )
 
 

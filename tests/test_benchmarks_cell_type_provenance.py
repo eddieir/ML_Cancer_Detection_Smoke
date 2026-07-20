@@ -33,6 +33,15 @@ def _artifact(**overrides) -> PreprocessingArtifact:
     kwargs = dict(
         version="1", gene_list=["g0", "g1"], gene_means=[0.0, 0.0], gene_stds=[1.0, 1.0],
         n_hvgs=2, smoke_marker_genes_forced=[], fit_n_cells=10, fit_n_subjects=10,
+        # Valid assay-policy provenance by default (see data/assay_policy.py,
+        # GitHub issue #13) — this file's own tests are about cell-type
+        # provenance specifically; assay provenance defaults to a valid,
+        # non-degraded state so it never masks what these tests actually
+        # exercise, unless a test overrides it on purpose.
+        assay_policy="single_cell_only", assay_policy_version="1",
+        observed_assay_modes=["human_single_cell"],
+        pseudo_bulk_rows_present_at_fit=False,
+        training_data_modality="single_cell", allowed_inference_modality="single_cell",
     )
     kwargs.update(overrides)
     return PreprocessingArtifact(**kwargs)

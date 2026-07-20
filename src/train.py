@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
-from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN
+from constants import N_CELL_TYPES, N_SMOKE_CLASSES, SMOKE_TYPES, DOSE_UNKNOWN, DEFAULT_ASSAY_POLICY
 from data.label_mapping import EffectiveLabelMapping
 from data.sampling import (
     SubjectBalancedBatchSampler,
@@ -47,6 +47,8 @@ class CellLevelDataset(Dataset):
         split_name:        Optional[str] = None,          # "train" | "val" | "test" | None
         dataset_source:    Optional[np.ndarray] = None,  # [N]  str, e.g. GEO accession per cell
         diagnostic_mode:   bool = False,
+        is_pseudo_bulk:    Optional[np.ndarray] = None,  # [N]  bool — row-level assay provenance (data/assay_policy.py)
+        assay_policy:      str = DEFAULT_ASSAY_POLICY,
     ):
         """
         subject_ids is required for any dataset used in real training/
@@ -56,6 +58,19 @@ class CellLevelDataset(Dataset):
         purely synthetic dataset (e.g. a smoke test with random data and no
         real subjects) — in that mode missing/"unknown" subject_ids are
         allowed and no disjointness guarantee is implied.
+
+        is_pseudo_bulk=None defaults to all-False (every cell treated as a
+        real single cell) — this is the legacy behaviour for every existing
+        caller that predates issue #13's assay-policy enforcement, NOT a
+        validated claim that no row here is actually pseudo-bulk. Real
+        (non-diagnostic_mode) callers built from real pipeline output (see
+        preprocess.py::run_pipeline_split_aware) pass the real per-row
+        array, which IS validated against `assay_policy` here — a pseudo-
+        bulk row must never reach a CellLevelDataset used for cell-level
+        smoke/malignancy/attention training under assay_policy=
+        'single_cell_only' (the default). diagnostic_mode datasets skip
+        this validation entirely, same as every other invariant this
+        constructor relaxes only for synthetic smoke tests.
 
         smoke_known=None defaults to all-True — this is the legacy behaviour
         for every existing caller/source that has no verified/unknown
@@ -115,6 +130,29 @@ class CellLevelDataset(Dataset):
             if dataset_source is not None else np.full(n, "unknown", dtype=object)
         )
 
+        # Assay-policy provenance (see data/assay_policy.py, GitHub issue
+        # #13). is_pseudo_bulk=None -> all-False is the documented legacy
+        # default (see __init__'s docstring), so this never breaks an
+        # existing caller that doesn't pass it. Validated only for real
+        # (non-diagnostic_mode) datasets — a pseudo-bulk row must never
+        # enter a CellLevelDataset under assay_policy='single_cell_only'.
+        from data.assay_policy import assert_rows_match_policy, validate_assay_policy
+        validate_assay_policy(assay_policy)
+        self.assay_policy = assay_policy
+        self.is_pseudo_bulk = (
+            np.asarray(is_pseudo_bulk, dtype=bool) if is_pseudo_bulk is not None
+            else np.zeros(n, dtype=bool)
+        )
+        if len(self.is_pseudo_bulk) != n:
+            raise ValueError(
+                f"CellLevelDataset: is_pseudo_bulk has {len(self.is_pseudo_bulk)} entries, "
+                f"expected {n} (one per cell)."
+            )
+        if not diagnostic_mode:
+            assert_rows_match_policy(
+                self.is_pseudo_bulk, assay_policy, context="CellLevelDataset construction",
+            )
+
     def __len__(self):  return len(self.X)
 
     def __getitem__(self, idx):
@@ -149,6 +187,8 @@ class CellLevelDataset(Dataset):
             subject_ids       = self.subject_ids[mask],
             dataset_source    = self.dataset_source[mask],
             diagnostic_mode   = self.diagnostic_mode,
+            is_pseudo_bulk    = self.is_pseudo_bulk[mask],
+            assay_policy      = self.assay_policy,
         )
 
     @classmethod
@@ -165,12 +205,15 @@ class CellLevelDataset(Dataset):
 
         subject_ids = None
         dataset_source = None
+        is_pseudo_bulk = None
         if meta_path.exists():
             meta = pd.read_csv(meta_path)
             if "subject_id" in meta.columns:
                 subject_ids = meta["subject_id"].astype(str).values
             if "source" in meta.columns:
                 dataset_source = meta["source"].astype(str).values
+            if "is_pseudo_bulk" in meta.columns:
+                is_pseudo_bulk = meta["is_pseudo_bulk"].astype(bool).values
 
         return cls(
             gene_matrix       = np.load(d / "gene_matrix.npy"),
@@ -183,6 +226,7 @@ class CellLevelDataset(Dataset):
             subject_ids       = subject_ids,
             dataset_source    = dataset_source,
             diagnostic_mode   = diagnostic_mode,
+            is_pseudo_bulk    = is_pseudo_bulk,
         )
 
     def smoke_class_weights(self, num_classes: int = N_SMOKE_CLASSES) -> torch.Tensor:

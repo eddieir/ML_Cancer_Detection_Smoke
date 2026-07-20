@@ -287,6 +287,7 @@ def build_fold_cell_dataset(
     dose = obs["exposure_dose"].values.astype(np.float32) if "exposure_dose" in obs.columns else None
     malig_known = obs["malignancy_known"].values.astype(bool) if "malignancy_known" in obs.columns else None
     source = obs["source"].astype(str).values if "source" in obs.columns else None
+    is_pseudo_bulk = obs["is_pseudo_bulk"].values.astype(bool) if "is_pseudo_bulk" in obs.columns else None
 
     return CellLevelDataset(
         gene_matrix=X,
@@ -299,6 +300,8 @@ def build_fold_cell_dataset(
         malignancy_known=malig_known,
         subject_ids=obs["subject_id"].astype(str).values,
         dataset_source=source,
+        is_pseudo_bulk=is_pseudo_bulk,
+        assay_policy=getattr(artifact, "assay_policy", None) or "single_cell_only",
     )
 
 
