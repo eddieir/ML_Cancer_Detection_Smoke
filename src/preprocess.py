@@ -281,8 +281,13 @@ def run_pipeline(config: Union[dict, str, Path]) -> Tuple[dict, list]:
     """
     cfg    = load_config(config)
     cfg    = cfg.get("data", cfg)  # configs/default.yaml nests these under "data:"
-    adatas = _load_all_sources(cfg)
     assay_policy = validate_assay_policy(cfg.get("assay_policy", DEFAULT_ASSAY_POLICY))
+    # Same trainable-result gate as run_pipeline_split_aware — see its
+    # comment. This legacy (non-split-aware) pipeline also ends in a
+    # CellLevelDataset + bags Returns contract, so bulk_only/multimodal
+    # must never reach it either.
+    require_assay_trainable(assay_policy)
+    adatas = _load_all_sources(cfg)
 
     from constants import EXPERIMENT_MODE_HUMAN_ONLY
     merged = merge_sources(
@@ -445,6 +450,13 @@ def run_pipeline_split_aware(config: Union[dict, str, Path]) -> dict:
     from constants import EXPERIMENT_MODE_HUMAN_ONLY
     experiment_mode = cfg.get("experiment_mode", EXPERIMENT_MODE_HUMAN_ONLY)
     assay_policy = validate_assay_policy(cfg.get("assay_policy", DEFAULT_ASSAY_POLICY))
+    # This pipeline's whole purpose is to produce a TRAINABLE CellLevelDataset
+    # + bags (see the docstring's Returns section) — fail immediately, before
+    # loading/merging/annotating anything, if the configured assay_policy
+    # cannot back real training (bulk_only/multimodal). Bulk manifest
+    # loading/validation stays available through load_tcga_bulk_dataset()
+    # separately; this is the trainable-result path.
+    require_assay_trainable(assay_policy)
     adatas = _load_all_sources(cfg)
     merged = merge_sources(  # gene intersection + concat only, NOT scaled
         *adatas, scale=False, experiment_mode=experiment_mode, assay_policy=assay_policy,

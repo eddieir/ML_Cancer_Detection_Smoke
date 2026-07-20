@@ -220,16 +220,19 @@ def test_context_validation_rejects_degraded_annotation_in_real_mode():
         gene_matrix=np.zeros((2, n_genes), dtype="float32"), smoke_labels=np.array([0, 1]),
         malignancy_labels=np.zeros(2, dtype="float32"), cell_type_ids=np.zeros(2, dtype=np.int64),
         subject_ids=np.array(train_subj, dtype=object), dataset_source=np.array(["a", "a"], dtype=object),
+        is_pseudo_bulk=np.zeros(2, dtype=bool),
     )
     val_ds = CellLevelDataset(
         gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([0]),
         malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
         subject_ids=np.array(val_subj, dtype=object), dataset_source=np.array(["a"], dtype=object),
+        is_pseudo_bulk=np.zeros(1, dtype=bool),
     )
     test_ds = CellLevelDataset(
         gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([1]),
         malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
         subject_ids=np.array(test_subj, dtype=object), dataset_source=np.array(["a"], dtype=object),
+        is_pseudo_bulk=np.zeros(1, dtype=bool),
     )
     artifact = PreprocessingArtifact(
         version="1", gene_list=[f"g{i}" for i in range(n_genes)], gene_means=[0.0] * n_genes,
@@ -430,16 +433,19 @@ def test_degraded_compatibility_override_is_rejected_by_real_context():
         gene_matrix=np.zeros((2, n_genes), dtype="float32"), smoke_labels=np.array([0, 1]),
         malignancy_labels=np.zeros(2, dtype="float32"), cell_type_ids=np.zeros(2, dtype=np.int64),
         subject_ids=np.array(["s0", "s1"], dtype=object), dataset_source=np.array(["a", "a"], dtype=object),
+        is_pseudo_bulk=np.zeros(2, dtype=bool),
     )
     val_ds = CellLevelDataset(
         gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([0]),
         malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
         subject_ids=np.array(["s2"], dtype=object), dataset_source=np.array(["a"], dtype=object),
+        is_pseudo_bulk=np.zeros(1, dtype=bool),
     )
     test_ds = CellLevelDataset(
         gene_matrix=np.zeros((1, n_genes), dtype="float32"), smoke_labels=np.array([1]),
         malignancy_labels=np.zeros(1, dtype="float32"), cell_type_ids=np.zeros(1, dtype=np.int64),
         subject_ids=np.array(["s3"], dtype=object), dataset_source=np.array(["a"], dtype=object),
+        is_pseudo_bulk=np.zeros(1, dtype=bool),
     )
     artifact = PreprocessingArtifact(
         version="1", gene_list=[f"g{i}" for i in range(n_genes)], gene_means=[0.0] * n_genes,

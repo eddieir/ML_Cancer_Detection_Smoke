@@ -40,6 +40,7 @@ from .candidate_registry import resolve_strategy_application
 from .cross_validation import (
     DEFAULT_INNER_FOLDS, MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn,
     _pathway_cancer_fit_score_fn, _pathway_smoke_fit_score_fn, _smoke_baseline_fit_score_fn,
+    _require_context_trainable,
 )
 from .domain_losses import DomainLossConfigurationError, resolve_domain_robustness_config
 from .features import build_cancer_subject_features, build_smoke_subject_summary_features
@@ -301,6 +302,7 @@ def run_cancer_source_held_out(
     fit; cross_run_stability reports insufficient_evidence rather than a
     fabricated single-run "stability" when left empty.
     """
+    _require_context_trainable(context)
     domain_cfg = resolve_domain_robustness_config(domain_robustness_config)
     subject_to_source = _pool_subjects_and_sources(context)
     all_bags = list(context.train_bags) + list(context.val_bags)
@@ -843,6 +845,7 @@ def run_smoke_source_held_out(
     label, and a subject whose verified cells disagree raises
     ConflictingSmokeLabelError rather than being resolved by majority vote.
     """
+    _require_context_trainable(context)
     domain_cfg = resolve_domain_robustness_config(domain_robustness_config)
     if domain_cfg["strategy"] != "erm":
         raise UnsupportedSmokeDomainStrategyError(

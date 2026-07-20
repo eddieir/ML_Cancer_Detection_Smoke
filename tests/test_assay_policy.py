@@ -284,11 +284,29 @@ def test_cell_level_dataset_diagnostic_mode_bypasses_assay_check():
     assert len(ds) == n
 
 
-def test_cell_level_dataset_default_is_pseudo_bulk_is_all_false_legacy():
-    """Existing callers that never pass is_pseudo_bulk (the overwhelming
-    majority of this codebase's existing synthetic tests) keep working
-    unchanged — the default is documented as a legacy backward-compat
-    default, not a validated safety claim."""
+def test_cell_level_dataset_missing_is_pseudo_bulk_rejected_outside_diagnostic_mode():
+    """A real (non-diagnostic) CellLevelDataset with no is_pseudo_bulk array
+    must be refused rather than silently defaulted to all-real-cells — a
+    missing array is never assumed to mean 'every cell is real'. See
+    train.py::CellLevelDataset.__init__ and GitHub issue #13's follow-up."""
+    from data.assay_policy import MissingAssayProvenanceError
+    from train import CellLevelDataset
+
+    n, g = 6, 4
+    with pytest.raises(MissingAssayProvenanceError):
+        CellLevelDataset(
+            gene_matrix=np.random.randn(n, g).astype("float32"),
+            smoke_labels=np.random.randint(0, 6, n),
+            malignancy_labels=np.zeros(n, dtype="float32"),
+            cell_type_ids=np.zeros(n, dtype="int64"),
+            subject_ids=[f"sub_{i}" for i in range(n)],
+        )
+
+
+def test_cell_level_dataset_diagnostic_mode_still_defaults_is_pseudo_bulk_to_all_false():
+    """diagnostic_mode=True is the one narrow, explicit opt-out that keeps
+    the old all-real-cells default — for a deliberately synthetic fixture
+    only, never inferred."""
     from train import CellLevelDataset
 
     n, g = 6, 4
@@ -298,6 +316,7 @@ def test_cell_level_dataset_default_is_pseudo_bulk_is_all_false_legacy():
         malignancy_labels=np.zeros(n, dtype="float32"),
         cell_type_ids=np.zeros(n, dtype="int64"),
         subject_ids=[f"sub_{i}" for i in range(n)],
+        diagnostic_mode=True,
     )
     assert not ds.is_pseudo_bulk.any()
 
@@ -456,3 +475,216 @@ def test_assay_policy_enforcement_does_not_touch_frozen_test_guard_module():
     never inside the guard's own state machine."""
     import benchmarks.test_guard as test_guard_mod
     assert "assay_policy" not in Path(test_guard_mod.__file__).read_text()
+
+
+# ─── Strict boolean provenance parser ───────────────────────────────────────
+
+def test_parse_strict_bool_array_accepts_canonical_values():
+    from data.assay_policy import parse_strict_bool_array
+    out = parse_strict_bool_array([True, False, "True", "False", "true", "false", "1", "0"])
+    assert out.tolist() == [True, False, True, False, True, False, True, False]
+
+
+def test_parse_strict_bool_array_rejects_string_false_as_truthy():
+    """The exact bug class this parser exists to prevent: bool("False")
+    evaluates to True in plain python. This parser must not repeat that."""
+    from data.assay_policy import parse_strict_bool_array
+    out = parse_strict_bool_array(["False"])
+    assert out.tolist() == [False]
+
+
+def test_parse_strict_bool_array_rejects_nan_none_and_unknown_strings():
+    from data.assay_policy import InvalidAssayProvenanceError, parse_strict_bool_array
+    for bad in ([float("nan")], [None], [""], ["maybe"], ["yes"], [2]):
+        with pytest.raises(InvalidAssayProvenanceError):
+            parse_strict_bool_array(bad)
+
+
+def test_parse_strict_bool_array_rejects_mixed_valid_and_invalid():
+    from data.assay_policy import InvalidAssayProvenanceError, parse_strict_bool_array
+    with pytest.raises(InvalidAssayProvenanceError):
+        parse_strict_bool_array([True, False, "bogus", None])
+
+
+def test_parse_strict_bool_array_rejects_length_mismatch():
+    from data.assay_policy import InvalidAssayProvenanceError, parse_strict_bool_array
+    with pytest.raises(InvalidAssayProvenanceError):
+        parse_strict_bool_array([True, False], n_hint=5)
+
+
+# ─── Missing provenance fails closed at every real boundary ────────────────
+
+def test_fit_preprocessing_missing_provenance_column_raises():
+    from data.assay_policy import MissingAssayProvenanceError
+    from data.preprocessing import fit_preprocessing
+
+    real = _mini_adata(n=20)
+    del real.obs["is_pseudo_bulk"]
+    with pytest.raises(MissingAssayProvenanceError):
+        fit_preprocessing(real, set(real.obs["subject_id"]), n_hvgs=10)
+
+
+def test_apply_preprocessing_missing_provenance_column_raises():
+    from data.assay_policy import MissingAssayProvenanceError
+    from data.preprocessing import apply_preprocessing, fit_preprocessing
+
+    real = _mini_adata(n=20)
+    artifact = fit_preprocessing(real, set(real.obs["subject_id"]), n_hvgs=10)
+    stripped = real.copy()
+    del stripped.obs["is_pseudo_bulk"]
+    with pytest.raises(MissingAssayProvenanceError):
+        apply_preprocessing(stripped, artifact)
+
+
+def test_apply_preprocessing_diagnostic_mode_tolerates_missing_column():
+    from data.preprocessing import apply_preprocessing, fit_preprocessing
+
+    real = _mini_adata(n=20)
+    artifact = fit_preprocessing(real, set(real.obs["subject_id"]), n_hvgs=10)
+    stripped = real.copy()
+    del stripped.obs["is_pseudo_bulk"]
+    apply_preprocessing(stripped, artifact, diagnostic_mode=True)  # must not raise
+
+
+def test_cell_level_dataset_from_dir_rejects_legacy_directory_missing_metadata(tmp_path):
+    from data.assay_policy import parse_strict_bool_array  # noqa: F401  (import surface check)
+    from train import CellLevelDataset, LegacyCellDatasetDirectoryError
+
+    n, g = 10, 5
+    np.save(tmp_path / "gene_matrix.npy", np.zeros((n, g), dtype="float32"))
+    np.save(tmp_path / "smoke_labels.npy", np.zeros(n, dtype="int64"))
+    np.save(tmp_path / "malignancy_labels.npy", np.zeros(n, dtype="float32"))
+    np.save(tmp_path / "cell_type_ids.npy", np.zeros(n, dtype="int64"))
+    # No cell_metadata.csv written at all — a pre-issue-13 export.
+    with pytest.raises(LegacyCellDatasetDirectoryError):
+        CellLevelDataset.from_dir(tmp_path)
+
+
+def test_cell_level_dataset_from_dir_rejects_metadata_missing_is_pseudo_bulk(tmp_path):
+    from train import CellLevelDataset, LegacyCellDatasetDirectoryError
+
+    n, g = 10, 5
+    np.save(tmp_path / "gene_matrix.npy", np.zeros((n, g), dtype="float32"))
+    np.save(tmp_path / "smoke_labels.npy", np.zeros(n, dtype="int64"))
+    np.save(tmp_path / "malignancy_labels.npy", np.zeros(n, dtype="float32"))
+    np.save(tmp_path / "cell_type_ids.npy", np.zeros(n, dtype="int64"))
+    meta = pd.DataFrame({
+        "subject_id": [f"s{i}" for i in range(n)], "source": ["a"] * n,
+    })  # no is_pseudo_bulk column
+    meta.to_csv(tmp_path / "cell_metadata.csv", index=False)
+    with pytest.raises(LegacyCellDatasetDirectoryError):
+        CellLevelDataset.from_dir(tmp_path)
+
+
+def test_cell_level_dataset_from_dir_real_mode_round_trips_provenance(tmp_path):
+    from train import CellLevelDataset
+
+    n, g = 12, 5
+    np.save(tmp_path / "gene_matrix.npy", np.random.randn(n, g).astype("float32"))
+    np.save(tmp_path / "smoke_labels.npy", np.zeros(n, dtype="int64"))
+    np.save(tmp_path / "malignancy_labels.npy", np.zeros(n, dtype="float32"))
+    np.save(tmp_path / "cell_type_ids.npy", np.zeros(n, dtype="int64"))
+    is_bulk = [False] * (n - 1) + [True]
+    meta = pd.DataFrame({
+        "subject_id": [f"s{i}" for i in range(n)], "source": ["a"] * n,
+        "is_pseudo_bulk": ["True" if b else "False" for b in is_bulk],  # strings, on purpose
+    })
+    meta.to_csv(tmp_path / "cell_metadata.csv", index=False)
+    # single_cell_only (the default policy) must reject the one pseudo-bulk row,
+    # proving the strings "True"/"False" were parsed correctly (not left as
+    # truthy strings) before the policy check even runs.
+    with pytest.raises(AssayPolicyError):
+        CellLevelDataset.from_dir(tmp_path)
+
+
+# ─── bulk_only/multimodal blocked before any real construction/fitting ─────
+
+def test_cell_level_dataset_rejects_bulk_only_in_real_mode():
+    from data.assay_policy import BulkTrainingNotImplementedError
+    from train import CellLevelDataset
+
+    n = 5
+    with pytest.raises(BulkTrainingNotImplementedError):
+        CellLevelDataset(
+            gene_matrix=np.zeros((n, 3), dtype="float32"), smoke_labels=np.zeros(n, dtype="int64"),
+            malignancy_labels=np.zeros(n, dtype="float32"), cell_type_ids=np.zeros(n, dtype="int64"),
+            subject_ids=[f"s{i}" for i in range(n)], is_pseudo_bulk=np.ones(n, dtype=bool),
+            assay_policy=ASSAY_POLICY_BULK_ONLY,
+        )
+
+
+def test_cell_level_dataset_rejects_multimodal_in_real_mode():
+    from train import CellLevelDataset
+
+    n = 5
+    with pytest.raises(MultimodalTrainingNotImplementedError):
+        CellLevelDataset(
+            gene_matrix=np.zeros((n, 3), dtype="float32"), smoke_labels=np.zeros(n, dtype="int64"),
+            malignancy_labels=np.zeros(n, dtype="float32"), cell_type_ids=np.zeros(n, dtype="int64"),
+            subject_ids=[f"s{i}" for i in range(n)], is_pseudo_bulk=np.zeros(n, dtype=bool),
+            assay_policy=ASSAY_POLICY_MULTIMODAL,
+        )
+
+
+def test_run_pipeline_split_aware_rejects_bulk_only_before_loading_any_source(tmp_path, monkeypatch):
+    """bulk_only must be rejected before _load_all_sources is even called —
+    proven with a spy that fails the test if source loading is reached."""
+    import preprocess
+
+    def _poison(*a, **kw):
+        raise AssertionError("run_pipeline_split_aware must not load sources under bulk_only")
+
+    monkeypatch.setattr(preprocess, "_load_all_sources", _poison)
+    cfg = {"data": {"assay_policy": ASSAY_POLICY_BULK_ONLY, "out_dir": str(tmp_path)}}
+    with pytest.raises(BulkTrainingNotImplementedError):
+        preprocess.run_pipeline_split_aware(cfg)
+
+
+def test_trainer_from_config_rejects_bulk_only_before_model_touched():
+    from model import MultiSmokeCancerNet
+    from train import Trainer
+
+    model = MultiSmokeCancerNet(input_dim=10, embedding_dim=8, attention_dim=4)
+    with pytest.raises(BulkTrainingNotImplementedError):
+        Trainer.from_config(model, {"data": {"assay_policy": ASSAY_POLICY_BULK_ONLY}})
+
+
+def test_context_validate_rejects_bulk_only_artifact_before_downstream_use(tmp_path):
+    """ExperimentContext.from_pipeline_result must reject a bulk_only
+    artifact — the shared gate every CV/OOF/final-fit path relies on."""
+    from benchmarks.context import ExperimentContext
+    from data.label_mapping import identity_label_mapping
+    from data.preprocessing import PreprocessingArtifact
+    from data.splitting import SplitManifest
+    from train import CellLevelDataset
+
+    n = 10
+    ids = np.array([f"s{i}" for i in range(n)], dtype=object)
+    # CellLevelDataset itself already refuses a real (non-diagnostic)
+    # bulk_only construction (see test_cell_level_dataset_rejects_bulk_only_
+    # in_real_mode above) — diagnostic_mode=True here isolates THIS test's
+    # target, the artifact-level gate in ExperimentContext._validate_context,
+    # from that earlier, independent gate.
+    ds = CellLevelDataset(
+        np.zeros((n, 3), dtype="float32"), np.zeros(n, dtype=int), np.zeros(n, dtype="float32"),
+        np.zeros(n, dtype=int), subject_ids=ids, is_pseudo_bulk=np.ones(n, dtype=bool),
+        assay_policy=ASSAY_POLICY_BULK_ONLY, diagnostic_mode=True,
+    )
+    train_ids, val_ids, test_ids = ids[:6].tolist(), ids[6:8].tolist(), ids[8:].tolist()
+    artifact = PreprocessingArtifact(
+        version="1", gene_list=["g0", "g1", "g2"], gene_means=[0.0] * 3, gene_stds=[1.0] * 3,
+        n_hvgs=3, smoke_marker_genes_forced=[], fit_n_cells=6, fit_n_subjects=6,
+        assay_policy=ASSAY_POLICY_BULK_ONLY, assay_policy_version=ASSAY_POLICY_VERSION,
+        observed_assay_modes=["bulk_tcga"], pseudo_bulk_rows_present_at_fit=True,
+        training_data_modality="bulk", allowed_inference_modality="bulk",
+        cell_type_annotation_degraded=False, cell_type_annotation_mode="pseudo_bulk_no_cell_type_identity",
+    )
+    manifest = SplitManifest(seed=1, train_subjects=train_ids, val_subjects=val_ids, test_subjects=test_ids)
+    result = dict(
+        train_cell_dataset=ds.subset_by_subjects(train_ids), val_cell_dataset=ds.subset_by_subjects(val_ids),
+        test_cell_dataset=ds.subset_by_subjects(test_ids), train_bags=[], val_bags=[], test_bags=[],
+        split_manifest=manifest, preprocessing_artifact=artifact, label_mapping=identity_label_mapping(),
+        rare_class_report={}, label_provenance_report={}, transductive_batch_correction=False,
+    )
+    with pytest.raises(BulkTrainingNotImplementedError):
+        ExperimentContext.from_pipeline_result(result, config={})

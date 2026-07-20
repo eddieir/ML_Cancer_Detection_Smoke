@@ -35,7 +35,8 @@ def test_cell_count_imbalance_does_not_dominate_subject_summary_features():
     X = np.concatenate([rng.randn(1000, 5).astype("float32"), rng.randn(10, 5).astype("float32") + 5])
     y = np.array([0] * 1000 + [1] * 10)
     ds = CellLevelDataset(X, y, np.zeros(1010, dtype="float32"), np.zeros(1010, dtype=int),
-                          subject_ids=np.array(subj, dtype=object))
+                          subject_ids=np.array(subj, dtype=object),
+                          is_pseudo_bulk=np.zeros(1010, dtype=bool))
     Xf, yf, subject_ids, _ = build_smoke_subject_summary_features(ds, num_cell_types=1, num_classes=2)
     assert Xf.shape[0] == 2  # exactly one row each, regardless of 1000 vs 10 cells
 

@@ -1257,18 +1257,37 @@ output is):
   to the merge list; also keeps the original `assay_mode=="bulk_tcga"`
   check as a second signal.
 - `data/assembly.py::merge_sources`/`assemble_subject_bags`/
-  `export_cell_dataset` — each independently re-checks `is_pseudo_bulk`,
-  so calling any of them directly (bypassing `_load_all_sources`) is still
-  safe.
-- `data/preprocessing.py::fit_preprocessing` — checks the train partition
-  before fitting scaling/HVG statistics; `apply_preprocessing` checks the
-  transform input's `is_pseudo_bulk` against the artifact's own
-  `assay_policy` (`assert_assay_compatible`) before transforming.
-- `train.py::CellLevelDataset.__init__` — accepts an optional
-  `is_pseudo_bulk` array (default: all-`False`, the documented legacy
-  default for callers that predate this field) and validates it against
-  `assay_policy` unless `diagnostic_mode=True`; `subset_by_subjects`/
-  `concat_cell_datasets` (`benchmarks/cross_validation.py`) preserve it.
+  `export_cell_dataset` — each independently re-checks `is_pseudo_bulk`
+  against `assay_policy` when the column is present. **Known open gap:**
+  unlike `fit_preprocessing`/`apply_preprocessing`/`CellLevelDataset`
+  above, these three still default a genuinely MISSING `is_pseudo_bulk`
+  column to all-`False` rather than failing closed — real callers are
+  unaffected in practice (`preprocess.py::_load_all_sources` already
+  guarantees the column is present before any of these run, and
+  `_load_all_sources` itself fails closed on a missing column), but a
+  hand-built AnnData passed directly to one of these three functions can
+  still hit the legacy default. Tightening this to match the rest of the
+  module is tracked as follow-up work, not yet done.
+- `data/preprocessing.py::fit_preprocessing` — REQUIRES `is_pseudo_bulk` on
+  the train partition unless `diagnostic_mode=True`; a missing column
+  raises `MissingAssayProvenanceError` rather than defaulting to
+  all-real-cells. `apply_preprocessing`/`assert_assay_compatible` apply the
+  same requirement to transform/inference input, and additionally check
+  the input's `is_pseudo_bulk` against the artifact's own `assay_policy`
+  once present.
+- `train.py::CellLevelDataset.__init__` — REQUIRES an `is_pseudo_bulk`
+  array unless `diagnostic_mode=True` (only then does it default to
+  all-`False`, for a deliberately synthetic fixture); values are parsed by
+  `data/assay_policy.py::parse_strict_bool_array` and validated against
+  `assay_policy`, and `require_trainable(assay_policy)` is enforced for
+  every real construction (this class is single-cell training only —
+  `bulk_only`/`multimodal` are rejected, not merely validated row-by-row).
+  `subset_by_subjects`/`concat_cell_datasets`
+  (`benchmarks/cross_validation.py`)/`cap_cell_dataset`
+  (`benchmarks/features.py`) all preserve `is_pseudo_bulk`/`assay_policy`.
+  `from_dir()` requires `cell_metadata.csv` with `subject_id`/`source`/
+  `is_pseudo_bulk` columns in real mode and raises the typed
+  `LegacyCellDatasetDirectoryError` for an export that predates them.
 - `benchmarks/fold_preprocessing.py::build_fold_cell_dataset` — inherits
   the `apply_preprocessing` check and threads `is_pseudo_bulk` into the
   fold's `CellLevelDataset`.
@@ -1281,9 +1300,27 @@ output is):
   the bundle manifest records `assay_policy` (defaulting to the referenced
   artifact's own value; an explicit mismatch is rejected at write time);
   reload cross-checks the manifest's recorded value against the loaded
-  artifact's. `validate_bundle_input_modality()` rejects inference input
-  whose `is_pseudo_bulk` doesn't match the bundle's declared policy,
-  checked before any model execution.
+  artifact's. `validate_bundle_input_modality()` rejects an input whose
+  `is_pseudo_bulk` doesn't match the bundle's declared policy — this
+  function is unit-tested directly but is **not currently called from
+  `inference.py`'s `Predictor`**, which has no `from_bundle`/
+  `load_and_validate_bundle` integration at all; AnnData inference through
+  `Predictor.predict_h5ad` is still protected because it always goes
+  through `apply_preprocessing`/`assert_assay_compatible`, but a
+  bundle-declared modality is not independently re-checked at prediction
+  time today. `Predictor.predict_subject`/`predict_batch` (raw-array
+  input) perform no assay/modality check at all — treat both as an open
+  gap, not a implemented guarantee, until they're wired up.
+- `preprocess.py::run_pipeline`/`run_pipeline_split_aware` and
+  `ExperimentContext.from_pipeline_result` call
+  `data/assay_policy.py::require_trainable` before doing any real work —
+  `assay_policy='bulk_only'` raises `BulkTrainingNotImplementedError` and
+  `'multimodal'` raises `MultimodalTrainingNotImplementedError` immediately,
+  never after a model has been constructed. The same call is repeated (as
+  defense in depth against a hand-built `ExperimentContext`) in
+  `Trainer.from_config`, `Trainer.from_experiment_context`,
+  `run_smoke_cv`/`run_cancer_cv`, `generate_subject_oof_predictions`,
+  `fit_final_candidate_on_dev_pool`, and both source-held-out entry points.
 - `preprocess.py::load_tcga_bulk_dataset` remains the only sanctioned way
   to load TCGA's bulk matrices (`data.tcga.enabled=true` required) and
   still raises `BulkTrainingNotImplementedError` for

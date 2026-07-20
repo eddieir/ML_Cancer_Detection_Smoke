@@ -25,6 +25,7 @@ def _base_result(n=20):
     ds = CellLevelDataset(
         np.random.rand(n, 5).astype("float32"), np.zeros(n, dtype=int),
         np.zeros(n, dtype="float32"), np.zeros(n, dtype=int), subject_ids=all_ids,
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
     train_ids, val_ids, test_ids = all_ids[:14].tolist(), all_ids[14:17].tolist(), all_ids[17:].tolist()
     artifact = PreprocessingArtifact(

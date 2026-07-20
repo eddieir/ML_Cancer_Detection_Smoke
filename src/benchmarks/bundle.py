@@ -287,13 +287,12 @@ def validate_bundle_input_modality(manifest: Dict, is_pseudo_bulk) -> None:
     and is left to whatever legacy-checkpoint policy the caller already
     applies elsewhere; this function only rejects a KNOWN mismatch.
     """
-    import numpy as np
-    from data.assay_policy import assert_rows_match_policy
+    from data.assay_policy import assert_rows_match_policy, parse_strict_bool_array
 
     policy = manifest.get("assay_policy")
     if policy is None:
         return
-    arr = np.asarray(is_pseudo_bulk, dtype=bool)
+    arr = parse_strict_bool_array(is_pseudo_bulk)
     try:
         assert_rows_match_policy(arr, policy, context="bundle inference input")
     except Exception as exc:  # AssayPolicyError (a ValueError subclass)

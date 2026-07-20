@@ -146,6 +146,56 @@ matrix under a permissive config — this document does not restate those
 figures as scientifically comparable to a genuinely single-cell-only run,
 since that has not been separately verified.
 
+**Missing provenance fails closed, not open.** A real (non-diagnostic) run
+that reaches `fit_preprocessing`, `apply_preprocessing`, `CellLevelDataset`
+construction, or `CellLevelDataset.from_dir()` without row-level
+`is_pseudo_bulk` provenance raises `MissingAssayProvenanceError` rather
+than defaulting the missing column to "every row is a real cell". That
+default-to-safe behavior existed for a period during this module's
+development and has been removed — it is not the current behavior of any
+of the functions above. The only sanctioned exception is an explicit,
+narrowly-scoped `diagnostic_mode=True` argument, reserved for deliberately
+synthetic fixtures (unit tests, `--synthetic` CLI runs); it is never
+inferred from a source name, a file path, or the absence of real data, and
+a diagnostic-mode dataset is rejected by `ExperimentContext` validation and
+by every real bundle/report path. `CellLevelDataset.from_dir()` additionally
+refuses to load a legacy exported directory (missing
+`cell_metadata.csv` or its `subject_id`/`source`/`is_pseudo_bulk`
+columns) with a typed `LegacyCellDatasetDirectoryError` — such a directory
+must be regenerated with the current pipeline, not loaded with relaxed
+assumptions.
+
+**Boolean provenance is parsed strictly.** `data/assay_policy.py::
+parse_strict_bool_array` is the one parser used for persisted/user-provided
+`is_pseudo_bulk` values throughout the codebase (loaders, `from_dir()`,
+bundle-input validation). It accepts real booleans and the literal strings
+`"true"/"True"/"1"` / `"false"/"False"/"0"`; it rejects `NaN`, `None`, empty
+strings, and any other value outright — `bool("False")` evaluating to
+`True` is exactly the kind of silent misparse this project does not rely
+on `astype(bool)`/`bool(x)` to avoid.
+
+**Unsupported training modes are blocked before fitting, not just at the
+policy helper.** `data.assay_policy.require_trainable()` is called at
+every production path that can reach a trainable result or a constructed
+model: `preprocess.py::run_pipeline`/`run_pipeline_split_aware` (before any
+source is loaded), `ExperimentContext.from_pipeline_result` (the shared
+validation every CV/OOF/final-fit/source-held-out path builds on),
+`Trainer.from_config`, `Trainer.from_experiment_context`, and the entry
+points of `run_smoke_cv`/`run_cancer_cv`,
+`generate_subject_oof_predictions`, `fit_final_candidate_on_dev_pool`, and
+both source-held-out functions. `assay_policy='bulk_only'` raises
+`BulkTrainingNotImplementedError` and `'multimodal'` raises
+`MultimodalTrainingNotImplementedError` before any model, optimizer, or
+preprocessing fit is constructed — loading/validating a bulk manifest
+(`load_tcga_bulk_dataset`) remains available separately and is unaffected.
+
+**Legacy datasets/artifacts/bundles must be regenerated, not patched
+around.** An exported cell-dataset directory, a `PreprocessingArtifact`, or
+a model bundle produced before this enforcement existed has no reliable
+way to retroactively prove its row-level provenance was correct, so each
+of those loaders refuses to guess — see `LegacyCellDatasetDirectoryError`
+above and `assert_real_assay_provenance()` for the artifact/bundle case.
+
 ### Label integrity
 
 - A missing label is never converted into a negative label. `malignancy_known`

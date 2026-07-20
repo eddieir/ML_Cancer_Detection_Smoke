@@ -20,7 +20,7 @@ def _artifact_path(tmp_path):
     subject_ids = [f"s{i // 10}" for i in range(60)]
     adata = ad.AnnData(
         X=np.random.default_rng(0).random((60, 10)).astype("float32"),
-        obs=pd.DataFrame({"subject_id": subject_ids}),
+        obs=pd.DataFrame({"subject_id": subject_ids, "is_pseudo_bulk": [False] * 60}),
         var=pd.DataFrame(index=[f"G{i}" for i in range(10)]),
     )
     artifact = fit_preprocessing(adata, {f"s{i}" for i in range(6)}, n_hvgs=10)

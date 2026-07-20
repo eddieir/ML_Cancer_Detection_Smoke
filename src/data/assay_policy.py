@@ -72,6 +72,32 @@ class AssayPolicyError(AssayModeError):
     working unchanged against this project-wide policy gate."""
 
 
+class MissingAssayProvenanceError(AssayPolicyError):
+    """Raised when a real (non-diagnostic) code path needs row-level
+    is_pseudo_bulk provenance and none was supplied — a missing column, a
+    None array, or an absent required field on a loaded artifact/dataset.
+    A missing value is NEVER treated as "real cell" / safe by default;
+    only an explicitly declared synthetic diagnostic fixture may omit
+    provenance, and only through a narrow, explicit diagnostic_mode path
+    that never reaches real training/evaluation/inference."""
+
+
+class InvalidAssayProvenanceError(AssayPolicyError):
+    """Raised when supplied is_pseudo_bulk provenance is present but not a
+    genuine boolean per row: NaN, None mixed with real values, an empty or
+    unrecognized string, a length mismatch against the number of rows, or
+    any other value the strict boolean parser (parse_strict_bool_array)
+    refuses to interpret unambiguously."""
+
+
+class AssayPolicyMismatchError(AssayPolicyError):
+    """Raised when two pieces of assay-policy-bearing state disagree where
+    they must agree — e.g. an artifact fit under one assay_policy applied
+    to input governed by another, a bundle's declared assay_policy
+    disagreeing with its embedded artifact, or a dataset class restricted
+    to a single trainable policy being constructed under a different one."""
+
+
 class BulkTrainingNotImplementedError(RuntimeError):
     """Raised when a caller asks for a TRAINABLE bulk-expression dataset or
     tries to train under assay_policy='bulk_only'. Loading/validating a
@@ -145,23 +171,95 @@ def require_trainable(policy: str) -> None:
         )
 
 
-def _as_bool_array(is_pseudo_bulk: Sequence, n_hint: Optional[int] = None) -> np.ndarray:
-    arr = np.asarray(is_pseudo_bulk)
-    if arr.dtype == object:
-        # Never treat a missing/None marker as False (a real cell) by
-        # default — fail closed on ambiguous provenance.
-        if any(v is None for v in arr.tolist()):
-            raise AssayPolicyError(
-                "assay_policy: is_pseudo_bulk contains None/missing value(s) — row-level "
-                "assay provenance must be an explicit boolean for every row. A missing "
-                "value is never assumed to mean 'real cell'."
+_TRUE_STRINGS = frozenset({"true", "1"})
+_FALSE_STRINGS = frozenset({"false", "0"})
+
+
+def parse_strict_bool_array(values: Sequence, n_hint: Optional[int] = None) -> np.ndarray:
+    """
+    The single canonical strict boolean parser for persisted/user-provided
+    assay provenance (is_pseudo_bulk and anything with the same contract).
+    Deliberately NOT `np.asarray(...).astype(bool)` or `bool(x)` — both of
+    those treat any non-empty string (including "False", "false", "0") as
+    truthy, which would silently turn an explicit "this row is NOT
+    pseudo-bulk" string marker into is_pseudo_bulk=True.
+
+    Accepted:
+      True values  — python bool True, numpy bool_ True, "true", "True", "1"
+      False values — python bool False, numpy bool_ False, "false", "False", "0"
+
+    Rejected (raises InvalidAssayProvenanceError): None/NaN, empty string,
+    any other string, any non-bool/non-string/non-NaN value, and a length
+    that doesn't match n_hint (when given).
+    """
+    # Fast path: already a genuine numpy boolean array — nothing ambiguous
+    # to parse, avoid an O(n) python-level loop over large real datasets.
+    arr_fast = values if isinstance(values, np.ndarray) else None
+    if arr_fast is not None and arr_fast.dtype == np.bool_:
+        if n_hint is not None and len(arr_fast) != n_hint:
+            raise InvalidAssayProvenanceError(
+                f"assay_policy: is_pseudo_bulk has {len(arr_fast)} entries, expected {n_hint}."
             )
-    arr = arr.astype(bool)
-    if n_hint is not None and len(arr) != n_hint:
-        raise AssayPolicyError(
-            f"assay_policy: is_pseudo_bulk has {len(arr)} entries, expected {n_hint}."
+        return arr_fast.astype(bool, copy=True)
+
+    raw = list(values)
+    if n_hint is not None and len(raw) != n_hint:
+        raise InvalidAssayProvenanceError(
+            f"assay_policy: is_pseudo_bulk has {len(raw)} entries, expected {n_hint}."
         )
-    return arr
+
+    out = np.empty(len(raw), dtype=bool)
+    bad_indices = []
+    for i, v in enumerate(raw):
+        parsed = _parse_one_strict_bool(v)
+        if parsed is None:
+            bad_indices.append(i)
+        else:
+            out[i] = parsed
+    if bad_indices:
+        sample = bad_indices[:10]
+        raise InvalidAssayProvenanceError(
+            f"assay_policy: is_pseudo_bulk contains {len(bad_indices)} invalid/missing "
+            f"value(s) at index(es) {sample}{' ...' if len(bad_indices) > 10 else ''} "
+            f"(raw values: {[raw[i] for i in sample]!r}) — every row must carry an "
+            "explicit, unambiguous boolean. NaN/None/empty-string/unrecognized-string "
+            "values are never coerced to a default; 'False' as a string is never "
+            "silently treated as truthy."
+        )
+    return out
+
+
+def _parse_one_strict_bool(v) -> Optional[bool]:
+    """Return True/False for an unambiguous value, or None if `v` cannot be
+    strictly parsed (caller collects these as errors, never guesses)."""
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s in _TRUE_STRINGS or s == "True":
+            return True
+        if s in _FALSE_STRINGS or s == "False":
+            return False
+        return None
+    if isinstance(v, float) and np.isnan(v):
+        return None
+    if v is None:
+        return None
+    # Reject everything else (ints other than 0/1 handled below, objects,
+    # etc.) rather than guessing via a bare bool(v) truthiness check.
+    if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+        if v == 1:
+            return True
+        if v == 0:
+            return False
+        return None
+    return None
+
+
+def _as_bool_array(is_pseudo_bulk: Sequence, n_hint: Optional[int] = None) -> np.ndarray:
+    """Back-compat wrapper around parse_strict_bool_array — kept as the
+    name existing call sites in this module already use."""
+    return parse_strict_bool_array(is_pseudo_bulk, n_hint=n_hint)
 
 
 def assert_rows_match_policy(
@@ -254,6 +352,9 @@ def assert_row_provenance_consistent(assay_mode: Sequence, is_pseudo_bulk: Seque
 
 __all__ = [
     "AssayPolicyError",
+    "MissingAssayProvenanceError",
+    "InvalidAssayProvenanceError",
+    "AssayPolicyMismatchError",
     "BulkTrainingNotImplementedError",
     "MultimodalTrainingNotImplementedError",
     "AssayCapabilities",
@@ -263,5 +364,6 @@ __all__ = [
     "assert_rows_match_policy",
     "assert_row_provenance_present",
     "assert_row_provenance_consistent",
+    "parse_strict_bool_array",
     "ASSAY_POLICY_VERSION",
 ]

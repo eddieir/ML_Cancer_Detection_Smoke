@@ -110,4 +110,12 @@ DEFAULT_ASSAY_POLICY = ASSAY_POLICY_SINGLE_CELL_ONLY
 # every code edit) — recorded on every PreprocessingArtifact/bundle/report so
 # a reload can tell an artifact fit under an older enforcement contract from
 # one fit under the current one. See data/assay_policy.py.
-ASSAY_POLICY_VERSION = "1"
+#
+# "2": missing row-level is_pseudo_bulk provenance now fails closed
+# (MissingAssayProvenanceError) in fit_preprocessing/apply_preprocessing/
+# CellLevelDataset/CellLevelDataset.from_dir, instead of defaulting to
+# all-real-cells outside an explicit diagnostic_mode; require_trainable()
+# is now enforced at every production training entry point rather than
+# only at the loading/manifest boundary. An artifact/bundle recorded with
+# version "1" was fit under the older, more permissive contract.
+ASSAY_POLICY_VERSION = "2"

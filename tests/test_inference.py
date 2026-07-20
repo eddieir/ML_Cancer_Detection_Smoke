@@ -32,6 +32,7 @@ def _h5ad(path, genes, n=20):
     obs = pd.DataFrame({
         "subject_id":   ["s1"] * n,
         "cell_type_id": np.zeros(n, dtype=int),
+        "is_pseudo_bulk": [False] * n,
     }, index=[f"c{i}" for i in range(n)])
     a = ad.AnnData(X=np.random.randn(n, len(genes)).astype("float32"), obs=obs,
                     var=pd.DataFrame(index=genes))
@@ -225,6 +226,7 @@ def test_predict_h5ad_handles_sparse_input():
         obs = pd.DataFrame({
             "subject_id":   ["s1"] * n,
             "cell_type_id": np.zeros(n, dtype=int),
+            "is_pseudo_bulk": [False] * n,
         }, index=[f"c{i}" for i in range(n)])
         a = ad.AnnData(
             X=sp.csr_matrix(np.random.randn(n, len(genes)).astype("float32")),

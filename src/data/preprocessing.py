@@ -367,6 +367,7 @@ def fit_preprocessing(
     minimum_gene_coverage:  float = DEFAULT_MINIMUM_GENE_COVERAGE,
     batch_correction_status: str = "disabled",
     assay_policy:            Optional[str] = None,
+    diagnostic_mode:         bool = False,
 ) -> PreprocessingArtifact:
     """
     Fit gene mean/std scaling + smoke-aware HVG selection using ONLY cells
@@ -381,9 +382,22 @@ def fit_preprocessing(
     apply_preprocessing() against every val/test/inference input — see the
     DEFAULT_* module constants and configs/default.yaml's preprocessing.*
     keys, which must agree with these defaults.
+
+    Row-level assay provenance (obs["is_pseudo_bulk"]) is REQUIRED for a
+    real (diagnostic_mode=False, the default) fit: a missing column raises
+    MissingAssayProvenanceError rather than defaulting to "every cell is
+    real" — a missing column is exactly the failure mode that would let
+    unlabelled bulk/pseudo-bulk rows silently influence the fitted scaling
+    statistics and HVG panel. Pass diagnostic_mode=True only to fit against
+    a deliberately synthetic AnnData that has no assay provenance wired in
+    (e.g. a smoke test) — in that mode only, a missing column defaults to
+    all-real-cells, exactly as it always has for such fixtures.
     """
     from constants import ALL_SMOKE_MARKERS, DEFAULT_ASSAY_POLICY, ASSAY_POLICY_VERSION
-    from data.assay_policy import assert_rows_match_policy, validate_assay_policy
+    from data.assay_policy import (
+        assert_rows_match_policy, validate_assay_policy, parse_strict_bool_array,
+        MissingAssayProvenanceError,
+    )
 
     resolved_assay_policy = validate_assay_policy(assay_policy or DEFAULT_ASSAY_POLICY)
 
@@ -398,13 +412,21 @@ def fit_preprocessing(
     # Assay-policy gate on the exact cells about to be fit — mixed rows
     # must never influence the scaling statistics or HVG selection, even if
     # every upstream gate (source loading, merge_sources) was somehow
-    # bypassed (e.g. a caller building `adata` by hand for a test). Missing
-    # obs["is_pseudo_bulk"] defaults to all-real-cells (legacy fixtures) —
-    # see data/assembly.py::merge_sources's docstring for the same pattern.
-    is_bulk_train = (
-        train_adata.obs["is_pseudo_bulk"].values if "is_pseudo_bulk" in train_adata.obs.columns
-        else np.zeros(train_adata.n_obs, dtype=bool)
-    )
+    # bypassed (e.g. a caller building `adata` by hand for a test).
+    if "is_pseudo_bulk" in train_adata.obs.columns:
+        is_bulk_train = parse_strict_bool_array(
+            train_adata.obs["is_pseudo_bulk"].values, n_hint=train_adata.n_obs,
+        )
+    elif diagnostic_mode:
+        is_bulk_train = np.zeros(train_adata.n_obs, dtype=bool)
+    else:
+        raise MissingAssayProvenanceError(
+            "fit_preprocessing: obs['is_pseudo_bulk'] is missing from the training "
+            "partition — real (non-diagnostic) preprocessing fits require explicit "
+            "row-level assay provenance for every cell. A missing column is never "
+            "assumed to mean 'every cell is real'. Pass diagnostic_mode=True only for "
+            "a deliberately synthetic fixture with no assay provenance."
+        )
     assert_rows_match_policy(
         is_bulk_train, resolved_assay_policy, context="fit_preprocessing (train partition)",
     )
@@ -496,7 +518,9 @@ def fit_preprocessing(
     )
 
 
-def apply_preprocessing(adata: ad.AnnData, artifact: PreprocessingArtifact) -> ad.AnnData:
+def apply_preprocessing(
+    adata: ad.AnnData, artifact: PreprocessingArtifact, diagnostic_mode: bool = False,
+) -> ad.AnnData:
     """
     Transform-only: subset/reorder genes to artifact.gene_list (in that
     exact order) and apply the train-fit mean/std scaling, clipped to
@@ -509,8 +533,12 @@ def apply_preprocessing(adata: ad.AnnData, artifact: PreprocessingArtifact) -> a
     calls with the same inputs produce identical output, and calling this
     on validation data before/after calling it on test data (or vice
     versa) never changes either result.
+
+    diagnostic_mode=True is the ONLY sanctioned way to transform an AnnData
+    with no row-level assay provenance at all (see assert_assay_compatible)
+    — a deliberately synthetic fixture, never real data.
     """
-    assert_assay_compatible(artifact, adata)
+    assert_assay_compatible(artifact, adata, diagnostic_mode=diagnostic_mode)
     diagnostics = verify_compatible(artifact, adata.var_names)
 
     if diagnostics["missing"]:
@@ -749,21 +777,34 @@ def assert_real_assay_provenance(artifact: "PreprocessingArtifact") -> None:
         )
 
 
-def assert_assay_compatible(artifact: "PreprocessingArtifact", adata: ad.AnnData) -> None:
+def assert_assay_compatible(
+    artifact: "PreprocessingArtifact", adata: ad.AnnData, diagnostic_mode: bool = False,
+) -> None:
     """
     Reject transforming an AnnData whose row-level assay provenance doesn't
     match what `artifact` was fit for — a bulk-only artifact applied to
     single-cell input, or vice versa, produces numerically valid but
     scientifically meaningless output (the wrong scaling statistics/HVG
     panel for that modality) without this check. Called by
-    apply_preprocessing() whenever `adata` carries an is_pseudo_bulk column
-    (raw-array callers with no obs — see verify_input_matrix — have no
-    provenance to check and are unaffected).
+    apply_preprocessing() for every AnnData input.
+
+    A REAL (diagnostic_mode=False, the default) input missing
+    obs["is_pseudo_bulk"] entirely raises MissingAssayProvenanceError — it
+    is never treated as "nothing to check, proceed". Only an explicitly
+    diagnostic_mode=True call (a deliberately synthetic fixture) may
+    transform an AnnData with no provenance column at all.
     """
-    from data.assay_policy import assert_rows_match_policy
+    from data.assay_policy import assert_rows_match_policy, MissingAssayProvenanceError
 
     if "is_pseudo_bulk" not in adata.obs.columns:
-        return
+        if diagnostic_mode:
+            return
+        raise MissingAssayProvenanceError(
+            "apply_preprocessing: input AnnData is missing obs['is_pseudo_bulk'] — real "
+            "(non-diagnostic) inference/transform requires explicit row-level assay "
+            "provenance. A missing column is never treated as safe to skip checking. "
+            "Pass diagnostic_mode=True only for a deliberately synthetic fixture."
+        )
     policy = artifact.assay_policy
     if policy is None:
         # Legacy artifact — assert_real_assay_provenance() is responsible

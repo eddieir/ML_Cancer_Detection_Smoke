@@ -75,6 +75,12 @@ def _apply_bool_mask(cell_dataset, mask: np.ndarray):
         subject_ids        = cell_dataset.subject_ids[mask],
         dataset_source      = cell_dataset.dataset_source[mask],
         diagnostic_mode     = cell_dataset.diagnostic_mode,
+        # Preserve row-level assay provenance/policy across this subset —
+        # dropping it here would otherwise force every real caller of
+        # cap_cell_dataset (run_smoke_cv's cell-capped CV path) to hit the
+        # missing-provenance guard on an entirely real dataset.
+        is_pseudo_bulk      = cell_dataset.is_pseudo_bulk[mask],
+        assay_policy        = cell_dataset.assay_policy,
     )
 
 

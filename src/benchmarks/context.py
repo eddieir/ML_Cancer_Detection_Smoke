@@ -140,6 +140,16 @@ def _validate_context(
     # assert_real_assay_provenance / data/assay_policy.py.
     assert_real_assay_provenance(preprocessing_artifact)
 
+    # 3d. the assay policy this artifact was fit under must actually be
+    # trainable — this is the single centralized enforcement point for
+    # every downstream consumer of a real ExperimentContext (Trainer, CV,
+    # OOF, final development fit, source-held-out fitting, domain-
+    # robustness ablation all build on a context constructed here). A
+    # bulk_only/multimodal artifact must never reach the point where a
+    # model/optimizer could be constructed against it.
+    from data.assay_policy import require_trainable as _require_assay_trainable
+    _require_assay_trainable(preprocessing_artifact.assay_policy)
+
     # 4. artifact's embedded label mapping matches the context's label_mapping
     if preprocessing_artifact.label_mapping is not None:
         artifact_mapping = EffectiveLabelMapping.from_dict(preprocessing_artifact.label_mapping)

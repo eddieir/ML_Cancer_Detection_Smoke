@@ -39,6 +39,7 @@ def _cell_dataset_per_subject(subjects_labels, cells_per_subject=20, seed=0):
         malignancy_labels=rng.randint(0, 2, n).astype("float32"),
         cell_type_ids=rng.randint(0, 2, n),
         subject_ids=np.array(subject_ids, dtype=object),
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
 
 

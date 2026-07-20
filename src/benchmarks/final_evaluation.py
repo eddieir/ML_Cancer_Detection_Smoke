@@ -42,7 +42,10 @@ from data.splitting import grouped_kfold
 from train import MILEligibilityError, SubjectLevelDataset, check_mil_eligibility, validate_experiment_partitions
 
 from .baselines import CANCER_BASELINES, CANCER_SEARCH_SPACE, positive_class_proba
-from .cross_validation import MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn, _pathway_cancer_fit_score_fn
+from .cross_validation import (
+    MIL_SEARCH_SPACE, _cancer_baseline_fit_score_fn, _mil_fit_score_fn, _pathway_cancer_fit_score_fn,
+    _require_context_trainable,
+)
 from .features import build_cancer_subject_features
 from .fold_preprocessing import (
     artifact_fingerprint,
@@ -216,6 +219,7 @@ def generate_subject_oof_predictions(
     if a subject's OOF prediction came from a fold that also trained on that
     subject.
     """
+    _require_context_trainable(context)
     normalized_adata = require_normalized_adata(context)
     dev_subjects = sorted({str(s) for s in dev_subjects if str(s) in outcomes_by_subject})
     if len(dev_subjects) < 2:
@@ -352,6 +356,7 @@ def fit_final_candidate_on_dev_pool(
     development subject contributes to gradient updates, with no internal
     validation carve-out for checkpoint selection (blocker 3).
     """
+    _require_context_trainable(context)
     normalized_adata = require_normalized_adata(context)
     dev_subjects = sorted({str(s) for s in dev_subjects if str(s) in outcomes_by_subject})
 

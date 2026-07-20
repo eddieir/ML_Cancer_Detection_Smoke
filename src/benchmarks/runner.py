@@ -100,12 +100,20 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
     Xte, yte, ste, srcte = make_split(test_subj, "sourceA")
 
     n_ct = 4
+    # This entire context is fabricated random data (see the docstring
+    # above) — diagnostic_mode=True is the explicit, narrow opt-out of
+    # real-mode assay-provenance enforcement for exactly this kind of
+    # deliberately synthetic fixture, never inferred from the "synthetic"
+    # naming alone.
     train_ds = CellLevelDataset(Xtr, ytr, np.zeros(len(ytr), dtype="float32"),
-                                 rng.randint(0, n_ct, len(ytr)), subject_ids=str_, dataset_source=srctr)
+                                 rng.randint(0, n_ct, len(ytr)), subject_ids=str_, dataset_source=srctr,
+                                 diagnostic_mode=True)
     val_ds   = CellLevelDataset(Xva, yva, np.zeros(len(yva), dtype="float32"),
-                                 rng.randint(0, n_ct, len(yva)), subject_ids=sva, dataset_source=srcva)
+                                 rng.randint(0, n_ct, len(yva)), subject_ids=sva, dataset_source=srcva,
+                                 diagnostic_mode=True)
     test_ds  = CellLevelDataset(Xte, yte, np.zeros(len(yte), dtype="float32"),
-                                 rng.randint(0, n_ct, len(yte)), subject_ids=ste, dataset_source=srcte)
+                                 rng.randint(0, n_ct, len(yte)), subject_ids=ste, dataset_source=srcte,
+                                 diagnostic_mode=True)
 
     def make_bag(sid, label, n=20):
         return {
@@ -168,6 +176,12 @@ def build_synthetic_context(seed: int = 42, fast: bool = True) -> ExperimentCont
         "subject_id": all_subj, "smoke_type": all_y, "smoke_type_known": True, "cell_type_id": all_ct,
         "malignancy": 0.0, "malignancy_known": False,
         "exposure_dose": -1.0, "source": all_src,
+        # Every synthetic cell here stands in for a real single-cell row —
+        # explicit, not inferred — so fold-level refits (fit_preprocessing,
+        # called on this AnnData by benchmarks/fold_preprocessing.py during
+        # CV/OOF) satisfy real-mode assay-provenance enforcement exactly
+        # like a real merged dataset would.
+        "is_pseudo_bulk": False,
     })
     normalized_adata = ad.AnnData(X=all_X.astype("float32"), obs=obs,
                                     var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]))

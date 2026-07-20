@@ -169,6 +169,7 @@ def test_subset_by_subjects_keeps_one_subjects_cells_entirely_in_one_split():
         malignancy_labels=np.random.randint(0, 2, n).astype("float32"),
         cell_type_ids=np.zeros(n, dtype="int64"),
         subject_ids=subject_ids,
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
     train_ds = ds.subset_by_subjects(["sub_a", "sub_b"])
     val_ds   = ds.subset_by_subjects(["sub_c"])
@@ -187,6 +188,7 @@ def test_subset_by_subjects_preserves_label_alignment():
         malignancy_labels=np.zeros(5, dtype="float32"),
         cell_type_ids=np.zeros(5, dtype="int64"),
         subject_ids=subject_ids,
+        is_pseudo_bulk=np.zeros(5, dtype=bool),
     )
     sub_b = ds.subset_by_subjects(["b"])
     assert sub_b.smoke.tolist() == [2, 3, 4]
@@ -214,6 +216,7 @@ def _real_cell_ds(subject_ids, n_per_subject=20):
         malignancy_labels=np.random.randint(0, 2, n).astype("float32"),
         cell_type_ids=np.zeros(n, dtype="int64"),
         subject_ids=sid_col,
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
 
 
@@ -304,6 +307,7 @@ def test_trainer_phase1_class_weights_computed_from_train_only():
         malignancy_labels=np.zeros(n_tr, dtype="float32"),
         cell_type_ids=np.zeros(n_tr, dtype="int64"),
         subject_ids=np.array(["s1"] * n_tr),
+        is_pseudo_bulk=np.zeros(n_tr, dtype=bool),
     )
     val_ds = CellLevelDataset(
         gene_matrix=np.random.randn(n_va, GENES).astype("float32"),
@@ -311,6 +315,7 @@ def test_trainer_phase1_class_weights_computed_from_train_only():
         malignancy_labels=np.zeros(n_va, dtype="float32"),
         cell_type_ids=np.zeros(n_va, dtype="int64"),
         subject_ids=np.array(["s2"] * n_va),
+        is_pseudo_bulk=np.zeros(n_va, dtype=bool),
     )
     expected = train_ds.smoke_class_weights()
     result = trainer.phase1(train_ds, val_ds)
@@ -591,6 +596,7 @@ def test_phase1_metrics_evaluate_exactly_k_classes_after_merge():
         malignancy_labels=np.zeros(n, dtype="float32"),
         cell_type_ids=np.zeros(n, dtype="int64"),
         subject_ids=np.array([f"s{i}" for i in range(n)]),
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
     val_ds = CellLevelDataset(
         gene_matrix=np.random.randn(n, GENES).astype("float32"),
@@ -598,6 +604,7 @@ def test_phase1_metrics_evaluate_exactly_k_classes_after_merge():
         malignancy_labels=np.zeros(n, dtype="float32"),
         cell_type_ids=np.zeros(n, dtype="int64"),
         subject_ids=np.array([f"t{i}" for i in range(n)]),
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
     result = trainer.phase1(train_ds, val_ds)
     assert "best_smoke_macro_f1" in result

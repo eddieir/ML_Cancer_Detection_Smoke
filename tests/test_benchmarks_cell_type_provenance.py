@@ -199,6 +199,7 @@ def _pipeline_result(artifact: PreprocessingArtifact, n=20) -> dict:
     ds = CellLevelDataset(
         np.random.rand(n, 2).astype("float32"), np.zeros(n, dtype=int),
         np.zeros(n, dtype="float32"), np.zeros(n, dtype=int), subject_ids=all_ids,
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
     train_ids, val_ids, test_ids = all_ids[:14].tolist(), all_ids[14:17].tolist(), all_ids[17:].tolist()
     manifest = SplitManifest(seed=1, train_subjects=train_ids, val_subjects=val_ids, test_subjects=test_ids)
