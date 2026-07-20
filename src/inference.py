@@ -7,10 +7,23 @@ Three roles, one file, zero duplication:
   Predictor (this file)   → predicts on new unlabelled subjects
 
 Entry points:
-  predictor.predict_subject(gene_matrix, cell_type_ids)
-  predictor.predict_batch([{"gene_matrix": X, "cell_type_ids": ct, ...}])
+  predictor.predict_subject(gene_matrix, cell_type_ids,
+                             input_modality="single_cell",
+                             input_assay_policy="single_cell_only",
+                             is_pseudo_bulk=<bool array>)
+  predictor.predict_batch([{"gene_matrix": X, "cell_type_ids": ct,
+                             "input_modality": "single_cell",
+                             "input_assay_policy": "single_cell_only",
+                             "is_pseudo_bulk": <bool array>, ...}])
   predictor.predict_h5ad("subject.h5ad")
   python3 src/inference.py --h5ad subject.h5ad --out results.json
+
+Raw-array prediction (predict_subject/predict_batch) requires the caller to
+declare input_modality/input_assay_policy/is_pseudo_bulk explicitly — a raw
+NumPy matrix carries no biological provenance of its own (see GitHub issue
+#13 and data/assay_policy.py). predict_h5ad() derives this contract from the
+validated H5AD/artifact state itself, so callers of predict_h5ad do not pass
+it directly.
 """
 
 import json
@@ -21,7 +34,7 @@ import numpy as np
 import torch
 import yaml
 
-from constants import CELL_TYPES, N_CELL_TYPES, SMOKE_TYPES
+from constants import CELL_TYPES, DEFAULT_ASSAY_POLICY, N_CELL_TYPES, SMOKE_TYPES
 from data.label_mapping import EffectiveLabelMapping
 from data.preprocessing import ARTIFACT_VERSION
 from metrics import validate_cell_type_ids
@@ -35,6 +48,32 @@ from train import load_checkpoint_into, read_checkpoint_metadata, _label_mapping
 # normalization target, or log-transform parameters, so it cannot reproduce
 # the full raw-count preprocessing chain used at training time.
 VALID_INPUT_STAGES = {"model_ready", "normalized_expression", "raw_counts"}
+
+# assay_policy -> the single input_modality string a raw-array caller must
+# declare to match it. Kept as the one place this correspondence is defined
+# so predict_subject/predict_batch never re-derive it ad hoc.
+_ASSAY_POLICY_TO_MODALITY = {
+    "single_cell_only": "single_cell",
+    "bulk_only":         "bulk",
+    "multimodal":        "multimodal",
+}
+
+
+class PredictorInputContractError(ValueError):
+    """Raised when a raw-array predict_subject()/predict_batch() call omits
+    or misdeclares the required inference-input modality contract
+    (input_modality, input_assay_policy, is_pseudo_bulk) — see
+    predict_subject's docstring and GitHub issue #13. Never silently
+    inferred from matrix shape, gene count, cell-type IDs, subject ID, or
+    any other proxy."""
+
+
+class PredictorBundleCompatibilityError(ValueError):
+    """Raised when a raw-array inference call's declared modality/assay
+    provenance is incompatible with the bundle manifest this Predictor was
+    constructed from (see Predictor.from_bundle / benchmarks/bundle.py::
+    validate_bundle_input_modality). Wraps the underlying
+    BundleValidationError, preserving it as __cause__."""
 
 
 # ─── DRY output formatter ─────────────────────────────────────────────────────
@@ -102,6 +141,7 @@ class Predictor:
         preprocessing_artifact: "Optional[object]" = None,
         unsafe_legacy_mode:     bool = False,
         label_mapping:          Optional["EffectiveLabelMapping"] = None,
+        bundle_manifest:        Optional[Dict] = None,
     ):
         """
         preprocessing_artifact, if given (a data.preprocessing.PreprocessingArtifact),
@@ -114,15 +154,32 @@ class Predictor:
         matrix to the model produces a confident-looking but meaningless
         prediction, and that failure mode must not be silent.
 
+        unsafe_legacy_mode=True marks this Predictor as DIAGNOSTIC-ONLY: it
+        may have been constructed without validating real assay provenance
+        on its checkpoint/artifact (see from_config), so every prediction it
+        produces is stamped "diagnostic": True and must never be exported as
+        a scientific/production result or used to build a model bundle (see
+        write_model_bundle — bundle export from an unsafe-legacy Predictor
+        is refused by the CLI/callers, not by this class alone, since
+        Predictor itself has no bundle-export method).
+
         label_mapping (data.label_mapping.EffectiveLabelMapping), if given,
         is validated against model.num_smoke and used to name smoke classes
         in every predict_* output — None falls back to the fixed six-class
         constants.SMOKE_TYPES (no-merge / legacy default).
+
+        bundle_manifest, if given (the dict returned by
+        benchmarks.bundle.load_and_validate_bundle — see Predictor.from_bundle),
+        is consulted by every raw-array prediction to reject input whose
+        declared modality/assay provenance doesn't match what this bundle
+        was built for (benchmarks.bundle.validate_bundle_input_modality),
+        BEFORE any tensor is created or the model is run.
         """
         self.model  = model.to(device).eval()
         self.device = device
         self.preprocessing_artifact = preprocessing_artifact
         self.unsafe_legacy_mode = unsafe_legacy_mode
+        self.bundle_manifest = bundle_manifest
         if label_mapping is not None and label_mapping.k != self.model.num_smoke:
             raise ValueError(
                 f"Predictor: label_mapping has K={label_mapping.k} effective classes but "
@@ -212,6 +269,33 @@ class Predictor:
                 )
             elif artifact.label_mapping and label_mapping is None:
                 label_mapping = EffectiveLabelMapping.from_dict(artifact.label_mapping)
+
+            # Real (unsafe_legacy_mode=False, the default) direct inference must
+            # reject a legacy/incomplete artifact here — before returning a
+            # usable Predictor — exactly like ExperimentContext does for
+            # training (see benchmarks/context.py::assert_real_assay_provenance).
+            # Without this, a checkpoint directory holding an artifact fit
+            # before issue #13's assay-policy enforcement (missing
+            # assay_policy, missing assay_policy_version, or internally
+            # contradictory provenance) could reach direct inference with no
+            # assay-provenance validation at all. unsafe_legacy_mode=True is
+            # the only sanctioned bypass, and it is diagnostic-only (see
+            # __init__'s docstring) — predictions from it are stamped
+            # "diagnostic": True and must never be described as scientific.
+            from data.preprocessing import CellTypeProvenanceError, assert_real_assay_provenance
+            if not unsafe_legacy_mode:
+                try:
+                    assert_real_assay_provenance(artifact)
+                except CellTypeProvenanceError as exc:
+                    raise CellTypeProvenanceError(
+                        f"Predictor.from_config: preprocessing artifact at {artifact_path} "
+                        f"failed real assay-provenance validation ({exc}). This artifact "
+                        "predates or violates issue #13's assay-policy enforcement and is "
+                        "refused for real (non-diagnostic) inference. Regenerate it with the "
+                        "current pipeline, or pass unsafe_legacy_mode=True to load it anyway "
+                        "for a deliberately disclosed diagnostic run (predictions will be "
+                        "stamped diagnostic and must not be used as a scientific result)."
+                    ) from exc
         elif not unsafe_legacy_mode:
             print("[inference] WARNING: no preprocessing_artifact.json found next to the "
                   "checkpoint — predict_h5ad() will refuse raw/unlabelled input unless "
@@ -220,6 +304,115 @@ class Predictor:
         return cls(model, device, preprocessing_artifact=artifact,
                    unsafe_legacy_mode=unsafe_legacy_mode, label_mapping=label_mapping)
 
+    @classmethod
+    def from_bundle(cls, bundle_dir: Union[str, Path], device: str = "cpu") -> "Predictor":
+        """
+        Construct a Predictor from a Phase 4 model bundle (see
+        benchmarks/bundle.py) — the supported, fully-validated path for
+        deployable inference. Loads and validates the bundle manifest
+        (checkpoint hash, preprocessing-artifact hash/fingerprint/gene
+        count, assay policy) via load_and_validate_bundle(), reconstructs
+        the model from the manifest's model_config, loads checkpoint
+        weights, and stores the validated manifest on the returned
+        Predictor so every subsequent raw-array prediction is checked
+        against it via validate_bundle_input_modality() before any model
+        execution. Never falls back to a second bundle format — this is
+        the one supported bundle-backed construction path. Raises whatever
+        benchmarks.bundle.load_and_validate_bundle raises (LegacyBundleError,
+        BundleCorruptionError, BundleValidationError) for a missing/tampered/
+        legacy bundle — allow_legacy is never set from here, since a bundle-
+        backed Predictor must be a real, reproducible bundle.
+        """
+        from benchmarks.bundle import load_and_validate_bundle
+
+        manifest = load_and_validate_bundle(bundle_dir, allow_legacy=False)
+        artifact = manifest["_artifact"]
+        bundle_root = manifest["_bundle_dir"]
+        ckpt_path = Path(bundle_root) / manifest["model_checkpoint"]["path"]
+
+        label_mapping = None
+        if artifact.label_mapping:
+            label_mapping = EffectiveLabelMapping.from_dict(artifact.label_mapping)
+
+        model = MultiSmokeCancerNet.from_config(
+            manifest.get("model_config", {}),
+            num_smoke_types=label_mapping.k if label_mapping else None,
+        )
+        load_checkpoint_into(model, ckpt_path, device)
+        print(f"[inference] loaded model bundle  ({bundle_root})")
+
+        return cls(
+            model, device, preprocessing_artifact=artifact,
+            unsafe_legacy_mode=False, label_mapping=label_mapping,
+            bundle_manifest=manifest,
+        )
+
+    # ── Modality-contract validation ──────────────────────────────────────────
+
+    def _validate_raw_input_contract(
+        self, n_rows: int, input_modality: str, input_assay_policy: str,
+        is_pseudo_bulk, context: str,
+    ) -> np.ndarray:
+        """
+        The single validation path every raw-array prediction call runs
+        BEFORE any tensor is created or the model is executed (see
+        predict_subject/predict_batch). A raw NumPy matrix carries no
+        biological provenance of its own — input_modality, input_assay_policy,
+        and is_pseudo_bulk must always be supplied explicitly by the caller,
+        never inferred from matrix shape, gene count, cell-type IDs, subject
+        ID, artifact filename, or source name. Returns the strictly-parsed
+        is_pseudo_bulk boolean array.
+        """
+        from data.assay_policy import (
+            AssayPolicyMismatchError, assert_rows_match_policy, parse_strict_bool_array,
+            require_trainable, validate_assay_policy,
+        )
+
+        validate_assay_policy(input_assay_policy)
+        # Only single_cell_only can back this cell-level model — bulk_only/
+        # multimodal raise their typed *NotImplementedError immediately,
+        # regardless of diagnostic_mode (there is no architecture to run
+        # them through, diagnostic or otherwise).
+        require_trainable(input_assay_policy)
+
+        expected_modality = _ASSAY_POLICY_TO_MODALITY[input_assay_policy]
+        if input_modality != expected_modality:
+            raise PredictorInputContractError(
+                f"{context}: input_modality={input_modality!r} does not match "
+                f"input_assay_policy={input_assay_policy!r} (expected "
+                f"input_modality={expected_modality!r}) — modality is never inferred, it must "
+                "be declared consistently."
+            )
+
+        if is_pseudo_bulk is None:
+            raise PredictorInputContractError(
+                f"{context}: is_pseudo_bulk is required for every real raw-array prediction "
+                "call — a raw NumPy matrix carries no biological provenance of its own, so "
+                "row-level assay provenance must always be supplied explicitly, never assumed."
+            )
+        bulk_arr = parse_strict_bool_array(is_pseudo_bulk, n_hint=n_rows)
+        assert_rows_match_policy(bulk_arr, input_assay_policy, context=context)
+
+        if self.preprocessing_artifact is not None and self.preprocessing_artifact.assay_policy is not None \
+                and self.preprocessing_artifact.assay_policy != input_assay_policy:
+            raise AssayPolicyMismatchError(
+                f"{context}: input_assay_policy={input_assay_policy!r} does not match this "
+                f"Predictor's preprocessing_artifact.assay_policy="
+                f"{self.preprocessing_artifact.assay_policy!r} — refusing to run inference "
+                "with a declared modality contract that disagrees with the fitted artifact."
+            )
+
+        if self.bundle_manifest is not None:
+            from benchmarks.bundle import BundleValidationError, validate_bundle_input_modality
+            try:
+                validate_bundle_input_modality(self.bundle_manifest, bulk_arr)
+            except BundleValidationError as exc:
+                raise PredictorBundleCompatibilityError(
+                    f"{context}: {exc}"
+                ) from exc
+
+        return bulk_arr
+
     # ── Core prediction — all other methods call this ─────────────────────────
 
     def predict_subject(
@@ -227,11 +420,36 @@ class Predictor:
         gene_matrix:   np.ndarray,   # [N, genes] float32, preprocessed
         cell_type_ids: np.ndarray,   # [N] int
         subject_id:    str = "subject",
+        *,
+        input_modality:     str,
+        input_assay_policy: str = DEFAULT_ASSAY_POLICY,
+        is_pseudo_bulk,
+        diagnostic_mode:    bool = False,
     ) -> Dict:
         """
         Predict cancer risk for one subject.
         gene_matrix must be preprocessed (log-normalised, HVG-selected, scaled).
+
+        input_modality/input_assay_policy/is_pseudo_bulk are REQUIRED keyword
+        -only arguments declaring this input's biological provenance — a raw
+        NumPy matrix has no gene names, no obs columns, nothing this code can
+        check on its own. input_modality must be "single_cell" (the only
+        modality this cell-level model supports); a declared "bulk"/
+        "multimodal" input_assay_policy raises the typed
+        BulkTrainingNotImplementedError/MultimodalTrainingNotImplementedError
+        before any tensor is created. is_pseudo_bulk (bool array, length N)
+        is parsed with the canonical strict boolean parser and must be
+        entirely False for single_cell_only. If this Predictor was built
+        from a bundle (see from_bundle), the declared provenance is also
+        checked against the bundle's own recorded assay_policy before any
+        model execution. diagnostic_mode=True stamps the returned result
+        "diagnostic": True — it never bypasses any of the checks above.
         """
+        bulk_arr = self._validate_raw_input_contract(
+            n_rows=len(gene_matrix), input_modality=input_modality,
+            input_assay_policy=input_assay_policy, is_pseudo_bulk=is_pseudo_bulk,
+            context=f"predict_subject(subject_id={subject_id!r})",
+        )
         cell_type_ids = validate_cell_type_ids(
             cell_type_ids, self.model.num_cell_types, n_expected=len(gene_matrix),
         )
@@ -240,7 +458,7 @@ class Predictor:
                 torch.FloatTensor(gene_matrix).to(self.device),
                 torch.LongTensor(cell_type_ids).to(self.device),
             )
-        return _format_result(
+        result = _format_result(
             subject_id  = subject_id,
             cancer_prob = out["cancer_probability"].item(),
             attn        = out["attention_weights"].cpu().numpy(),
@@ -248,6 +466,8 @@ class Predictor:
             malignancy  = out["cell_malignancy"].squeeze().cpu().numpy(),
             class_names = self._class_names(),
         )
+        result["diagnostic"] = bool(diagnostic_mode) or bool(self.unsafe_legacy_mode)
+        return result
 
     # ── Batch prediction ──────────────────────────────────────────────────────
 
@@ -256,15 +476,71 @@ class Predictor:
         Predict cancer risk for a list of subjects.
 
         Each dict must contain:
-          gene_matrix   : np.ndarray [N, genes]
-          cell_type_ids : np.ndarray [N]
-          subject_id    : str (optional, defaults to index)
+          gene_matrix         : np.ndarray [N, genes]
+          cell_type_ids        : np.ndarray [N]
+          input_modality        : str  — required, see predict_subject
+          input_assay_policy    : str  — required, see predict_subject
+          is_pseudo_bulk         : array-like [N] bool — required, see predict_subject
+          subject_id             : str (optional, defaults to index)
+          diagnostic_mode         : bool (optional, defaults to False)
+
+        Every subject is validated (modality contract AND cross-subject
+        consistency) BEFORE any subject is predicted — one invalid subject
+        anywhere in the batch rejects the WHOLE batch before a single model
+        forward pass runs, preventing partial prediction output. Mixed
+        input_modality/diagnostic_mode values across the batch are rejected:
+        a batch is one coherent scientific (or one coherent diagnostic) call,
+        never a silent mix of the two.
         """
+        from data.assay_policy import AssayPolicyMismatchError
+
+        # Cheap structural/cross-subject checks FIRST — every subject must
+        # declare the same modality/diagnostic status regardless of whether
+        # any individual subject's declared policy is itself trainable, so a
+        # mixed-modality batch always fails with the same clear error rather
+        # than surfacing whichever subject happens to be validated first.
+        for i, s in enumerate(subjects):
+            missing = [k for k in ("gene_matrix", "cell_type_ids", "input_modality",
+                                    "input_assay_policy", "is_pseudo_bulk") if k not in s]
+            if missing:
+                raise PredictorInputContractError(
+                    f"predict_batch: subject index {i} "
+                    f"({s.get('subject_id', f'subject_{i}')!r}) is missing required key(s) "
+                    f"{missing} — every subject must declare its own modality contract."
+                )
+
+        modalities = {s["input_modality"] for s in subjects}
+        if len(modalities) > 1:
+            raise AssayPolicyMismatchError(
+                f"predict_batch: mixed input_modality values {sorted(modalities)} in one "
+                "batch — every subject in a single predict_batch() call must declare the "
+                "same modality."
+            )
+        diagnostic_flags = {bool(s.get("diagnostic_mode", False)) for s in subjects}
+        if len(diagnostic_flags) > 1:
+            raise AssayPolicyMismatchError(
+                "predict_batch: mixed diagnostic_mode values in one batch — diagnostic status "
+                "must never be mixed with real scientific execution in the same call."
+            )
+
+        # Full per-subject modality-contract validation — still entirely
+        # BEFORE any model forward pass for any subject in the batch.
+        for i, s in enumerate(subjects):
+            self._validate_raw_input_contract(
+                n_rows=len(s["gene_matrix"]), input_modality=s["input_modality"],
+                input_assay_policy=s["input_assay_policy"], is_pseudo_bulk=s["is_pseudo_bulk"],
+                context=f"predict_batch(index={i}, subject_id={s.get('subject_id', f'subject_{i}')!r})",
+            )
+
         return [
             self.predict_subject(
                 s["gene_matrix"],
                 s["cell_type_ids"],
                 s.get("subject_id", f"subject_{i}"),
+                input_modality=s["input_modality"],
+                input_assay_policy=s["input_assay_policy"],
+                is_pseudo_bulk=s["is_pseudo_bulk"],
+                diagnostic_mode=s.get("diagnostic_mode", False),
             )
             for i, s in enumerate(subjects)
         ]
@@ -389,13 +665,41 @@ class Predictor:
             adata.obs[cell_type_col].values, self.model.num_cell_types, n_expected=X.shape[0],
         )
 
+        # predict_h5ad's own contract (checked above by _prepare_model_ready/
+        # _prepare_normalized_expression: gene order, artifact/input_stage
+        # compatibility, unsafe_legacy_mode) already establishes that this
+        # H5AD is single-cell input for this cell-level model — so the
+        # modality/policy declaration handed to predict_batch is fixed
+        # (never re-derived from source name or file path), and row-level
+        # is_pseudo_bulk provenance comes from obs if present, defaulting to
+        # all-real-cells only for a legacy H5AD that predates this column
+        # (the same "missing -> legacy default" convention already used
+        # elsewhere for smoke_type_known/malignancy_known in this file's
+        # data pipeline, NOT a silent guess about a raw unlabeled matrix).
+        from data.assay_policy import parse_strict_bool_array
+        input_assay_policy = (
+            self.preprocessing_artifact.assay_policy
+            if self.preprocessing_artifact is not None and self.preprocessing_artifact.assay_policy
+            else DEFAULT_ASSAY_POLICY
+        )
+        if "is_pseudo_bulk" in adata.obs.columns:
+            all_is_pseudo_bulk = parse_strict_bool_array(
+                adata.obs["is_pseudo_bulk"].values, n_hint=adata.n_obs,
+            )
+        else:
+            all_is_pseudo_bulk = np.zeros(adata.n_obs, dtype=bool)
+
         subjects = []
         for sid in adata.obs[subject_col].unique():
             mask = (adata.obs[subject_col] == sid).values
             subjects.append({
-                "subject_id":    str(sid),
-                "gene_matrix":   X[mask],
-                "cell_type_ids": all_cell_type_ids[mask],
+                "subject_id":         str(sid),
+                "gene_matrix":        X[mask],
+                "cell_type_ids":      all_cell_type_ids[mask],
+                "input_modality":     "single_cell",
+                "input_assay_policy": input_assay_policy,
+                "is_pseudo_bulk":     all_is_pseudo_bulk[mask],
+                "diagnostic_mode":    self.unsafe_legacy_mode,
             })
 
         print(f"[inference] {len(subjects)} subjects from {Path(h5ad_path).name}"
@@ -612,6 +916,10 @@ if __name__ == "__main__":
         np.random.randn(n, GENES).astype("float32"),
         np.random.randint(0, N_CELL_TYPES, n),
         subject_id="test_subject",
+        input_modality="single_cell",
+        input_assay_policy="single_cell_only",
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
+        diagnostic_mode=True,
     )
     assert r["subject_id"]         == "test_subject"
     assert 0.0 <= r["cancer_probability"] <= 1.0
@@ -625,9 +933,13 @@ if __name__ == "__main__":
     # ── predict_batch ─────────────────────────────────────────────────────────
     subjects = [
         {
-            "subject_id":    f"batch_sub_{i}",
-            "gene_matrix":   (X := np.random.randn(n := random.randint(40, 100), GENES).astype("float32")),
-            "cell_type_ids": np.random.randint(0, N_CELL_TYPES, n),
+            "subject_id":         f"batch_sub_{i}",
+            "gene_matrix":        (X := np.random.randn(n := random.randint(40, 100), GENES).astype("float32")),
+            "cell_type_ids":      np.random.randint(0, N_CELL_TYPES, n),
+            "input_modality":     "single_cell",
+            "input_assay_policy": "single_cell_only",
+            "is_pseudo_bulk":     np.zeros(n, dtype=bool),
+            "diagnostic_mode":    True,
         }
         for i in range(5)
     ]

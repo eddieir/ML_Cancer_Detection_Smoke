@@ -793,6 +793,16 @@ def assert_assay_compatible(
     is never treated as "nothing to check, proceed". Only an explicitly
     diagnostic_mode=True call (a deliberately synthetic fixture) may
     transform an AnnData with no provenance column at all.
+
+    An artifact with no recorded assay_policy (artifact.assay_policy is
+    None — it predates issue #13's enforcement, or was fit under the
+    former mixed pipeline) is a LEGACY/incomplete artifact. In real
+    (diagnostic_mode=False) mode this now raises MissingAssayProvenanceError
+    instead of silently returning — a legacy artifact must never be treated
+    as "nothing to check" during real transform/inference. Only an explicit
+    diagnostic_mode=True call may proceed with an unrecorded policy, and
+    even then row-level provenance (if present) is still validated once a
+    policy is known.
     """
     from data.assay_policy import assert_rows_match_policy, MissingAssayProvenanceError
 
@@ -807,12 +817,20 @@ def assert_assay_compatible(
         )
     policy = artifact.assay_policy
     if policy is None:
-        # Legacy artifact — assert_real_assay_provenance() is responsible
-        # for rejecting it for any real context; a raw apply_preprocessing()
-        # call (e.g. from a diagnostic script) is not blocked here on that
-        # basis alone, but cannot meaningfully be checked against a policy
-        # that was never recorded.
-        return
+        if diagnostic_mode:
+            # Deliberately synthetic call against an artifact with no
+            # recorded policy — nothing more can be checked, but this can
+            # never happen for a real ExperimentContext (see
+            # assert_real_assay_provenance, called separately for that path).
+            return
+        raise MissingAssayProvenanceError(
+            "apply_preprocessing: preprocessing_artifact has no recorded assay_policy — this "
+            "is a legacy artifact that predates issue #13's assay-policy enforcement (or was "
+            "fit under the former mixed single-cell/pseudo-bulk pipeline). A legacy artifact "
+            "is never treated as 'nothing to check' during real (non-diagnostic) transform/"
+            "inference. Regenerate the artifact with the current pipeline, or pass "
+            "diagnostic_mode=True only for a deliberately synthetic/diagnostic call."
+        )
     assert_rows_match_policy(
         adata.obs["is_pseudo_bulk"].values, policy,
         context=f"apply_preprocessing (artifact assay_policy={policy!r})",

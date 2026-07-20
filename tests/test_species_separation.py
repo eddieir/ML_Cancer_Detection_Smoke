@@ -71,13 +71,13 @@ def test_merge_sources_refuses_to_mix_species_under_default_mode():
     human = _mini_adata(SPECIES_HUMAN, "h")
     mouse = _mini_adata(SPECIES_MOUSE, "mouse::m")
     with pytest.raises(SpeciesPolicyError):
-        merge_sources(human, mouse, scale=False)  # default experiment_mode=human_only
+        merge_sources(human, mouse, scale=False, diagnostic_mode=True)  # default experiment_mode=human_only
 
 
 def test_merge_sources_allows_pure_human_under_default_mode():
     human1 = _mini_adata(SPECIES_HUMAN, "h1")
     human2 = _mini_adata(SPECIES_HUMAN, "h2")
-    merged = merge_sources(human1, human2, scale=False)
+    merged = merge_sources(human1, human2, scale=False, diagnostic_mode=True)
     assert merged.n_obs == human1.n_obs + human2.n_obs
 
 
@@ -85,7 +85,8 @@ def test_merge_sources_allows_mixed_species_when_explicitly_opted_in():
     human = _mini_adata(SPECIES_HUMAN, "h")
     mouse = _mini_adata(SPECIES_MOUSE, "mouse::m")
     merged = merge_sources(
-        human, mouse, scale=False, experiment_mode=EXPERIMENT_MODE_CROSS_SPECIES_PRETRAINING
+        human, mouse, scale=False, experiment_mode=EXPERIMENT_MODE_CROSS_SPECIES_PRETRAINING,
+        diagnostic_mode=True,
     )
     assert merged.n_obs == human.n_obs + mouse.n_obs
 

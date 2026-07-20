@@ -184,18 +184,33 @@ def test_renamed_bulk_source_still_rejected_even_under_innocuous_filename(tmp_pa
 
 # ─── Row-level provenance failures ──────────────────────────────────────────
 
-def test_missing_is_pseudo_bulk_column_defaults_to_real_cells_not_a_bypass():
-    """A legacy fixture with no is_pseudo_bulk column at all is treated as
-    real single cells (documented backward-compatible default), not
-    silently rejected outright — but this must never be relied on to
-    smuggle real bulk data through; it only applies when the column is
-    truly absent."""
+def test_missing_is_pseudo_bulk_column_rejected_in_real_mode():
+    """A legacy/hand-built fixture with no is_pseudo_bulk column at all must
+    be REJECTED for real (non-diagnostic) assembly, never silently treated
+    as 'every row is a real cell' — that legacy-default behaviour was
+    exactly the bypass this module exists to close (see
+    data/assembly.py::merge_sources)."""
+    from data.assembly import merge_sources
+    from data.assay_policy import MissingAssayProvenanceError
+
+    a = _mini_adata(n=10)
+    del a.obs["is_pseudo_bulk"]
+    with pytest.raises(MissingAssayProvenanceError):
+        merge_sources(a, scale=False)
+
+
+def test_missing_is_pseudo_bulk_column_allowed_only_in_explicit_diagnostic_mode():
+    """The ONLY sanctioned way to merge a source with no is_pseudo_bulk
+    column is an explicit diagnostic_mode=True call — it then becomes an
+    explicit, synthetic all-False array, stamped on the merged output."""
     from data.assembly import merge_sources
 
     a = _mini_adata(n=10)
     del a.obs["is_pseudo_bulk"]
-    merged = merge_sources(a, scale=False)
+    merged = merge_sources(a, scale=False, diagnostic_mode=True)
     assert merged.n_obs == 10
+    assert merged.uns["diagnostic_mode"] is True
+    assert not merged.obs["is_pseudo_bulk"].any()
 
 
 def test_mixed_anndata_fails_before_preprocessing_fit():

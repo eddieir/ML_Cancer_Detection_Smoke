@@ -1258,16 +1258,22 @@ output is):
   check as a second signal.
 - `data/assembly.py::merge_sources`/`assemble_subject_bags`/
   `export_cell_dataset` — each independently re-checks `is_pseudo_bulk`
-  against `assay_policy` when the column is present. **Known open gap:**
-  unlike `fit_preprocessing`/`apply_preprocessing`/`CellLevelDataset`
-  above, these three still default a genuinely MISSING `is_pseudo_bulk`
-  column to all-`False` rather than failing closed — real callers are
-  unaffected in practice (`preprocess.py::_load_all_sources` already
-  guarantees the column is present before any of these run, and
-  `_load_all_sources` itself fails closed on a missing column), but a
-  hand-built AnnData passed directly to one of these three functions can
-  still hit the legacy default. Tightening this to match the rest of the
-  module is tracked as follow-up work, not yet done.
+  against `assay_policy`, and now REQUIRES the column in real
+  (`diagnostic_mode=False`, the default) mode: a genuinely MISSING
+  `is_pseudo_bulk` column raises `MissingAssayProvenanceError` rather than
+  defaulting to all-`False`, matching `fit_preprocessing`/
+  `apply_preprocessing`/`CellLevelDataset`. Only an explicit
+  `diagnostic_mode=True` caller may fall back to a synthetic all-False
+  array (stamped `uns["diagnostic_mode"]=True` on the merged output, and
+  `diagnostic_mode`/`assay_policy`/`assay_policy_version` on every bag and
+  in `export_cell_dataset`'s `dataset_metadata.json`), so a hand-built or
+  corrupted AnnData passed directly to any of these three functions can no
+  longer smuggle unlabelled rows through as "every row is a real cell".
+  `export_cell_dataset` validates before writing anything, so a rejected
+  call leaves no partial output directory on disk. `assemble_subject_bags`/
+  `export_cell_dataset` also call `require_trainable(assay_policy)`
+  directly, since a per-cell MIL bag or cell-level export has no meaning
+  under `bulk_only`/`multimodal` regardless of `diagnostic_mode`.
 - `data/preprocessing.py::fit_preprocessing` — REQUIRES `is_pseudo_bulk` on
   the train partition unless `diagnostic_mode=True`; a missing column
   raises `MissingAssayProvenanceError` rather than defaulting to
@@ -1301,16 +1307,32 @@ output is):
   artifact's own value; an explicit mismatch is rejected at write time);
   reload cross-checks the manifest's recorded value against the loaded
   artifact's. `validate_bundle_input_modality()` rejects an input whose
-  `is_pseudo_bulk` doesn't match the bundle's declared policy — this
-  function is unit-tested directly but is **not currently called from
-  `inference.py`'s `Predictor`**, which has no `from_bundle`/
-  `load_and_validate_bundle` integration at all; AnnData inference through
-  `Predictor.predict_h5ad` is still protected because it always goes
-  through `apply_preprocessing`/`assert_assay_compatible`, but a
-  bundle-declared modality is not independently re-checked at prediction
-  time today. `Predictor.predict_subject`/`predict_batch` (raw-array
-  input) perform no assay/modality check at all — treat both as an open
-  gap, not a implemented guarantee, until they're wired up.
+  `is_pseudo_bulk` doesn't match the bundle's declared policy, and is now
+  wired into real inference via `inference.py::Predictor.from_bundle()` —
+  the supported bundle-backed construction path loads and validates the
+  manifest, and stores it on the returned `Predictor` so every subsequent
+  raw-array prediction is checked against it before any model execution.
+  AnnData inference through `Predictor.predict_h5ad` remains protected via
+  `apply_preprocessing`/`assert_assay_compatible` as before.
+  `Predictor.predict_subject`/`predict_batch` (raw-array input) now REQUIRE
+  keyword-only `input_modality`/`input_assay_policy`/`is_pseudo_bulk`
+  (`predict_batch` additionally requires `diagnostic_mode` to agree across
+  every subject in the call) — a raw NumPy matrix carries no biological
+  provenance of its own, so these are never inferred from matrix shape,
+  gene count, cell-type IDs, subject ID, or bundle/artifact metadata. Both
+  validate the full declared contract (modality/policy consistency, row
+  count, strict-parsed `is_pseudo_bulk`, the artifact's own recorded
+  `assay_policy`, and — if this `Predictor` came from `from_bundle()` —
+  the bundle manifest) before any tensor is created or the model runs;
+  `predict_batch` validates every subject in the batch before predicting
+  any of them, so one invalid subject anywhere rejects the whole batch
+  with zero partial predictions. `Predictor.from_config()` similarly
+  rejects a legacy/incomplete `PreprocessingArtifact` (`assay_policy is
+  None`) for real inference, raising `CellTypeProvenanceError` unless the
+  caller explicitly passes `unsafe_legacy_mode=True` — every prediction
+  produced by an unsafe-legacy or `diagnostic_mode=True` call is stamped
+  `"diagnostic": True` in its result and must never be treated as a
+  scientific/production output.
 - `preprocess.py::run_pipeline`/`run_pipeline_split_aware` and
   `ExperimentContext.from_pipeline_result` call
   `data/assay_policy.py::require_trainable` before doing any real work —

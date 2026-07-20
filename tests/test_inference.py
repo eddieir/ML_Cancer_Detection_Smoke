@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from constants import N_CELL_TYPES
+from constants import ASSAY_POLICY_SINGLE_CELL_ONLY, ASSAY_POLICY_VERSION, N_CELL_TYPES
 from data.label_mapping import build_effective_label_mapping
 from data.preprocessing import PreprocessingArtifact
 from inference import Predictor, VALID_INPUT_STAGES
@@ -25,6 +25,10 @@ def _artifact(genes):
         gene_means=[0.0] * len(genes), gene_stds=[1.0] * len(genes),
         n_hvgs=len(genes), smoke_marker_genes_forced=[],
         fit_n_cells=100, fit_n_subjects=10,
+        assay_policy=ASSAY_POLICY_SINGLE_CELL_ONLY,
+        assay_policy_version=ASSAY_POLICY_VERSION,
+        pseudo_bulk_rows_present_at_fit=False,
+        training_data_modality="single_cell",
     )
 
 
@@ -210,6 +214,8 @@ def test_predict_subject_rejects_fractional_cell_type_id():
         predictor.predict_subject(
             np.random.randn(4, GENES).astype("float32"),
             np.array([0.0, 1.5, 2.0, 0.0]),
+            input_modality="single_cell", input_assay_policy="single_cell_only",
+            is_pseudo_bulk=np.zeros(4, dtype=bool),
         )
 
 
@@ -419,6 +425,8 @@ def test_predictor_smoke_profile_uses_wired_mapping_class_names():
     r = predictor.predict_subject(
         np.random.randn(n, GENES).astype("float32"),
         np.random.randint(0, N_CELL_TYPES, n),
+        input_modality="single_cell", input_assay_policy="single_cell_only",
+        is_pseudo_bulk=np.zeros(n, dtype=bool),
     )
     assert set(r["smoke_profile"].keys()) == set(mapping.class_names)
     assert "cigar" not in r["smoke_profile"]

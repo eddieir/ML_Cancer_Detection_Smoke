@@ -225,7 +225,16 @@ class CellLevelDataset(Dataset):
         rather than silently loading with relaxed assumptions.
         diagnostic_mode=True keeps the old permissive behaviour for
         deliberately synthetic on-disk fixtures.
+
+        If dataset_metadata.json (written by export_cell_dataset()) is
+        present, its recorded assay_policy/diagnostic_mode are cross-checked
+        against the row-level cell_metadata.csv provenance and against the
+        caller's own diagnostic_mode — a disagreement (e.g. a hand-edited
+        metadata file, or loading a diagnostic export as diagnostic_mode=
+        False) raises LegacyCellDatasetDirectoryError rather than silently
+        trusting one source over the other.
         """
+        import json as _json
         import pandas as pd
         from data.assay_policy import parse_strict_bool_array
 
@@ -234,10 +243,17 @@ class CellLevelDataset(Dataset):
         malig_known_path = d / "malignancy_known.npy"
         smoke_known_path = d / "smoke_labels_known.npy"
         meta_path = d / "cell_metadata.csv"
+        dataset_meta_path = d / "dataset_metadata.json"
 
         subject_ids = None
         dataset_source = None
         is_pseudo_bulk = None
+        resolved_assay_policy = DEFAULT_ASSAY_POLICY
+
+        dataset_meta = None
+        if dataset_meta_path.exists():
+            with open(dataset_meta_path) as f:
+                dataset_meta = _json.load(f)
 
         if not diagnostic_mode:
             if not meta_path.exists():
@@ -262,6 +278,25 @@ class CellLevelDataset(Dataset):
             subject_ids = meta["subject_id"].astype(str).values
             dataset_source = meta["source"].astype(str).values
             is_pseudo_bulk = parse_strict_bool_array(meta["is_pseudo_bulk"].values, n_hint=len(meta))
+
+            if dataset_meta is not None:
+                if dataset_meta.get("diagnostic_mode", False):
+                    raise LegacyCellDatasetDirectoryError(
+                        f"CellLevelDataset.from_dir({d}): dataset_metadata.json declares "
+                        "diagnostic_mode=True, but this call requested real (non-diagnostic) "
+                        "loading — a diagnostic export must not be loaded as a real dataset. "
+                        "Pass diagnostic_mode=True explicitly if this is intentional."
+                    )
+                meta_policy = dataset_meta.get("assay_policy")
+                row_bulk_present = bool(is_pseudo_bulk.any())
+                if meta_policy is not None and meta_policy == "single_cell_only" and row_bulk_present:
+                    raise LegacyCellDatasetDirectoryError(
+                        f"CellLevelDataset.from_dir({d}): dataset_metadata.json records "
+                        "assay_policy='single_cell_only' but cell_metadata.csv contains "
+                        "pseudo-bulk row(s) — row-level and dataset-level provenance disagree."
+                    )
+                if meta_policy is not None:
+                    resolved_assay_policy = meta_policy
         elif meta_path.exists():
             meta = pd.read_csv(meta_path)
             if "subject_id" in meta.columns:
@@ -283,6 +318,7 @@ class CellLevelDataset(Dataset):
             dataset_source    = dataset_source,
             diagnostic_mode   = diagnostic_mode,
             is_pseudo_bulk    = is_pseudo_bulk,
+            assay_policy      = resolved_assay_policy,
         )
 
     def smoke_class_weights(self, num_classes: int = N_SMOKE_CLASSES) -> torch.Tensor:

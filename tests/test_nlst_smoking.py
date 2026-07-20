@@ -322,7 +322,9 @@ def test_unknown_cancer_outcome_and_unknown_smoke_history_are_independent():
 
     # p1 has a KNOWN cancer outcome, p2 does not — independent of smoke history.
     outcomes = pd.DataFrame({"subject_id": ["p1"], "cancer_label": [1]})
-    bags = {b["subject_id"]: b for b in assemble_subject_bags(merged, outcomes, min_cells_per_subject=1)}
+    bags = {b["subject_id"]: b for b in assemble_subject_bags(
+        merged, outcomes, min_cells_per_subject=1, diagnostic_mode=True,
+    )}
 
     assert bags["p1"]["cancer_label_known"] is True
     assert bool(bags["p1"]["smoke_known"][0]) is True
