@@ -2504,11 +2504,18 @@ path must call before emitting a clinical-readiness claim; it raises
 
 ### 17.5 What Phase 7 does not implement
 
-The Track A/B/C evaluation runners, the leakage-safe real-data pipeline
-integration, the external-validation sentinel's runnable code path, the
-full `artifacts/evidence/<run_id>/` bundle structure, and the
-`evidence.runner` CLI's `development`/`internal-test`/`external-test`
-subcommands are not implemented — every one of them requires real,
-eligible data that the audit CLI confirms does not exist in this
-environment. See `docs/EVIDENCE_PROTOCOL.md` for the complete list and
-reasoning.
+`evidence/external_validation.py` (`ExternalValidationGate`,
+`evaluate_external_cohort_eligibility()`), `evidence/calibration.py`
+(frozen calibration/thresholding, `decision_curve_analysis()`),
+`evidence/artifact_bundle.py` (the immutable `artifacts/evidence/<run_id>/`
+writer/reader), and `evidence/runner.py` (the `python -m evidence.runner`
+CLI: `audit`/`inspect`/`validate`/`clinical-readiness` fully implemented;
+`development`/`internal-test`/`external-test` are honest stubs) are all
+implemented and tested against synthetic fixtures and the real (currently
+empty-of-external-cohorts) registry. What remains unimplemented is the
+leakage-safe real-data pipeline integration (Steps 8-10) that would
+produce genuine development/internal-test/external-test predictions for
+these modules to run against, and — as a direct consequence — a real
+external cohort to release through the gate, since the audit CLI confirms
+no locally eligible real dataset exists in this environment. See
+`docs/EVIDENCE_PROTOCOL.md` for the complete list and reasoning.
