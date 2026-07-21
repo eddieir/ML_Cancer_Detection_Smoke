@@ -114,6 +114,25 @@ calibration_policy:
     - specificity_constrained
     - predeclared_fixed
 
+# Step 10 — repeated-resampling uncertainty policy enforced by
+# src/evidence/uncertainty.py. min_independent_cohorts is the minimum
+# number of distinct dataset sources observed across a repeated-resampling
+# run's development subjects before this repository will report a
+# source-level uncertainty status other than "insufficient evidence for
+# reliable source-level uncertainty" — repeated resampling of subjects
+# drawn from very few cohorts cannot honestly speak to how the model
+# behaves across sources it has never seen.
+uncertainty_policy:
+  min_independent_cohorts: 3
+  min_repeats_for_ci: 2
+
+# Step 13 — subgroup/fairness diagnostic policy enforced by
+# src/evidence/subgroups.py. A subgroup value with fewer than this many
+# subjects is marked not_evaluable rather than reported with an unstable
+# metric estimate.
+subgroup_policy:
+  min_subjects_per_subgroup: 10
+
 notes:
   - "not_evaluable is the only sanctioned representation of missing evidence — never 0, false, an empty metric dict, NaN without explanation, or a warning attached to a fabricated result."
   - "development_only_flag=true reports can never claim internal_held_out_real_data or stronger."
