@@ -76,3 +76,38 @@ class OutcomeExpressionLinkageError(EvidenceContractError):
 class EndpointDefinitionError(EvidenceContractError):
     """Raised when a report's endpoint definition is missing required
     fields (time horizon, censoring semantics, event indicator, etc.)."""
+
+
+class InternalSplitMislabeledAsExternalError(EvidenceContractError):
+    """Raised when a candidate 'external' cohort is actually the same
+    cohort as development, or shares subject IDs with the development
+    subject set — i.e. an internal held-out split masquerading as external
+    validation. Deliberately a distinct class from
+    ExternalValidationRequiredError, so callers (and tests) can tell "you
+    handed me an internal split" apart from "no external cohort exists at
+    all yet" — the two require completely different remediation."""
+
+
+class ArtifactBundleError(EvidenceContractError):
+    """Base class for evidence/artifact_bundle.py failures: writing into an
+    already-completed run directory, a missing/checksum-mismatched file
+    referenced by manifest.json, or a corrupt manifest."""
+
+
+class RunAlreadyCompleteError(ArtifactBundleError):
+    """Raised when code attempts to write any file into a run directory
+    whose manifest.json already records run_status='complete' — a
+    completed evidence run directory is immutable."""
+
+
+class ArtifactValidationError(ArtifactBundleError):
+    """Raised by the artifact-bundle reader/validator when a file listed in
+    manifest.json is missing or its checksum does not match."""
+
+
+class EvidenceRunnerUsageError(EvidenceContractError):
+    """Raised by evidence.runner for an unsupported flag combination, an
+    unrecognized subcommand, or a --diagnostic-mode flag passed to any real
+    (non-audit) subcommand — real evidence execution never accepts
+    diagnostic_mode, consistent with how the rest of this repository
+    treats diagnostic_mode (see src/data/assay_policy.py)."""
