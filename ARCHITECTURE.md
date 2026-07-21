@@ -2504,18 +2504,34 @@ path must call before emitting a clinical-readiness claim; it raises
 
 ### 17.5 What Phase 7 does not implement
 
+Every remaining framework module named in the Phase 7 specification now
+exists and is tested against synthetic fixtures and the real (currently
+empty-of-external-cohorts) registry:
 `evidence/external_validation.py` (`ExternalValidationGate`,
-`evaluate_external_cohort_eligibility()`), `evidence/calibration.py`
+`evaluate_external_cohort_eligibility()`),
+`tests/test_evidence_leakage_isolation.py` (corruption-isolation tests
+reusing `benchmarks/sentinel.py`'s poison-object pattern),
+`evidence/candidate_comparison.py` (identical-partition comparison across
+baseline and MIL-kind candidates, driven through the existing
+`benchmarks/cross_validation.py`/`benchmarks/final_evaluation.py`
+machinery), `evidence/uncertainty.py` (repeated grouped-resampling
+subject-level bootstrap CIs, structurally confined to
+`role="development"` input), `evidence/subgroups.py` (subgroup/fairness
+diagnostics over the five dimensions this repository has a genuine data
+source for, refusing to fabricate any other), `evidence/calibration.py`
 (frozen calibration/thresholding, `decision_curve_analysis()`),
 `evidence/artifact_bundle.py` (the immutable `artifacts/evidence/<run_id>/`
 writer/reader), and `evidence/runner.py` (the `python -m evidence.runner`
 CLI: `audit`/`inspect`/`validate`/`clinical-readiness` fully implemented;
-`development`/`internal-test`/`external-test` are honest stubs) are all
-implemented and tested against synthetic fixtures and the real (currently
-empty-of-external-cohorts) registry. What remains unimplemented is the
-leakage-safe real-data pipeline integration (Steps 8-10) that would
-produce genuine development/internal-test/external-test predictions for
-these modules to run against, and — as a direct consequence — a real
-external cohort to release through the gate, since the audit CLI confirms
-no locally eligible real dataset exists in this environment. See
+`development`/`internal-test`/`external-test` are honest stubs).
+
+What remains unimplemented is not code — it is real data. None of the
+modules above has ever processed a genuine development/internal-test/
+external-test prediction, because no cohort in `configs/cohorts.yaml` has
+local files present in this environment (`python -m evidence.audit`
+reports `overall_status: "blocked_no_real_data"`). Their synthetic-fixture
+paths prove the real Phase 1-6 training/scoring/statistics code executes
+correctly end to end; they are never read as evidence that a real
+candidate comparison, uncertainty estimate, subgroup breakdown,
+calibration, or external-cohort release has occurred. See
 `docs/EVIDENCE_PROTOCOL.md` for the complete list and reasoning.

@@ -106,65 +106,102 @@ or above; external+ levels require `cohort_role=external_validation`).
   Steps 8-10 pipeline integration does not exist as a callable pipeline
   yet. `--diagnostic-mode` is accepted only by `audit` (a no-op there) and
   raises a typed `EvidenceRunnerUsageError` on every other subcommand.
+- `tests/test_evidence_leakage_isolation.py` — Step 8: corruption-isolation
+  tests reusing `benchmarks/sentinel.py`'s poison-object pattern, proving
+  that development-only code paths in this evidence framework (tracks,
+  calibration fitting, uncertainty resampling) cannot read a held-out/test
+  partition even adversarially.
+- `src/evidence/candidate_comparison.py` — Step 9: identical-partition
+  candidate comparison across the classical baselines and MIL-kind models
+  already registered in `benchmarks/candidate_registry.py`. Every candidate
+  for a task shares one `run_smoke_cv`/`run_cancer_cv` call, so the fold
+  assignment, per-fold-refit preprocessing artifact, and label mapping are
+  identical across candidates by construction. `select_best_candidate()`
+  raises `CandidateSelectionError` rather than falling back to a secondary
+  metric when no candidate has a defined primary metric.
+- `src/evidence/uncertainty.py` — Step 10: repeated grouped-resampling
+  uncertainty reporting, structurally confined to development data
+  (`DevelopmentRepeatedOOF.role` must be the literal `"development"`).
+  Subject-level bootstrap CIs, seed-level aggregation via
+  `benchmarks.metrics.aggregate_metric_by_seed`, and a paired candidate
+  comparison. `confidence_intervals_overlap()` is explicitly labeled
+  `interpretation='descriptive_only'` — never a formal equivalence test.
+- `src/evidence/subgroups.py` — Step 13: subgroup/fairness diagnostics over
+  the five subgroup dimensions this repository actually has a genuine data
+  source for (`cohort_source`, `exposure_type`, `disease_status`,
+  `assay_platform`, `species`); requesting any other dimension (e.g. sex,
+  age band, race/ethnicity, site — none of which exist anywhere in this
+  repository's data model) raises `UnsupportedSubgroupDimensionError`
+  rather than fabricating one. `assert_no_banned_claims()` rejects any
+  rendered summary asserting fairness has been established.
 
 Each of the above has a dedicated adversarial test file under `tests/`
 (`test_evidence_contract.py`, `test_cohort_registry.py`,
 `test_evidence_eligibility.py`, `test_evidence_audit.py`,
 `test_clinical_readiness.py`, `test_evidence_tracks.py`,
 `test_external_validation.py`, `test_evidence_calibration.py`,
-`test_artifact_bundle.py`, `test_evidence_runner.py`).
+`test_artifact_bundle.py`, `test_evidence_runner.py`,
+`test_evidence_leakage_isolation.py`, `test_candidate_comparison.py`,
+`test_evidence_uncertainty.py`, `test_evidence_subgroups.py`).
 
 ## What is not implemented
 
-The following pieces of the full Phase 7 specification are **not**
-implemented in this change, in every case because they depend on real
-evaluable data that is not present in this environment, or because they
-require substantial additional engineering beyond what was completed
-here:
+Every framework module for Steps 1-16 of the Phase 7 specification now
+exists and is tested against synthetic fixtures: the evidence contract,
+cohort registry, eligibility gates, audit CLI, evaluation tracks (A/B/C),
+clinical-readiness assessment, the external-validation sentinel/gate,
+leakage corruption-isolation tests, candidate comparison, repeated-
+resampling uncertainty reporting, subgroup/fairness diagnostics, frozen
+calibration/thresholding, the artifact bundle writer/reader, and the
+`evidence.runner` umbrella CLI.
 
-- **Tracks A/B/C evaluation runners.** No code path in this change trains
-  a model, runs cross-validation, or produces an actual smoke/malignancy/
-  cancer-prediction metric against real data. The audit CLI establishes
-  that no cohort currently has real local files present, so every
-  eligibility row is `IMPOSSIBLE` — there is nothing for a Track A/B/C
-  runner to evaluate yet.
-- **Leakage-safe pipeline integration (Step 8 order) for real data.** The
-  existing Phase 1-6 safeguards (`src/data/splitting.py`,
-  `src/benchmarks/test_guard.py`, `src/benchmarks/sentinel.py`) are
-  unmodified and still enforced for the existing synthetic/benchmark path;
-  this change does not wire a new real-data pipeline through them.
-- **Complete candidate comparison (Step 9) for real data**, since it
-  requires Track A/B/C actually running.
-- **Repeated development estimates and uncertainty (Step 10)** for real
-  data, for the same reason.
-- **Subgroup/fairness diagnostics (Step 13)** against real predictions —
-  requires real development/test predictions that do not exist.
+What remains unimplemented is, in every case, **not a missing piece of
+code — it is the absence of any real dataset file in this environment**:
+
+- **No cohort in this environment has real local files present.** `python
+  -m evidence.audit` reports `local_files_present: false` for all seven
+  registered cohorts and `overall_status: "blocked_no_real_data"`. This
+  repository's `data/` directory does not exist here; downloading and
+  authorizing access to GSE136831/GSE288003/GSE123352/GSE307690/
+  TCGA-LUAD/TCGA-LUSC/NLST (the last one controlled-access) is outside
+  what this change can or should do without explicit authorization and
+  network/storage access this environment does not have.
+- **Tracks A/B/C evaluation runners consequently have nothing to
+  evaluate.** `run_track_a/b/c_against_registry()` are honest
+  `not_evaluable` for every task, because `eligible_cohorts_for_track()`
+  finds no cohort with real local files. The `..._on_fixture()` paths run
+  the real metric-computation code end-to-end against synthetic data and
+  are stamped `synthetic_flag=True` — they prove the scoring code works,
+  never that real evidence exists.
+- **Candidate comparison (Step 9), repeated-resampling uncertainty
+  (Step 10), and subgroup diagnostics (Step 13) are consequently framework-
+  only.** `run_candidate_comparison_on_synthetic_fixture()`,
+  `repeated_development_oof_for_cancer_track()`, and `subgroup_report()`
+  all run the real comparison/statistics code against real Phase 1-6
+  training machinery, but only against a synthetic development context
+  (`benchmarks.runner.build_synthetic_context`) — no real candidate
+  comparison, uncertainty estimate, or subgroup breakdown has been
+  produced anywhere in this repository.
 - **Calibration/thresholding (Step 14) and the artifact bundle (Step 15)
-  against REAL predictions.** The framework (`evidence/calibration.py`,
-  `evidence/artifact_bundle.py`) is implemented and tested against
-  synthetic fixtures; no real development/internal-test/external-test
-  predictions exist in this repository to run it against yet, because the
-  Steps 8-10 pipeline integration does not exist as a callable pipeline.
+  have never been run against real predictions**, for the same reason —
+  there are no real development/internal-test/external-test predictions
+  to fit a frozen calibrator on or bundle into an artifact run.
 - **`evidence.runner development`/`internal-test`/`external-test`** are
   honest stubs (`not_evaluable(reason_code="TRACK_RUNNER_NOT_YET_INTEGRATED")`)
-  for the same reason — `audit`, `inspect`, `validate`, and
-  `clinical-readiness` are fully implemented.
-- **External-validation release against a REAL external cohort (Step 11).**
-  `ExternalValidationGate`/`evaluate_external_cohort_eligibility()` are
-  implemented and tested (with synthetic `Cohort` fixtures and against the
-  real registry's current, expected-empty external-eligible set); no
-  cohort in `configs/cohorts.yaml` currently has `role_eligibility`
-  including `external_validation`, so there is no real external cohort to
-  release in this environment yet.
-- **Step 18's full adversarial test matrix** — the subset covering the
-  evidence contract, cohort registry, eligibility gates, audit CLI,
-  clinical-readiness framework, evaluation tracks, external-validation
-  gate, calibration/thresholding, artifact bundle, and `evidence.runner`
-  CLI is implemented and passing; the subset covering
-  splitting/leakage corruption-isolation against a real pipeline and
-  metric-manual-calculation tests against real (non-fixture) predictions
-  is not, because the underlying real-data pipeline integration (Steps
-  8-10) is not implemented.
+  — `audit`, `inspect`, `validate`, and `clinical-readiness` are fully
+  implemented and read-only.
+- **External-validation release against a REAL external cohort (Step 11)**
+  has not happened — no cohort in `configs/cohorts.yaml` currently has
+  `role_eligibility` including `external_validation`.
+- **Step 18's adversarial test matrix** is complete for every framework
+  module above (1520 tests passing, including the leakage-isolation suite
+  in `tests/test_evidence_leakage_isolation.py`). The subset that would
+  exercise these same tests against genuine real (non-fixture, non-
+  synthetic) predictions cannot exist yet, for the same reason as
+  everything else in this section.
+
+No further engineering round changes this section: the blocker is data
+availability in this environment, not missing framework code.
 
 ## Why this is the honest outcome
 

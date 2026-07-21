@@ -2377,6 +2377,46 @@ evidence that does not exist.
   `complete` with a real evidence reference, and `guard_clinical_claim()`
   additionally requires a signed external-evidence manifest before any
   code path may emit a clinical-readiness claim.
+- `src/evidence/tracks.py` — Track A (smoke classification), Track B
+  (malignancy classification), Track C (subject-level cancer prediction),
+  each with a real registry-checked path (honestly `not_evaluable` for
+  every task in this environment) and a synthetic-fixture path that runs
+  the real metric-computation code end to end.
+- `src/evidence/external_validation.py` — a poison-object sentinel for
+  external-cohort data plus a gate that structurally cannot release a
+  cohort for external validation before development is explicitly frozen,
+  and that tells apart "no eligible external cohort exists" from "this is
+  an internal split masquerading as external validation."
+- `tests/test_evidence_leakage_isolation.py` — corruption-isolation tests
+  proving the evidence framework's development-only code paths cannot
+  read a held-out/test partition, even adversarially.
+- `src/evidence/candidate_comparison.py` — identical-partition comparison
+  across classical baselines and MIL-kind candidates for a task, reusing
+  the existing cross-validation/final-evaluation machinery so every
+  candidate shares one fold assignment, preprocessing artifact, and label
+  mapping by construction.
+- `src/evidence/uncertainty.py` — repeated grouped-resampling uncertainty
+  reporting, structurally confined to development data (its one input type
+  requires the literal role `"development"`), with subject-level bootstrap
+  CIs and a paired candidate comparison that is explicitly labeled
+  descriptive, never a formal equivalence test.
+- `src/evidence/subgroups.py` — subgroup/fairness diagnostics over the
+  subgroup dimensions this repository genuinely has a data source for
+  (cohort source, exposure type, disease status, assay platform, species);
+  it refuses to fabricate a dimension (e.g. sex, age, race/ethnicity) that
+  has no field anywhere in this repository's data model, and it refuses to
+  render any summary claiming fairness has been established.
+- `src/evidence/calibration.py` — frozen calibration (Platt/isotonic) and
+  thresholding fit only on development out-of-fold predictions; applying
+  the frozen artifact to new probabilities takes no fitting parameters at
+  all, so it cannot be refit on test data.
+- `src/evidence/artifact_bundle.py` — an atomic, checksummed, immutable
+  writer/reader for `artifacts/evidence/<run_id>/` run directories; a run
+  directory already marked complete can never be written into again.
+- `src/evidence/runner.py` — the `python -m evidence.runner` umbrella CLI
+  (`audit`, `inspect`, `validate`, `clinical-readiness` fully implemented
+  and read-only; `development`/`internal-test`/`external-test` are honest
+  stubs pending real-data pipeline integration).
 
 **Current audited data availability in this environment (run 2026-07):**
 running the audit CLI above against this repository, with no datasets
@@ -2405,16 +2445,18 @@ manufacture a result around it.
   — every mandatory dimension is `not_started` or `blocked`, so
   `overall_status` is `clinically_not_ready`.
 
-**What Phase 7 does not yet do:** run the three evaluation tracks
+**What Phase 7 does not yet do:** run any of the three evaluation tracks
 (Track A smoke classification / Track B malignancy classification /
-Track C subject-level cancer prediction) end to end against real data,
-because no real data satisfying the eligibility gates is available in
-this environment; wire a leakage-safe real-data run through
-`src/benchmarks/runner.py`'s existing candidate-comparison/frozen-test
-machinery; or produce the full `artifacts/evidence/<run_id>/` bundle
-structure. `src/evidence/` is infrastructure and honest-blocker reporting,
-not a claim that real evidence has been generated — see
-`docs/EVIDENCE_PROTOCOL.md` for exactly which steps remain and why.
+Track C subject-level cancer prediction), the candidate comparison,
+uncertainty reporting, subgroup diagnostics, calibration/thresholding, or
+the artifact bundle against real data — every one of those modules is
+implemented and tested against synthetic fixtures, but none has ever been
+run against a real cohort in this environment, because no cohort
+satisfies the eligibility gates here (`local_files_present: false` for
+all seven registered cohorts). `src/evidence/` is infrastructure and
+honest-blocker reporting, not a claim that real evidence has been
+generated — see `docs/EVIDENCE_PROTOCOL.md` for exactly which steps
+remain and why.
 
 ## Next steps
 
