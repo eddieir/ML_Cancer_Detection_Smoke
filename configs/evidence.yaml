@@ -97,6 +97,23 @@ cohort_roles:
   - external_validation
   - excluded
 
+# Step 14 — calibration/threshold policy enforced by
+# src/evidence/calibration.py. Isotonic regression is a flexible
+# non-parametric fit that overfits badly on small validation sets; it is
+# only offered once the development out-of-fold selection set clears this
+# minimum subject count, mirroring (and never going below)
+# benchmarks/calibration.py's own MIN_ISOTONIC_N guard.
+calibration_policy:
+  min_isotonic_n: 200
+  min_platt_n: 20
+  valid_calibration_methods: [uncalibrated, platt, isotonic]
+  valid_threshold_methods:
+    - youden
+    - balanced_accuracy
+    - sensitivity_constrained
+    - specificity_constrained
+    - predeclared_fixed
+
 notes:
   - "not_evaluable is the only sanctioned representation of missing evidence — never 0, false, an empty metric dict, NaN without explanation, or a warning attached to a fabricated result."
   - "development_only_flag=true reports can never claim internal_held_out_real_data or stronger."
