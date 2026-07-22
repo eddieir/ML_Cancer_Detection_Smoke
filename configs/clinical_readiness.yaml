@@ -1,0 +1,78 @@
+# configs/clinical_readiness.yaml — Phase 7 clinical-readiness policy.
+#
+# Defines the 22 assessment dimensions enforced by
+# src/evidence/clinical_readiness.py, and documents (for human review) the
+# eligibility thresholds also encoded in src/evidence/eligibility.py.
+# These are engineering/scientific guardrails chosen for this repository's
+# development process — not a regulatory standard, and not a substitute
+# for expert legal/regulatory review.
+
+schema_version: "1"
+
+eligibility_thresholds:
+  min_subjects_exploratory: 6
+  min_subjects_internal_held_out: 20
+  min_subjects_external_validation: 20
+  min_per_class_exploratory: 2
+  min_per_class_internal_held_out: 5
+  min_independent_sources_external: 1
+
+# mandatory: true dimensions must reach status="complete" with real,
+# checkable evidence_references before overall clinical readiness can be
+# anything other than "not clinically ready". As of this policy version,
+# no dimension in this repository has reached "complete" with real
+# external/prospective evidence.
+dimensions:
+  - id: intended_use
+    mandatory: true
+  - id: target_population
+    mandatory: true
+  - id: clinical_setting
+    mandatory: true
+  - id: prediction_target_and_time_horizon
+    mandatory: true
+  - id: input_specimen_and_assay
+    mandatory: true
+  - id: data_provenance
+    mandatory: true
+  - id: analytical_validity
+    mandatory: true
+  - id: internal_validation
+    mandatory: true
+  - id: external_validation
+    mandatory: true
+  - id: calibration
+    mandatory: true
+  - id: clinical_utility
+    mandatory: true
+  - id: fairness_subgroup_performance
+    mandatory: true
+  - id: robustness_to_site_platform_domain_shift
+    mandatory: true
+  - id: missing_data_handling
+    mandatory: false
+  - id: failure_detection_and_abstention
+    mandatory: false
+  - id: reproducibility
+    mandatory: true
+  - id: model_version_governance
+    mandatory: false
+  - id: privacy_security
+    mandatory: true
+  - id: human_factors_usability_validation
+    mandatory: false
+  - id: prospective_validation
+    mandatory: true
+  - id: regulatory_pathway
+    mandatory: true
+  - id: post_deployment_monitoring
+    mandatory: false
+
+required_disclaimer_statements:
+  - "This is research software."
+  - "This is not a medical device."
+  - "Not validated for diagnosis, screening, prognosis, or treatment."
+  - "A model probability is not an individual clinical risk estimate unless calibration and target-population validation establish that."
+  - "Retrospective public-dataset performance cannot establish clinical utility."
+  - "Prospective and independent external validation remain necessary."
+  - "Regulatory readiness requires expert legal/regulatory review outside this repository."

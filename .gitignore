@@ -29,6 +29,9 @@ demo_run_*/
 # benchmark run output (created by src/benchmarks/runner.py)
 artifacts/benchmarks/
 
+# evidence run output (created by evidence.audit / evidence.runner)
+artifacts/evidence/
+
 # OS
 .DS_Store
 

@@ -2419,3 +2419,119 @@ addressed as follows:
   `smoke_domain_shift_report`, so `gene_space_compatibility` reports
   `not_evaluable` in every live run, exactly as designed. This section
   reconfirms rather than changes that behavior.
+
+## 17. Real-World Evidence and Clinical-Readiness Framework ("Phase 7")
+
+Phase 7 adds `src/evidence/`, a package separate from `src/benchmarks/`
+that defines what would count as real-world clinical evidence for this
+project and refuses, structurally, to represent absent evidence as a
+result. It changes nothing about the existing benchmark-runner path,
+splitting, preprocessing, or model code from Phases 1-6.
+
+### 17.1 The evidence contract
+
+`evidence/evidence_contract.py` defines `EVIDENCE_LEVELS` (seven levels,
+`synthetic_software_validation` through `regulatory_evidence`) and
+`REQUIRED_IDENTITY_FIELDS` (29 fields every report must carry — task,
+endpoint, prediction unit, specimen/assay, dataset accession, cohort role,
+species, sample/subject/class/verified/unknown/excluded counts, split
+role, five provenance fingerprints, random seed, commit SHA, environment
+fingerprint, synthetic/development-only flags, frozen-test-access status,
+evidence level, limitations, timestamp, schema version). `build_report()`
+is the only sanctioned constructor — it validates identity and stamps a
+`content_fingerprint` over the whole report so `validate_report()` can
+detect post-write tampering by re-deriving that fingerprint.
+`validate_identity()` enforces which evidence levels a report's own
+synthetic/development-only/frozen-test-access/cohort-role flags actually
+support (e.g. a synthetic report cannot claim
+`internal_held_out_real_data`; an internal test split cannot claim
+`external_retrospective_validation`). `not_evaluable(reason_code, reason,
+required_next_action)` is the only sanctioned representation of missing
+evidence — a metric must never be `0`, `False`, an empty dict, `NaN`
+without explanation, or a "successful" result with a caveat attached.
+`evidence/errors.py` defines 13 typed exceptions for the specific
+violation modes above rather than one generic error.
+
+### 17.2 Cohort registry and eligibility gates
+
+`configs/cohorts.yaml` / `evidence/cohort_registry.py` extend
+`configs/datasets.yaml`'s raw-provenance facts with per-cohort Phase 7
+facts: which of the four tasks (smoke classification, malignancy
+classification, subject-level cancer prediction, external validation)
+each cohort can support, in which role, and why not otherwise —
+GSE136831's COPD field is recorded as a weak proxy, never a verified
+smoke label; GSE288003 stays species-separated (mouse); the bulk cohorts
+(GSE123352, GSE307690/CANUCK, TCGA-LUAD/LUSC) are recorded as unavailable
+for single-cell MIL until a genuinely supported bulk pipeline exists;
+NLST is recorded controlled-access with no linkage claimed.
+`cross_check_against_dataset_manifest()` rejects accession/species/access-
+level contradictions between the two config files.
+`evidence/eligibility.py::assess_eligibility()` turns real (never assumed)
+subject/class counts into one of `IMPOSSIBLE` /
+`EXPLORATORY_DEVELOPMENT_ONLY` / `ELIGIBLE_INTERNAL_HELD_OUT` /
+`ELIGIBLE_EXTERNAL_VALIDATION`, gated first by structural compatibility
+(species/assay/prediction-unit/linkage) before any count threshold is
+even considered.
+
+### 17.3 Read-only audit CLI
+
+`python -m evidence.audit` (`evidence/audit.py`) builds the dataset
+manifest and cohort registry, checks controlled-access availability via
+the existing `data/nlst_adapter.py`, and reports per-cohort file
+presence, per-task eligibility, and structural contradictions — without
+ever opening, fitting, or training against an actual expression matrix.
+Run with no local datasets present, it reports `overall_status:
+"blocked_no_real_data"` and a structured `not_evaluable` object for every
+count-based section (subject counts, label counts, outcome counts,
+missingness, duplicate/collision checks) rather than a fabricated zero or
+an empty table.
+
+### 17.4 Clinical readiness
+
+`evidence/clinical_readiness.py` + `configs/clinical_readiness.yaml`
+define 22 assessment dimensions (13 mandatory), each independently
+`not_started` / `blocked` / `partial` / `complete` with required
+`evidence_references` on `complete` and required `blocking_requirements`/
+`limitations` otherwise. `assess_clinical_readiness()` computes overall
+status purely from those records — there is no parameter that sets
+readiness directly — and can only reach
+`mandatory_dimensions_complete_expert_review_required` (never an
+unqualified "ready") once every mandatory dimension is `complete`.
+`guard_clinical_claim()` is the single choke point any CLI/report code
+path must call before emitting a clinical-readiness claim; it raises
+`ClinicalReadinessNotEstablishedError` unless that status has been reached
+*and* the caller attests a signed external-evidence manifest is present.
+
+### 17.5 What Phase 7 does not implement
+
+Every remaining framework module named in the Phase 7 specification now
+exists and is tested against synthetic fixtures and the real (currently
+empty-of-external-cohorts) registry:
+`evidence/external_validation.py` (`ExternalValidationGate`,
+`evaluate_external_cohort_eligibility()`),
+`tests/test_evidence_leakage_isolation.py` (corruption-isolation tests
+reusing `benchmarks/sentinel.py`'s poison-object pattern),
+`evidence/candidate_comparison.py` (identical-partition comparison across
+baseline and MIL-kind candidates, driven through the existing
+`benchmarks/cross_validation.py`/`benchmarks/final_evaluation.py`
+machinery), `evidence/uncertainty.py` (repeated grouped-resampling
+subject-level bootstrap CIs, structurally confined to
+`role="development"` input), `evidence/subgroups.py` (subgroup/fairness
+diagnostics over the five dimensions this repository has a genuine data
+source for, refusing to fabricate any other), `evidence/calibration.py`
+(frozen calibration/thresholding, `decision_curve_analysis()`),
+`evidence/artifact_bundle.py` (the immutable `artifacts/evidence/<run_id>/`
+writer/reader), and `evidence/runner.py` (the `python -m evidence.runner`
+CLI: `audit`/`inspect`/`validate`/`clinical-readiness` fully implemented;
+`development`/`internal-test`/`external-test` are honest stubs).
+
+What remains unimplemented is not code — it is real data. None of the
+modules above has ever processed a genuine development/internal-test/
+external-test prediction, because no cohort in `configs/cohorts.yaml` has
+local files present in this environment (`python -m evidence.audit`
+reports `overall_status: "blocked_no_real_data"`). Their synthetic-fixture
+paths prove the real Phase 1-6 training/scoring/statistics code executes
+correctly end to end; they are never read as evidence that a real
+candidate comparison, uncertainty estimate, subgroup breakdown,
+calibration, or external-cohort release has occurred. See
+`docs/EVIDENCE_PROTOCOL.md` for the complete list and reasoning.

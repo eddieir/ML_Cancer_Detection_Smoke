@@ -2330,6 +2330,165 @@ the aggregate's source count.
   `runner.py` persists ablation output through this writer instead of the
   generic `write_json`.
 
+## Phase 7 — real-world evidence and clinical-readiness framework
+
+Phases 1-6 established leakage-safe splitting, imbalance handling, label
+semantics, reproducible preprocessing artifacts, pathway-hierarchical MIL,
+and domain-robustness evaluation — all validated against synthetic
+fixtures and, where noted above, one training-set real-data run. Phase 7
+adds a separate framework (`src/evidence/`) for stating, precisely, what
+would count as real-world clinical evidence, and for refusing to report
+evidence that does not exist.
+
+**What this phase adds:**
+- `src/evidence/evidence_contract.py` — a versioned evidence-report schema
+  with seven evidence levels (`synthetic_software_validation` through
+  `regulatory_evidence`), 29 required identity fields per report, and a
+  structured `not_evaluable(...)` object that is the only sanctioned way
+  to represent missing evidence (never `0`, `False`, an empty metric dict,
+  or a "successful" result with a caveat attached).
+- `configs/cohorts.yaml` / `src/evidence/cohort_registry.py` — a canonical
+  registry of every cohort this repository knows about (GSE136831,
+  GSE288003, GSE123352, GSE307690/CANUCK, TCGA-LUAD/LUSC, NLST), recording
+  per-cohort what it can and cannot support: GSE136831's COPD field is a
+  weak exposure proxy, not a verified smoke label; GSE288003 is mouse and
+  stays species-separated; the bulk/pseudo-bulk cohorts (GSE123352,
+  GSE307690, TCGA-LUAD/LUSC) cannot enter single-cell MIL without a bulk
+  pipeline this repository does not have; NLST is controlled-access and
+  unavailable without an authorized local dataset. The registry is
+  cross-checked against `configs/datasets.yaml` for contradictions.
+- `src/evidence/eligibility.py` — deterministic eligibility gates (Step 6)
+  that classify every (task, cohort) pair as impossible, exploratory-only,
+  or eligible for internal/external evaluation, from real on-disk counts
+  only.
+- `src/evidence/audit.py` — a **read-only** audit CLI:
+  ```
+  PYTHONPATH=src python -m evidence.audit \
+      --config configs/default.yaml --cohort-config configs/cohorts.yaml \
+      --output artifacts/evidence/data_audit.json
+  ```
+  It never trains, fits preprocessing, or downloads anything; it reports
+  which datasets have local files, which cohorts are controlled-access and
+  unauthorized, and a per-task eligibility table.
+- `src/evidence/clinical_readiness.py` + `configs/clinical_readiness.yaml`
+  + `docs/CLINICAL_READINESS.md` — a 22-dimension staged clinical-readiness
+  assessment. `assess_clinical_readiness()` can only report
+  `clinically_not_ready` unless every mandatory dimension is independently
+  `complete` with a real evidence reference, and `guard_clinical_claim()`
+  additionally requires a signed external-evidence manifest before any
+  code path may emit a clinical-readiness claim.
+- `src/evidence/tracks.py` — Track A (smoke classification), Track B
+  (malignancy classification), Track C (subject-level cancer prediction),
+  each with a real registry-checked path (honestly `not_evaluable` for
+  every task in this environment) and a synthetic-fixture path that runs
+  the real metric-computation code end to end.
+- `src/evidence/external_validation.py` — a poison-object sentinel for
+  external-cohort data plus a gate that structurally cannot release a
+  cohort for external validation before development is explicitly frozen,
+  and that tells apart "no eligible external cohort exists" from "this is
+  an internal split masquerading as external validation."
+- `tests/test_evidence_leakage_isolation.py` — corruption-isolation tests
+  proving the evidence framework's development-only code paths cannot
+  read a held-out/test partition, even adversarially.
+- `src/evidence/candidate_comparison.py` — identical-partition comparison
+  across classical baselines and MIL-kind candidates for a task, reusing
+  the existing cross-validation/final-evaluation machinery so every
+  candidate shares one fold assignment, preprocessing artifact, and label
+  mapping by construction.
+- `src/evidence/uncertainty.py` — repeated grouped-resampling uncertainty
+  reporting, structurally confined to development data (its one input type
+  requires the literal role `"development"`), with subject-level bootstrap
+  CIs and a paired candidate comparison that is explicitly labeled
+  descriptive, never a formal equivalence test.
+- `src/evidence/subgroups.py` — subgroup/fairness diagnostics over the
+  subgroup dimensions this repository genuinely has a data source for
+  (cohort source, exposure type, disease status, assay platform, species);
+  it refuses to fabricate a dimension (e.g. sex, age, race/ethnicity) that
+  has no field anywhere in this repository's data model, and it refuses to
+  render any summary claiming fairness has been established.
+- `src/evidence/calibration.py` — frozen calibration (Platt/isotonic) and
+  thresholding fit only on development out-of-fold predictions; applying
+  the frozen artifact to new probabilities takes no fitting parameters at
+  all, so it cannot be refit on test data.
+- `src/evidence/artifact_bundle.py` — an atomic, checksummed, immutable
+  writer/reader for `artifacts/evidence/<run_id>/` run directories; a run
+  directory already marked complete can never be written into again.
+- `src/evidence/runner.py` — the `python -m evidence.runner` umbrella CLI
+  (`audit`, `inspect`, `validate`, `clinical-readiness` fully implemented
+  and read-only; `development`/`internal-test`/`external-test` are honest
+  stubs pending real-data pipeline integration).
+
+**Current audited data availability in this environment:** GSE136831 and
+GSE123352 are downloaded locally (`data/raw/`, gitignored); the other five
+registered cohorts (GSE288003, GSE307690/CANUCK, TCGA-LUAD/LUSC, NLST) are
+not, and NLST's controlled-access authorization check is `false` (no
+`NLST_DATA_ROOT`). `python -m evidence.audit` reports
+`partial_local_data_present` accordingly, never a fabricated eligible
+count for the five cohorts that are still absent.
+
+**Evidence status, stated plainly:**
+- **Real weak-label smoke-exposure result (GSE136831): executed, reported
+  honestly weak.** `scripts/run_gse136831_weak_label_evidence.py` ran the
+  real single-cell pipeline (qc_filter, normalize, train-only HVG
+  selection/scaling, logistic regression) against the real downloaded
+  GSE136831 matrix. Of 78 real subjects, 32 IPF subjects were excluded (IPF
+  is not a smoke-exposure proxy); the remaining 46 COPD/Control subjects
+  were subject-level split 33/7/6 (train/val/test). Cells were subsampled
+  to 300/subject (deterministic, seeded) so the dense HVG-selection matrix
+  fits in this environment's 16GB RAM — see the script's module docstring.
+  On the 6 held-out test subjects: macro-F1 1.0, but both classes (4 vs 2
+  subjects) are below this repository's 5-subject learnability-claim
+  threshold, so `run_track_a_on_real_weak_label_data` correctly declines to
+  make a learnability claim from this result. This is a **weak-label
+  sensitivity experiment** (`Disease_Identity=COPD` as a correlational
+  proxy for cigarette exposure, `Control` as the "never" proxy) — it is
+  never a verified-label result and is never merged with one. Report:
+  `artifacts/evidence/gse136831_weak_label_smoke_v1/` (gitignored).
+- **Real verified-label smoke-classification result (GSE123352):
+  executed.** `src/data/bulk_pipeline.py` (a new, minimal bulk-microarray
+  path — GSE123352 is bulk, never entered into the single-cell MIL
+  pipeline) parsed real per-sample `ever_never_smoker` phenotype values
+  from the real downloaded series matrix for all 176 real subjects; every
+  subject carried a verified label (0 excluded). A 70/30 subject-level
+  split gave 126 train / 50 test subjects (34 cigarette, 16 unexposed in
+  test). A train-only top-variance-gene-selected, train-only-standardized
+  L2 logistic regression (a first honest bulk baseline, not tuned)
+  achieved **macro-F1 0.592, balanced accuracy 0.605** on the 50 held-out
+  real test subjects. This is this repository's first real, primary,
+  verified-label Track A result — `evidence_level=development_only_real_data`
+  (development-cohort only; no frozen-test guard has been acquired for
+  this cohort/task, so this is not an internal-held-out or external claim).
+  Report: `artifacts/evidence/gse123352_verified_label_smoke_v1/`
+  (gitignored).
+- **Real cancer-prediction performance: still not established.** No
+  cohort in this repository has both compatible expression input and a
+  genuinely linked subject-level cancer outcome — downloading more data
+  does not change this; see `configs/cohorts.yaml`'s cohort-by-cohort
+  `expression_outcome_linkable_at_subject_level: false`.
+- **Malignancy classification: still not established.** No single-cell
+  cohort carries a per-cell/per-sample malignancy label.
+- **External validation: still not performed.** No eligible external
+  cohort exists (GSE288003 is mouse; the remaining bulk cohorts and TCGA
+  cannot enter the single-cell pipeline; NLST is inaccessible without a
+  DUA) — this is unaffected by the two real results above, both of which
+  are `development`-role only.
+- **Clinical readiness: still not established.** See
+  `docs/CLINICAL_READINESS.md` — every mandatory dimension is
+  `not_started` or `blocked`, so `overall_status` is
+  `clinically_not_ready`.
+
+**What Phase 7 does and does not do:** Track A now has two real executed
+results (above), one weak-label and one verified-label, both
+`development`-role only. Track B (malignancy classification) and Track C
+(subject-level cancer prediction), the candidate comparison, uncertainty
+reporting, subgroup diagnostics, calibration/thresholding, and the
+artifact bundle remain implemented and tested only against synthetic
+fixtures — none has been run against real data, because no cohort
+satisfies their eligibility gates. `src/evidence/` is infrastructure plus
+two genuine development-only real-data results, not a claim that
+clinical, external, or cancer-prediction evidence exists — see
+`docs/EVIDENCE_PROTOCOL.md` for exactly which steps remain and why.
+
 ## Next steps
 
 - Run `python -m benchmarks.runner` against the real single-cell data
