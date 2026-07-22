@@ -101,17 +101,18 @@ cohorts:
     expression_outcome_linkable_at_subject_level: false
     source_limitations:
       - "Bulk/pseudo-bulk microarray — must not enter single-cell MIL."
-      - "No genuinely supported bulk pipeline currently exists in this repository; evaluable only under one, which does not currently exist."
+      - "A minimal, independent bulk-classification pipeline now exists (src/data/bulk_pipeline.py) — a simple train-only-top-variance-gene logistic regression, deliberately not tied into the single-cell MIL pipeline in any way. It is a first honest bulk baseline, not a tuned or externally validated model."
+      - "No frozen internal/external held-out guard has ever been acquired for this cohort/task — role_eligibility stays [development] only; a real run against this cohort can claim evidence_level='development_only_real_data' at most."
     licensing_access_limitations: "Public GEO series, no DUA required."
     checksum_rule: "sha256 of series-matrix + platform-annotation files under raw_subdir."
     task_support:
-      smoke_classification: not_currently
+      smoke_classification: "yes"
       malignancy_classification: "no"
       subject_level_cancer_prediction: "no"
       external_validation: "no"
-    role_eligibility: [excluded]
+    role_eligibility: [development]
     notes:
-      - "Recorded as unavailable for Phase 7 single-cell MIL evidence; historical mixed-assay results involving this cohort are not resurrected."
+      - "smoke_classification uses data/bulk_pipeline.py + evidence.tracks.run_track_a_on_real_verified_label_data — see scripts/run_gse123352_verified_label_evidence.py for the end-to-end real run this repository has actually executed."
 
   - cohort_id: gse307690_canuck
     accession: GSE307690

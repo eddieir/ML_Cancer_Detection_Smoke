@@ -119,6 +119,24 @@ def _no_eligible_cohort(task: str, role: str, extra_reason: str) -> dict:
 # ─── Track A — verified smoke classification ──────────────────────────────
 
 def run_track_a_against_registry(cohorts: Sequence[Cohort], role: str = "development") -> dict:
+    """Deliberately stays registry-only, even now that gse123352 carries
+    task_support['smoke_classification']='yes' and role_eligibility
+    including 'development' (see configs/cohorts.yaml). This function's
+    contract (see module docstring) is that it never opens a dataset file
+    and never fabricates a subject/class count — it only reasons about
+    which cohorts the registry says are structurally eligible. Genuinely
+    running a real fit against gse123352 or gse136831 happens through the
+    dedicated, dataset-specific paths this module also provides
+    (run_track_a_on_real_verified_label_data / run_track_a_on_real_weak_label_data)
+    and the scripts that call them
+    (scripts/run_gse123352_verified_label_evidence.py,
+    scripts/run_gse136831_weak_label_evidence.py) — this generic path is
+    intentionally NOT auto-wired to invoke those, so that a caller of this
+    function can never be surprised by an implicit multi-minute real
+    training run or an implicit real-file read; it always returns a
+    structured, honest not_evaluable() naming which cohort(s) are eligible
+    and pointing at the concrete next step.
+    """
     eligible = eligible_cohorts_for_track(cohorts, TASK_SMOKE, role)
     if not eligible:
         return _no_eligible_cohort(
@@ -126,16 +144,23 @@ def run_track_a_against_registry(cohorts: Sequence[Cohort], role: str = "develop
             "Verified per-subject smoke-exposure labels on single-cell-compatible input "
             "are not currently supported by any registered cohort in this environment "
             "(gse136831 has only a weak Disease_Identity proxy; gse288003 is mouse-only "
-            "and role_eligibility=excluded; gse123352 is bulk and excluded).",
+            "and role_eligibility=excluded).",
         )
     return not_evaluable(
         reason_code="REAL_FITTING_NOT_IMPLEMENTED",
         reason=(
             f"cohort(s) {[c.cohort_id for c in eligible]} are marked eligible for "
-            f"{TASK_SMOKE!r}/{role!r}, but no local raw data was verified present in this "
-            "environment (see evidence.audit) and no fitting was attempted."
+            f"{TASK_SMOKE!r}/{role!r}, but this generic against-registry path never opens a "
+            "dataset file by design (see this function's docstring) — it does not itself "
+            "check local file presence or attempt any fitting."
         ),
-        required_next_action="Run evidence.audit to confirm local data presence, then invoke evidence.runner development.",
+        required_next_action=(
+            "Run evidence.audit to confirm local data presence, then call the dedicated "
+            "real-data function for the eligible cohort directly (e.g. "
+            "evidence.tracks.run_track_a_on_real_verified_label_data for gse123352, "
+            "evidence.tracks.run_track_a_on_real_weak_label_data for gse136831) or the "
+            "matching script under scripts/."
+        ),
         task=TASK_SMOKE, role=role, candidate_cohorts=[c.cohort_id for c in eligible],
     )
 

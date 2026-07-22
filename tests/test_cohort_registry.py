@@ -52,13 +52,20 @@ def test_gse288003_mouse_cohort_excluded_from_human_roles():
     assert mouse.task_support["external_validation"] != "yes"
 
 
-def test_bulk_cohorts_never_support_single_cell_tasks():
+def test_bulk_cohorts_never_support_single_cell_only_tasks():
+    # malignancy_classification (per-cell/per-sample MIL) has no bulk path
+    # in this repository — no bulk cohort may claim it. gse123352's
+    # smoke_classification='yes' is the one deliberate exception: it is
+    # served by an independent bulk pipeline (data/bulk_pipeline.py), never
+    # by the single-cell MIL pipeline — see that cohort's source_limitations.
     cohorts = load_cohort_registry(COHORTS_YAML)
     for cohort_id in ("gse123352", "gse307690_canuck", "tcga_luad", "tcga_lusc"):
         cohort = find_cohort(cohorts, cohort_id)
         assert cohort.single_cell_or_bulk == "bulk"
-        assert cohort.task_support["smoke_classification"] != "yes"
         assert cohort.task_support["malignancy_classification"] != "yes"
+    for cohort_id in ("gse307690_canuck", "tcga_luad", "tcga_lusc"):
+        cohort = find_cohort(cohorts, cohort_id)
+        assert cohort.task_support["smoke_classification"] != "yes"
 
 
 def test_tcga_cannot_supply_verified_smoke_labels():
@@ -166,7 +173,10 @@ def test_registry_fingerprint_changes_on_content_change():
     assert fp1 != fp2
 
 
-def test_cohorts_supporting_smoke_classification_is_empty_today():
+def test_cohorts_supporting_smoke_classification_is_only_gse123352_today():
+    # gse123352 gained a real, independent bulk pipeline (see
+    # data/bulk_pipeline.py) — every other cohort still has no genuinely
+    # supported pipeline for this task.
     cohorts = load_cohort_registry(COHORTS_YAML)
     supporting = cohorts_supporting(cohorts, "smoke_classification")
-    assert supporting == []
+    assert [c.cohort_id for c in supporting] == ["gse123352"]

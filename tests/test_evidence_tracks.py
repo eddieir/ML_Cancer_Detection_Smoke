@@ -23,10 +23,25 @@ def cohorts():
 # ─── against-registry paths: must all be honest not_evaluable in this repo ─
 
 def test_track_a_against_registry_is_not_evaluable(cohorts):
+    # gse123352 is now task_support['smoke_classification']='yes' with
+    # role_eligibility=[development] (a real bulk pipeline exists — see
+    # data/bulk_pipeline.py) — so this generic path finds it eligible, but
+    # its own contract (never open a dataset file) still means it returns
+    # not_evaluable(REAL_FITTING_NOT_IMPLEMENTED) rather than a real result.
     result = tracks.run_track_a_against_registry(cohorts)
     assert is_not_evaluable(result)
-    assert result["reason_code"] == "NO_ELIGIBLE_COHORT"
+    assert result["reason_code"] == "REAL_FITTING_NOT_IMPLEMENTED"
     assert result["task"] == tracks.TASK_SMOKE
+    assert "gse123352" in result["candidate_cohorts"]
+
+
+def test_track_a_against_registry_never_opens_a_file_even_when_eligible(cohorts):
+    # Regression guard for the documented contract in
+    # run_track_a_against_registry's docstring: eligibility alone must never
+    # produce a real metric — only the dedicated real-data functions do that.
+    result = tracks.run_track_a_against_registry(cohorts)
+    assert "macro_f1" not in result
+    assert "content_fingerprint" not in result
 
 
 def test_track_b_against_registry_is_not_evaluable(cohorts):
