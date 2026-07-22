@@ -271,6 +271,7 @@ def run_track_a_on_real_weak_label_data(
     excluded_subject_reason: Optional[str] = None,
     preprocessing_artifact_fingerprint: Optional[str] = None,
     random_seed: int = 0,
+    extra_limitations: Optional[Sequence[str]] = None,
 ) -> dict:
     """Real-data counterpart to run_track_a_on_fixture, for a documented
     weak-label side-experiment against genuinely downloaded raw data (today
@@ -338,6 +339,8 @@ def run_track_a_on_real_weak_label_data(
         )
     if excluded_subject_reason:
         limitations.append(excluded_subject_reason)
+    if extra_limitations:
+        limitations.extend(extra_limitations)
 
     identity = {
         "task": TASK_SMOKE,
