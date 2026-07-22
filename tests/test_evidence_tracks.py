@@ -125,3 +125,70 @@ def test_track_c_on_fixture_endpoint_definition_states_horizon_and_field():
     )
     assert "2.0" in out["identity"]["endpoint_definition"]
     assert "malignancy_dx" in out["identity"]["endpoint_definition"]
+
+
+# ─── real-data Track A paths (Phase 7 round 2) ────────────────────────────
+
+def _tiny_real_file(tmp_path, name="raw_fixture.txt", content=b"real-bytes-not-a-placeholder"):
+    p = tmp_path / name
+    p.write_bytes(content)
+    return p
+
+
+def test_track_a_real_weak_label_data_is_stamped_correctly(tmp_path):
+    raw_file = _tiny_real_file(tmp_path)
+    y_true = [0, 1, 1, 0, 0, 1]
+    y_pred = [0, 1, 0, 0, 0, 1]
+    subject_ids = [f"donor{i}" for i in range(6)]
+    out = tracks.run_track_a_on_real_weak_label_data(
+        y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[raw_file],
+    )
+    validate_report(report_from_dict(out))
+    assert out["identity"]["synthetic_flag"] is False
+    assert out["identity"]["development_only_flag"] is True
+    assert out["identity"]["evidence_level"] == "development_only_real_data"
+    assert out["identity"]["dataset_accession"] == "GSE136831"
+    assert out["identity"]["verified_label_count"] == 0
+    assert out["metrics"]["weak_label_experiment"] is True
+    assert any("weak_label_experiment=True" in lim for lim in out["identity"]["limitations"])
+    # real sha256 fingerprint of the actual file content, not a placeholder
+    assert len(out["identity"]["dataset_manifest_fingerprint"]) == 64
+
+
+def test_track_a_real_weak_label_data_missing_raw_file_raises(tmp_path):
+    missing = tmp_path / "does_not_exist.txt"
+    with pytest.raises(FileNotFoundError):
+        tracks.run_track_a_on_real_weak_label_data(
+            [0, 1], [0, 1], ["a", "b"], num_classes=2, raw_file_paths=[missing],
+        )
+
+
+def test_track_a_real_verified_label_data_is_stamped_correctly(tmp_path):
+    raw_file = _tiny_real_file(tmp_path, name="series_matrix_fixture.txt")
+    y_true = [0, 1, 1, 0, 1, 0]
+    y_pred = [0, 1, 1, 0, 0, 0]
+    subject_ids = [f"GSM{i}" for i in range(6)]
+    out = tracks.run_track_a_on_real_verified_label_data(
+        y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[raw_file],
+    )
+    validate_report(report_from_dict(out))
+    assert out["identity"]["synthetic_flag"] is False
+    assert out["identity"]["development_only_flag"] is True
+    assert out["identity"]["evidence_level"] == "development_only_real_data"
+    assert out["identity"]["dataset_accession"] == "GSE123352"
+    assert out["identity"]["verified_label_count"] == len(y_true)
+    assert out["metrics"]["weak_label_experiment"] is False
+    assert out["identity"]["assay_modality"] == "bulk_microarray"
+
+
+def test_track_a_real_data_fingerprint_changes_with_file_content(tmp_path):
+    file_a = _tiny_real_file(tmp_path, name="a.txt", content=b"content-one")
+    file_b = _tiny_real_file(tmp_path, name="b.txt", content=b"content-two")
+    y_true, y_pred, subject_ids = [0, 1], [0, 1], ["s0", "s1"]
+    out_a = tracks.run_track_a_on_real_verified_label_data(
+        y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[file_a],
+    )
+    out_b = tracks.run_track_a_on_real_verified_label_data(
+        y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[file_b],
+    )
+    assert out_a["identity"]["dataset_manifest_fingerprint"] != out_b["identity"]["dataset_manifest_fingerprint"]
