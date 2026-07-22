@@ -155,24 +155,52 @@ resampling uncertainty reporting, subgroup/fairness diagnostics, frozen
 calibration/thresholding, the artifact bundle writer/reader, and the
 `evidence.runner` umbrella CLI.
 
-What remains unimplemented is, in every case, **not a missing piece of
-code — it is the absence of any real dataset file in this environment**:
+GSE136831 and GSE123352 are downloaded locally in this environment
+(`data/raw/`, gitignored — never committed). Two real Track A runs have
+been executed against them:
 
-- **No cohort in this environment has real local files present.** `python
-  -m evidence.audit` reports `local_files_present: false` for all seven
-  registered cohorts and `overall_status: "blocked_no_real_data"`. This
-  repository's `data/` directory does not exist here; downloading and
-  authorizing access to GSE136831/GSE288003/GSE123352/GSE307690/
-  TCGA-LUAD/TCGA-LUSC/NLST (the last one controlled-access) is outside
-  what this change can or should do without explicit authorization and
-  network/storage access this environment does not have.
-- **Tracks A/B/C evaluation runners consequently have nothing to
-  evaluate.** `run_track_a/b/c_against_registry()` are honest
-  `not_evaluable` for every task, because `eligible_cohorts_for_track()`
-  finds no cohort with real local files. The `..._on_fixture()` paths run
-  the real metric-computation code end-to-end against synthetic data and
-  are stamped `synthetic_flag=True` — they prove the scoring code works,
-  never that real evidence exists.
+- **GSE136831 weak-label smoke-exposure experiment (real data, weak
+  proxy).** `scripts/run_gse136831_weak_label_evidence.py` runs the real
+  single-cell pipeline end to end; 46 real COPD/Control subjects (32 IPF
+  subjects excluded), subject-level split 33/7/6, cells subsampled to
+  300/subject for this environment's memory. Result:
+  `run_track_a_on_real_weak_label_data` — macro-F1 1.0 on 6 held-out test
+  subjects, but both classes are below the 5-subject learnability
+  threshold, so no learnability claim is made. `weak_label_experiment=True`
+  always; never merged with a verified-label result. Report artifact:
+  `artifacts/evidence/gse136831_weak_label_smoke_v1/`.
+- **GSE123352 verified-label smoke classification (real data, real
+  labels).** GSE123352 is bulk microarray — `src/data/bulk_pipeline.py` is
+  a new, minimal, separate path (never touches the single-cell MIL
+  pipeline; see `data/assay_policy.py`) that parses real per-sample
+  `ever_never_smoker` labels from the real downloaded series matrix. All
+  176 real subjects carried a verified label; 126/50 subject-level
+  train/test split; a train-only-fit logistic regression scored
+  **macro-F1 0.592, balanced accuracy 0.605** on the 50 held-out real test
+  subjects. `run_track_a_on_real_verified_label_data` stamps this
+  `evidence_level=development_only_real_data`,
+  `cohort_role=development` — `gse123352`'s `role_eligibility` is
+  `[development]` only; this is not an internal-held-out or external
+  claim. Report artifact:
+  `artifacts/evidence/gse123352_verified_label_smoke_v1/`.
+
+What remains unimplemented past these two runs is, in every case, **not a
+missing piece of code — it is the absence of a suitable real dataset file,
+or a real cross-assay/expression-outcome linkage, in this environment**:
+
+- **Five of seven registered cohorts still have no real local files
+  present** (GSE288003, GSE307690/CANUCK, TCGA-LUAD, TCGA-LUSC, NLST — the
+  last controlled-access). `python -m evidence.audit` reports
+  `partial_local_data_present` given GSE136831/GSE123352 are present.
+- **Track B (malignancy) and Track C (subject-level cancer prediction)
+  still have nothing eligible to evaluate**, independent of which cohorts
+  are downloaded: no single-cell cohort carries a malignancy label, and no
+  cohort has a genuine expression<->outcome linkage
+  (`expression_outcome_linkable_at_subject_level: false` everywhere in
+  `configs/cohorts.yaml`). `run_track_b/c_against_registry()` remain
+  honest `not_evaluable`. Their `..._on_fixture()` paths still run the
+  real metric-computation code end-to-end only against synthetic data,
+  stamped `synthetic_flag=True`.
 - **Candidate comparison (Step 9), repeated-resampling uncertainty
   (Step 10), and subgroup diagnostics (Step 13) are consequently framework-
   only.** `run_candidate_comparison_on_synthetic_fixture()`,
@@ -194,23 +222,41 @@ code — it is the absence of any real dataset file in this environment**:
   has not happened — no cohort in `configs/cohorts.yaml` currently has
   `role_eligibility` including `external_validation`.
 - **Step 18's adversarial test matrix** is complete for every framework
-  module above (1520 tests passing, including the leakage-isolation suite
-  in `tests/test_evidence_leakage_isolation.py`). The subset that would
-  exercise these same tests against genuine real (non-fixture, non-
-  synthetic) predictions cannot exist yet, for the same reason as
-  everything else in this section.
+  module above (1535 tests passing, including the leakage-isolation suite
+  in `tests/test_evidence_leakage_isolation.py`). The two real Track A
+  runs above are exercised by their own scripts/module tests against small
+  synthetic fixtures for speed (CI does not depend on the multi-gigabyte
+  real downloads); the real runs themselves were executed once, by hand,
+  against the real downloaded data, and their artifact bundles validate
+  cleanly via `evidence.runner validate`.
+- **External-validation release against a REAL external cohort (Step 11)**
+  has not happened — no cohort in `configs/cohorts.yaml` currently has
+  `role_eligibility` including `external_validation`, independent of the
+  two development-only real results above.
+- **Candidate comparison (Step 9), repeated-resampling uncertainty
+  (Step 10), subgroup diagnostics (Step 13), calibration/thresholding
+  (Step 14), and `evidence.runner development`/`internal-test`/
+  `external-test`** remain framework-only, run only against synthetic
+  development contexts — none of them has been run against the two real
+  Track A results above yet; that is genuine remaining work, not a data
+  blocker.
 
-No further engineering round changes this section: the blocker is data
-availability in this environment, not missing framework code.
+No further engineering round changes real cancer-prediction, malignancy,
+external-validation, or clinical-readiness status: those blockers are
+genuinely about missing linkage/authorization/cohorts, not missing
+framework code or missing local files for the two cohorts already
+downloaded.
 
 ## Why this is the honest outcome
 
-Running `PYTHONPATH=src python -m evidence.audit` against this repository,
-with no datasets downloaded and no NLST DUA obtained, returns
-`overall_status: "blocked_no_real_data"`. Per the specification: "If no
-suitable real dataset is locally available (this is the expected case —
-check first) ... produce a complete data audit and not_evaluable evidence
-report ... state clearly that real evidence remains blocked by data
-availability." That is exactly the state this change leaves the
-repository in — infrastructure and audited-blocker reporting, not
-manufactured evidence.
+Two of seven registered cohorts (GSE136831, GSE123352) have real local
+files in this environment, and both now have a genuine, once-executed,
+checksummed real-data Track A result — one weak-label, one verified-label,
+both `development`-role only. The other five cohorts remain undownloaded
+or (for NLST) unauthorized, and no cohort anywhere has a malignancy label
+or an expression<->outcome linkage, so Track B, Track C, external
+validation, and clinical readiness remain genuinely `not_evaluable`/
+`not_established` regardless of further downloads. Per the specification:
+state plainly what is real, what is weak-proxy, and what is still blocked
+— never merge the three. That is exactly the state this change leaves the
+repository in.

@@ -2418,45 +2418,76 @@ evidence that does not exist.
   and read-only; `development`/`internal-test`/`external-test` are honest
   stubs pending real-data pipeline integration).
 
-**Current audited data availability in this environment (run 2026-07):**
-running the audit CLI above against this repository, with no datasets
-downloaded, reports `overall_status: "blocked_no_real_data"` — every
-cohort's `local_files_present` is `false`, NLST's controlled-access
-authorization check is `false` (no `NLST_DATA_ROOT`), and every
-(task, cohort) row in the eligibility table is `IMPOSSIBLE`, never a
-fabricated eligible/ineligible count. This is the expected result in an
-environment where no multi-gigabyte GEO/TCGA download and no NLST DUA have
-been obtained — the audit's job is to report that honestly, not to
-manufacture a result around it.
+**Current audited data availability in this environment:** GSE136831 and
+GSE123352 are downloaded locally (`data/raw/`, gitignored); the other five
+registered cohorts (GSE288003, GSE307690/CANUCK, TCGA-LUAD/LUSC, NLST) are
+not, and NLST's controlled-access authorization check is `false` (no
+`NLST_DATA_ROOT`). `python -m evidence.audit` reports
+`partial_local_data_present` accordingly, never a fabricated eligible
+count for the five cohorts that are still absent.
 
 **Evidence status, stated plainly:**
-- **Real held-out smoke performance: not established.** The 77.2%/0.27
-  table above is a training-set number from before subject-level
-  splitting existed; it is historical and is not being reinterpreted as
-  held-out evidence.
-- **Real cancer-prediction performance: not established.** No cohort in
-  this repository currently has both compatible single-cell expression
-  input and a genuinely linked subject-level cancer outcome.
-- **External validation: not performed.** No eligible external cohort has
-  been identified (GSE288003 is mouse; the bulk cohorts and TCGA cannot
-  enter the single-cell pipeline without a bulk-pipeline the repository
-  does not have; NLST is inaccessible without a DUA).
-- **Clinical readiness: not established.** See `docs/CLINICAL_READINESS.md`
-  — every mandatory dimension is `not_started` or `blocked`, so
-  `overall_status` is `clinically_not_ready`.
+- **Real weak-label smoke-exposure result (GSE136831): executed, reported
+  honestly weak.** `scripts/run_gse136831_weak_label_evidence.py` ran the
+  real single-cell pipeline (qc_filter, normalize, train-only HVG
+  selection/scaling, logistic regression) against the real downloaded
+  GSE136831 matrix. Of 78 real subjects, 32 IPF subjects were excluded (IPF
+  is not a smoke-exposure proxy); the remaining 46 COPD/Control subjects
+  were subject-level split 33/7/6 (train/val/test). Cells were subsampled
+  to 300/subject (deterministic, seeded) so the dense HVG-selection matrix
+  fits in this environment's 16GB RAM — see the script's module docstring.
+  On the 6 held-out test subjects: macro-F1 1.0, but both classes (4 vs 2
+  subjects) are below this repository's 5-subject learnability-claim
+  threshold, so `run_track_a_on_real_weak_label_data` correctly declines to
+  make a learnability claim from this result. This is a **weak-label
+  sensitivity experiment** (`Disease_Identity=COPD` as a correlational
+  proxy for cigarette exposure, `Control` as the "never" proxy) — it is
+  never a verified-label result and is never merged with one. Report:
+  `artifacts/evidence/gse136831_weak_label_smoke_v1/` (gitignored).
+- **Real verified-label smoke-classification result (GSE123352):
+  executed.** `src/data/bulk_pipeline.py` (a new, minimal bulk-microarray
+  path — GSE123352 is bulk, never entered into the single-cell MIL
+  pipeline) parsed real per-sample `ever_never_smoker` phenotype values
+  from the real downloaded series matrix for all 176 real subjects; every
+  subject carried a verified label (0 excluded). A 70/30 subject-level
+  split gave 126 train / 50 test subjects (34 cigarette, 16 unexposed in
+  test). A train-only top-variance-gene-selected, train-only-standardized
+  L2 logistic regression (a first honest bulk baseline, not tuned)
+  achieved **macro-F1 0.592, balanced accuracy 0.605** on the 50 held-out
+  real test subjects. This is this repository's first real, primary,
+  verified-label Track A result — `evidence_level=development_only_real_data`
+  (development-cohort only; no frozen-test guard has been acquired for
+  this cohort/task, so this is not an internal-held-out or external claim).
+  Report: `artifacts/evidence/gse123352_verified_label_smoke_v1/`
+  (gitignored).
+- **Real cancer-prediction performance: still not established.** No
+  cohort in this repository has both compatible expression input and a
+  genuinely linked subject-level cancer outcome — downloading more data
+  does not change this; see `configs/cohorts.yaml`'s cohort-by-cohort
+  `expression_outcome_linkable_at_subject_level: false`.
+- **Malignancy classification: still not established.** No single-cell
+  cohort carries a per-cell/per-sample malignancy label.
+- **External validation: still not performed.** No eligible external
+  cohort exists (GSE288003 is mouse; the remaining bulk cohorts and TCGA
+  cannot enter the single-cell pipeline; NLST is inaccessible without a
+  DUA) — this is unaffected by the two real results above, both of which
+  are `development`-role only.
+- **Clinical readiness: still not established.** See
+  `docs/CLINICAL_READINESS.md` — every mandatory dimension is
+  `not_started` or `blocked`, so `overall_status` is
+  `clinically_not_ready`.
 
-**What Phase 7 does not yet do:** run any of the three evaluation tracks
-(Track A smoke classification / Track B malignancy classification /
-Track C subject-level cancer prediction), the candidate comparison,
-uncertainty reporting, subgroup diagnostics, calibration/thresholding, or
-the artifact bundle against real data — every one of those modules is
-implemented and tested against synthetic fixtures, but none has ever been
-run against a real cohort in this environment, because no cohort
-satisfies the eligibility gates here (`local_files_present: false` for
-all seven registered cohorts). `src/evidence/` is infrastructure and
-honest-blocker reporting, not a claim that real evidence has been
-generated — see `docs/EVIDENCE_PROTOCOL.md` for exactly which steps
-remain and why.
+**What Phase 7 does and does not do:** Track A now has two real executed
+results (above), one weak-label and one verified-label, both
+`development`-role only. Track B (malignancy classification) and Track C
+(subject-level cancer prediction), the candidate comparison, uncertainty
+reporting, subgroup diagnostics, calibration/thresholding, and the
+artifact bundle remain implemented and tested only against synthetic
+fixtures — none has been run against real data, because no cohort
+satisfies their eligibility gates. `src/evidence/` is infrastructure plus
+two genuine development-only real-data results, not a claim that
+clinical, external, or cancer-prediction evidence exists — see
+`docs/EVIDENCE_PROTOCOL.md` for exactly which steps remain and why.
 
 ## Next steps
 
