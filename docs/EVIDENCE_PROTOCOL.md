@@ -181,7 +181,7 @@ been executed against them:
   `smoke_type_known` value outright. All 176 real subjects carried a
   verified label and verified subject identity in the most recently
   validated run (2026-07-23, commit
-  `94a78450d22cc92dcda2e379b1f95c11170bf6e8`). A single 70/30
+  `c28eeee166ae98b3198ede46bcfc426bdd62a4f7`). A single 70/30
   subject-level split (124/50) with a train-only-fit logistic regression
   scored **macro-F1 0.653, balanced accuracy 0.700, accuracy 0.66**
   (confusion matrix `[[13,3],[14,20]]`, class counts unexposed=16/
@@ -235,13 +235,13 @@ been executed against them:
   `evidence_level=development_only_real_data`, `cohort_role=development`,
   `split_role=development_holdout` — `gse123352`'s `role_eligibility` is
   `[development]` only; this is not an internal-held-out or external claim.
-  Report artifacts: `artifacts/evidence/gse123352_verified_label_smoke_v1/`
-  (single-split), `artifacts/evidence/gse123352_repeated_development_v2/`
+  Report artifacts: `artifacts/evidence/gse123352_verified_label_smoke_v2/`
+  (single-split), `artifacts/evidence/gse123352_repeated_development_v3/`
   (repeated, baselines, full metrics, calibration, frozen-test eligibility —
   both gitignored); sanitized publication summaries:
-  `evidence/published/gse123352_verified_label_smoke_v1/summary.json`
+  `evidence/published/gse123352_verified_label_smoke_v2/summary.json`
   (single-split) and
-  `evidence/published/gse123352_repeated_development_v2/summary.json`
+  `evidence/published/gse123352_repeated_development_v3/summary.json`
   (repeated).
 - **GSE136831 COPD-vs-Control disease-status proxy sensitivity analysis
   (real data, explicitly NOT smoke-classification evidence).** GSE136831

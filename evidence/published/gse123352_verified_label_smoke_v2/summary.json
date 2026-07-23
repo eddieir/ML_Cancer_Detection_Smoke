@@ -24,8 +24,8 @@
   "preprocessing_artifact_fingerprint": "6acade252ac0e38d518f09899cf8ea05958ced4e74d193533a93e50e40aee31a",
   "model_fingerprint": "a581c773597f7802cd7b76df600d8e6abd21e114594f45ff5b8f8f713e8ffcbb",
   "random_seed": 42,
-  "code_commit_sha": "94a78450d22cc92dcda2e379b1f95c11170bf6e8",
-  "environment_fingerprint": "1d6a369ec2cfbf53b53cd2b0cee2edf1fb9c0ab27ede2b1b2319f219f206c150",
+  "code_commit_sha": "c28eeee166ae98b3198ede46bcfc426bdd62a4f7",
+  "environment_fingerprint": "8155b48f9f8e49f2fbbcf79fec276ffde18e8e1d959217b3b7de8a36cc83198a",
   "synthetic_flag": false,
   "development_only_flag": true,
   "frozen_test_access_status": "not_applicable",
@@ -35,7 +35,7 @@
     "development_only_flag=True \u2014 gse123352's role_eligibility is [development] only and no frozen-test guard has ever been acquired for this cohort/task.",
     "Simple L2 logistic regression over train-only top-variance genes \u2014 a first honest bulk baseline, not a tuned or externally validated model."
   ],
-  "evaluation_timestamp": "2026-07-23T09:56:58.804341Z",
+  "evaluation_timestamp": "2026-07-23T12:16:31.893315Z",
   "report_schema_version": "1",
   "metrics": {
     "primary_metric": "macro_f1",
@@ -74,8 +74,8 @@
     "weak_label_experiment": false,
     "classes_below_support_threshold": []
   },
-  "report_content_fingerprint": "91b6cbcc595a33b536726c3d959dfcfb8668bd1f6c636b8ffe329abe6e39f293",
-  "source_private_bundle_fingerprint": "78fac06e3b67ae205165e776b6535688c894641b4847316c29b557ba7b16336f",
+  "report_content_fingerprint": "3044a328e9ec67c05761463ace42eb0d56e9c7a428e73c399680fc740afd4d87",
+  "source_private_bundle_fingerprint": "644f2a305f2497c0340a82f42ab0fb0a6363b59573d04ae34ffd6019577fae62",
   "run_status": "complete",
   "split_configuration": {
     "schema_version": "1",
@@ -106,5 +106,5 @@
     "external_subject_ids_count": 0,
     "fingerprint": "a18e2ecb3b55bcb3045c9636c526c440a8e0e793683218c39dcdda5cf782dec3"
   },
-  "checksum_sha256": "906a4f15017b5ceac0e11553f63ea600e3cf6f02e61449203411340ce8bf44a2"
+  "checksum_sha256": "369dc0b91881cc67c69d24447684deb02f6f2db8bbcdfb84e10530d034e99c5a"
 }

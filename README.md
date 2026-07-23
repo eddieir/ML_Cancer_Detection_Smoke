@@ -2478,7 +2478,7 @@ loaded from a validated evidence artifact):**
   `smoke_type_known` value is rejected outright, never silently coerced. A
   single 70/30 split (124 train / 50 test) achieved **macro-F1 0.653,
   balanced accuracy 0.700** on 50 held-out subjects (validated
-  2026-07-23, commit `94a78450d22cc92dcda2e379b1f95c11170bf6e8`) — this
+  2026-07-23, commit `c28eeee166ae98b3198ede46bcfc426bdd62a4f7`) — this
   remains a labeled, single-split **exploratory** finding, not the primary
   estimate; the split changed from an earlier pre-remediation run because
   it is now correctly keyed on verified donor subject IDs rather than raw
@@ -2513,8 +2513,8 @@ loaded from a validated evidence artifact):**
   subjects (58 minority-class) versus a configured minimum of 300 total /
   50 per class — carving a third partition out of a cohort this small would
   leave every partition too small to trust, so no frozen partition is
-  created. Sanitized artifacts: `evidence/published/gse123352_verified_label_smoke_v1/summary.json`
-  (single-split) and `evidence/published/gse123352_repeated_development_v2/summary.json`
+  created. Sanitized artifacts: `evidence/published/gse123352_verified_label_smoke_v2/summary.json`
+  (single-split) and `evidence/published/gse123352_repeated_development_v3/summary.json`
   (repeated, baselines, full metrics, calibration, and the frozen-test
   eligibility decision); private bundles under `artifacts/evidence/`
   (gitignored — regenerate via `evidence.development.run_gse123352_repeated_development`
