@@ -22,13 +22,16 @@ from data.bulk_pipeline import (
     fit_bulk_logistic_regression,
     apply_bulk_classifier,
     load_bulk_expression_and_labels,
+    parse_strict_bool,
     run_bulk_smoke_classification,
     split_bulk_subjects,
 )
 
 
 def _write_fixture(tmp_path, n_samples=40, n_genes=50, seed=0, all_unknown=False,
-                    single_class=False, missing_meta=False, extra_class=False):
+                    single_class=False, missing_meta=False, extra_class=False,
+                    unverified_subject_indices=(), duplicate_subject=False,
+                    smoke_type_known_values=None):
     rng = np.random.RandomState(seed)
     sample_ids = [f"GSM{1000+i}" for i in range(n_samples)]
     gene_ids = [f"GENE{i}" for i in range(n_genes)]
@@ -53,11 +56,19 @@ def _write_fixture(tmp_path, n_samples=40, n_genes=50, seed=0, all_unknown=False
     expr.to_csv(csv_path)
 
     if not missing_meta:
-        known = [not all_unknown] * n_samples
+        known = smoke_type_known_values if smoke_type_known_values is not None else (
+            [not all_unknown] * n_samples
+        )
+        subject_ids = [f"SUBJ{1000+i}" for i in range(n_samples)]
+        if duplicate_subject and n_samples >= 2:
+            subject_ids[1] = subject_ids[0]
+        subject_verified = [i not in set(unverified_subject_indices) for i in range(n_samples)]
         meta = pd.DataFrame({
             "sample_id": sample_ids,
             "smoke_type": labels,
             "smoke_type_known": known,
+            "subject_id": subject_ids,
+            "subject_id_verified": subject_verified,
         })
         meta_path = tmp_path / "FAKE_samples_meta.csv"
         meta.to_csv(meta_path, index=False)
@@ -70,6 +81,16 @@ def test_load_bulk_expression_and_labels_real_fixture(tmp_path):
     expr, meta = load_bulk_expression_and_labels(csv_path)
     assert expr.shape[1] == 40
     assert meta["smoke_type_known"].astype(bool).all()
+
+
+def test_load_bulk_expression_and_labels_missing_subject_columns_raises(tmp_path):
+    csv_path = _write_fixture(tmp_path, n_samples=10)
+    meta_path = tmp_path / "FAKE_samples_meta.csv"
+    meta = pd.read_csv(meta_path)
+    meta = meta.drop(columns=["subject_id", "subject_id_verified"])
+    meta.to_csv(meta_path, index=False)
+    with pytest.raises(BulkPipelineError):
+        load_bulk_expression_and_labels(csv_path)
 
 
 def test_load_bulk_expression_and_labels_missing_sidecar_raises(tmp_path):
@@ -153,3 +174,50 @@ def test_run_bulk_smoke_classification_no_subject_leakage(tmp_path):
     train_ids = set(result["train"]["subject_ids"])
     test_ids = set(result["test"]["subject_ids"])
     assert not (train_ids & test_ids)
+
+
+def test_build_bulk_smoke_dataset_excludes_unverified_subject(tmp_path):
+    csv_path = _write_fixture(tmp_path, n_samples=20, unverified_subject_indices=(0, 3))
+    dataset = build_bulk_smoke_dataset(csv_path)
+    assert dataset.X.shape[0] == 18
+    assert dataset.excluded_reason_counts.get("subject_identity_unverified") == 2
+
+
+def test_build_bulk_smoke_dataset_duplicate_verified_subject_raises(tmp_path):
+    csv_path = _write_fixture(tmp_path, n_samples=20, duplicate_subject=True)
+    with pytest.raises(BulkPipelineError):
+        build_bulk_smoke_dataset(csv_path)
+
+
+# ─── parse_strict_bool ──────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value,expected", [
+    (True, True), (False, False),
+    (1, True), (0, False),
+    ("true", True), ("True", True), ("1", True),
+    ("false", False), ("False", False), ("0", False),
+])
+def test_parse_strict_bool_accepts_documented_values(value, expected):
+    assert parse_strict_bool(value, field_name="f", row_context="r") is expected
+
+
+def test_parse_strict_bool_string_false_is_never_truthy():
+    # the specific regression this parser exists to close: bool("False") is
+    # True in plain Python, but parse_strict_bool must return False.
+    assert parse_strict_bool("False", field_name="f", row_context="r") is False
+
+
+@pytest.mark.parametrize("value", [
+    float("nan"), None, "", "   ", "yes", "no", "TRUE_ISH", 2, -1, [True], {"a": 1},
+])
+def test_parse_strict_bool_rejects_ambiguous_values(value):
+    with pytest.raises(BulkPipelineError):
+        parse_strict_bool(value, field_name="f", row_context="r")
+
+
+def test_build_bulk_smoke_dataset_mixed_valid_invalid_smoke_type_known_column_raises(tmp_path):
+    n = 10
+    values = ["True"] * (n - 1) + ["not_a_bool"]
+    csv_path = _write_fixture(tmp_path, n_samples=n, smoke_type_known_values=values)
+    with pytest.raises(BulkPipelineError):
+        build_bulk_smoke_dataset(csv_path)

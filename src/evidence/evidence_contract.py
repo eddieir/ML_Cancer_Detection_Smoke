@@ -30,6 +30,7 @@ from .errors import (
     EvidenceIdentityMismatchError,
     UnsupportedEvidenceClaimError,
 )
+from .run_identity import validate_real_timestamp
 
 REPORT_SCHEMA_VERSION = "1"
 
@@ -70,6 +71,20 @@ EXTERNAL_LEVELS = (
 )
 
 VALID_COHORT_ROLES = ("development", "internal_test", "external_validation", "excluded")
+
+# A report's split_role must name what the scored subjects actually were —
+# never the generic "train" for a result that is in fact a held-out
+# development/internal/external partition (Issue #16 blocker 1). Kept
+# deliberately narrow: any code path that cannot honestly name one of
+# these is not allowed to build a real evidence report at all.
+VALID_SPLIT_ROLES = (
+    "development_train",
+    "development_validation",
+    "development_oof",
+    "development_holdout",
+    "internal_test",
+    "external_validation",
+)
 
 REQUIRED_IDENTITY_FIELDS = (
     "task",
@@ -268,6 +283,18 @@ def validate_identity(identity: Dict[str, Any]) -> None:
         raise ReportValidationError(
             f"cohort_role {identity['cohort_role']!r} is not one of {VALID_COHORT_ROLES}"
         )
+
+    if identity["split_role"] not in VALID_SPLIT_ROLES:
+        raise ReportValidationError(
+            f"split_role {identity['split_role']!r} is not one of {VALID_SPLIT_ROLES} — a report "
+            "must name what the scored subjects actually were (e.g. a held-out development "
+            "partition must never be recorded as 'train')"
+        )
+
+    try:
+        validate_real_timestamp(identity["evaluation_timestamp"])
+    except ValueError as exc:
+        raise ReportValidationError(f"evaluation_timestamp is invalid: {exc}") from exc
 
     for fp_field in FINGERPRINT_FIELDS:
         if fp_field in identity and identity[fp_field] is not None:

@@ -44,7 +44,7 @@ def _base_identity(**overrides) -> dict:
         "verified_label_count": 10,
         "unknown_label_count": 0,
         "excluded_subject_count": 0,
-        "split_role": "train",
+        "split_role": "development_train",
         "split_manifest_fingerprint": FAKE_FP,
         "dataset_manifest_fingerprint": FAKE_FP,
         "preprocessing_artifact_fingerprint": FAKE_FP,

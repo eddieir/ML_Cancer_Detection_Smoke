@@ -40,8 +40,19 @@ def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list
     the series ships its expression matrix as a separate supplementary file
     instead of embedding it, e.g. GSE307690/CANUCK).
     """
+    sample_ids, meta, table_lines, _titles = _parse_sample_metadata_with_titles(gz_path)
+    return sample_ids, meta, table_lines
+
+
+def _parse_sample_metadata_with_titles(gz_path: Path) -> tuple[list[str], pd.DataFrame, list[str], list[str]]:
+    """Same as `_parse_sample_metadata`, plus the raw `!Sample_title` values
+    (in the same GSM column order) — used by `_infer_subject_id_column` to
+    recover a genuine donor identifier for cohorts whose series matrix
+    encodes one in the sample title (e.g. GSE123352's
+    "non_involved_lung_tissue_patient_N")."""
     opener = gzip.open if gz_path.suffix == ".gz" else open
     sample_ids: list[str] = []
+    titles: list[str] = []
     char_rows: dict[str, list[str]] = {}
     table_lines: list[str] = []
     in_table = False
@@ -51,6 +62,8 @@ def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list
             line = line.rstrip("\n")
             if line.startswith("!Sample_geo_accession"):
                 sample_ids = [s.strip('"') for s in line.split("\t")[1:]]
+            elif line.startswith("!Sample_title"):
+                titles = [s.strip('"') for s in line.split("\t")[1:]]
             elif line.startswith("!Sample_characteristics_ch1"):
                 vals = [s.strip('"') for s in line.split("\t")[1:]]
                 for v in vals:
@@ -69,7 +82,79 @@ def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list
         if len(vals) == len(sample_ids):
             meta[key] = vals
 
-    return sample_ids, meta, table_lines
+    if len(titles) != len(sample_ids):
+        titles = []
+
+    return sample_ids, meta, table_lines, titles
+
+
+_PATIENT_TITLE_RE = re.compile(r"patient[_\s]?(\d+)", re.I)
+
+
+def _infer_subject_id_column(
+    accession: str, sample_ids: list[str], titles: list[str],
+) -> "tuple[pd.Series, pd.Series, str]":
+    """Cohort-specific, versioned subject-identity policy for series-matrix
+    accessions that encode a donor number in `!Sample_title` (documented
+    today for GSE123352: titles of the form
+    "non_involved_lung_tissue_patient_<N> <GEO array position>", one
+    distinct N per GSM with no repeats — i.e. one bulk sample per donor;
+    see docs/DATA_CARD.md).
+
+    Returns (subject_id, subject_id_verified, policy_note). subject_id is
+    only trusted (subject_id_verified=True for every row) when every
+    sample's title matches the documented "patient_<N>" pattern AND the
+    resulting donor numbers are unique across the whole series — i.e. a
+    verified one-sample-per-donor mapping. If titles are absent, any
+    sample's title fails to match, or two samples resolve to the same
+    donor number, this fails closed: subject_id falls back to sample_id
+    (GSM accession) but subject_id_verified=False for every row, so a
+    caller that requires verified subject independence (see
+    data/bulk_pipeline.py) must refuse to make a subject-level claim
+    rather than silently trust sample_id as if it were a genuine donor id.
+    """
+    if not titles:
+        return (
+            pd.Series(sample_ids, index=sample_ids),
+            pd.Series(False, index=sample_ids),
+            "no !Sample_title field was present to parse a donor identifier from — "
+            "subject independence could not be verified; sample_id was used as a "
+            "fallback and must not be treated as a verified subject id.",
+        )
+
+    matches = [_PATIENT_TITLE_RE.search(t) for t in titles]
+    if not all(matches):
+        return (
+            pd.Series(sample_ids, index=sample_ids),
+            pd.Series(False, index=sample_ids),
+            "one or more !Sample_title values did not match the documented "
+            "'patient_<N>' pattern — subject independence could not be verified; "
+            "sample_id was used as a fallback and must not be treated as a "
+            "verified subject id.",
+        )
+
+    donor_nums = [m.group(1) for m in matches]
+    if len(set(donor_nums)) != len(donor_nums):
+        return (
+            pd.Series(sample_ids, index=sample_ids),
+            pd.Series(False, index=sample_ids),
+            "two or more samples resolved to the same donor number parsed from "
+            "!Sample_title — this contradicts the documented one-sample-per-donor "
+            "assumption for this accession; subject independence could not be "
+            "verified and sample_id was used as a fallback only.",
+        )
+
+    subject_ids = pd.Series(
+        [f"{accession}_patient_{n}" for n in donor_nums], index=sample_ids,
+    )
+    return (
+        subject_ids,
+        pd.Series(True, index=sample_ids),
+        "subject_id parsed and verified from !Sample_title's documented "
+        "'patient_<N>' pattern: every sample resolved to a distinct donor number, "
+        "confirming one bulk sample per donor for this accession (see "
+        "docs/DATA_CARD.md's GSE123352 subject-identity policy).",
+    )
 
 
 def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -83,7 +168,14 @@ def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             parsed from `!Sample_characteristics_ch1` lines of the form
             "key: value".
     """
-    sample_ids, meta, table_lines = _parse_sample_metadata(gz_path)
+    expr, meta, _titles = _parse_series_matrix_with_titles(gz_path)
+    return expr, meta
+
+
+def _parse_series_matrix_with_titles(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Same as `_parse_series_matrix`, plus the raw `!Sample_title` values in
+    GSM column order (see `_parse_sample_metadata_with_titles`)."""
+    sample_ids, meta, table_lines, titles = _parse_sample_metadata_with_titles(gz_path)
     if not table_lines:
         raise ValueError(f"No expression table found in {gz_path}")
 
@@ -91,7 +183,7 @@ def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     expr = pd.read_csv(StringIO("\n".join(table_lines)), sep="\t", index_col=0)
     expr.columns = [c.strip('"') for c in expr.columns]
 
-    return expr, meta
+    return expr, meta, titles
 
 
 _SMOKE_STATUS_PATTERNS = {
@@ -187,7 +279,7 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
     (transforms.py) already resolves BioMart's many-probes-to-one-gene case.
     """
     out_dir = _mkout()
-    expr, meta = _parse_series_matrix(gz_path)
+    expr, meta, titles = _parse_series_matrix_with_titles(gz_path)
 
     if platform_annot_path is not None:
         n_probes = len(expr)
@@ -216,6 +308,13 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
         ),
         index=expr.columns,
     )
+
+    subject_id, subject_id_verified, subject_id_policy_note = _infer_subject_id_column(
+        accession, list(expr.columns), titles,
+    )
+    subject_id = subject_id.reindex(expr.columns)
+    subject_id_verified = subject_id_verified.reindex(expr.columns).fillna(False)
+
     pd.DataFrame({
         "sample_id": expr.columns,
         "smoke_type": smoke.values,
@@ -223,6 +322,9 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
         "smoke_type_source": f"GEO {accession} series matrix characteristics",
         "smoke_type_method": "regex_pattern_match",
         "smoke_type_limitation": limitation.values,
+        "subject_id": subject_id.values,
+        "subject_id_verified": subject_id_verified.values,
+        "subject_id_policy_note": subject_id_policy_note,
     }).to_csv(meta_path, index=False)
 
     n_unknown = int((~known).sum())
