@@ -134,23 +134,36 @@ def assess_clinical_readiness(dimensions: List[DimensionAssessment], commit_sha:
     )
 
 
-def guard_clinical_claim(report: ClinicalReadinessReport, *, signed_external_evidence_manifest: bool) -> None:
+def guard_clinical_claim(
+    report: ClinicalReadinessReport, *,
+    evidence_manifest: "ClinicalEvidenceManifest",
+    approved_public_keys: Dict[str, bytes],
+    evidence_reports: Dict[str, dict],
+) -> None:
     """The single choke point every CLI/report code path MUST call before
     emitting any clinical-readiness claim (a --clinical-ready flag,
     clinical_validated=true, a model-card "ready for clinical use"
-    statement, etc). Raises unless the assessed overall_status has
-    actually reached the (still-qualified) complete state AND the caller
-    attests a signed external evidence manifest is present — this function
-    performs no I/O and cannot be satisfied by simply passing True; it is
-    the caller's responsibility not to lie about signed_external_evidence_manifest,
-    exactly as it is the caller's responsibility not to lie about any other
-    identity field in this framework."""
+    statement, etc). Raises unless BOTH:
+      (a) the assessed overall_status has actually reached the
+          (still-qualified) complete state, and
+      (b) `evidence_manifest` is a real, unexpired
+          evidence/clinical_manifest.ClinicalEvidenceManifest whose
+          signature verifies against `approved_public_keys` and whose
+          referenced evidence is independently validated against
+          `evidence_reports` (see clinical_manifest.py).
+
+    There is no boolean parameter here — a caller cannot satisfy this
+    function by passing True. `approved_public_keys` must come from the
+    caller's own configuration; this repository's default configuration
+    ships none (see configs/clinical_readiness.yaml), so by default this
+    function is unsatisfiable regardless of what manifest is supplied."""
+    from .clinical_manifest import validate_clinical_evidence_manifest
+
     if report.overall_status != "mandatory_dimensions_complete_expert_review_required":
         raise ClinicalReadinessNotEstablishedError(
             f"cannot emit a clinical-readiness claim: overall_status={report.overall_status!r} — "
             "mandatory dimensions are not all complete"
         )
-    if not signed_external_evidence_manifest:
-        raise ClinicalReadinessNotEstablishedError(
-            "cannot emit a clinical-readiness claim without a signed external evidence manifest"
-        )
+    validate_clinical_evidence_manifest(
+        evidence_manifest, approved_public_keys=approved_public_keys, evidence_reports=evidence_reports,
+    )
