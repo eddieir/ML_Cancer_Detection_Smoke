@@ -2500,38 +2500,48 @@ unqualified "ready") once every mandatory dimension is `complete`.
 `guard_clinical_claim()` is the single choke point any CLI/report code
 path must call before emitting a clinical-readiness claim; it raises
 `ClinicalReadinessNotEstablishedError` unless that status has been reached
-*and* the caller attests a signed external-evidence manifest is present.
+*and* the caller supplies a real, Ed25519-signed `ClinicalEvidenceManifest`
+(`evidence/clinical_manifest.py`) whose signature verifies against a
+caller-configured approved-public-key allow-list and whose referenced
+evidence reports independently validate — never a boolean. This
+repository's default configuration ships no approved public key, so by
+default no manifest can satisfy this gate.
 
 ### 17.5 What Phase 7 does not implement
 
-Every remaining framework module named in the Phase 7 specification now
-exists and is tested against synthetic fixtures and the real (currently
-empty-of-external-cohorts) registry:
-`evidence/external_validation.py` (`ExternalValidationGate`,
-`evaluate_external_cohort_eligibility()`),
+Every framework module named in the Phase 7 specification now exists.
+Most remain tested only against synthetic fixtures and the real (still
+empty-of-external-cohorts) registry: `evidence/external_validation.py`
+(`ExternalValidationGate`, `evaluate_external_cohort_eligibility()`),
 `tests/test_evidence_leakage_isolation.py` (corruption-isolation tests
 reusing `benchmarks/sentinel.py`'s poison-object pattern),
 `evidence/candidate_comparison.py` (identical-partition comparison across
-baseline and MIL-kind candidates, driven through the existing
-`benchmarks/cross_validation.py`/`benchmarks/final_evaluation.py`
-machinery), `evidence/uncertainty.py` (repeated grouped-resampling
-subject-level bootstrap CIs, structurally confined to
-`role="development"` input), `evidence/subgroups.py` (subgroup/fairness
-diagnostics over the five dimensions this repository has a genuine data
-source for, refusing to fabricate any other), `evidence/calibration.py`
-(frozen calibration/thresholding, `decision_curve_analysis()`),
-`evidence/artifact_bundle.py` (the immutable `artifacts/evidence/<run_id>/`
-writer/reader), and `evidence/runner.py` (the `python -m evidence.runner`
-CLI: `audit`/`inspect`/`validate`/`clinical-readiness` fully implemented;
-`development`/`internal-test`/`external-test` are honest stubs).
+baseline and MIL-kind candidates), `evidence/subgroups.py`
+(subgroup/fairness diagnostics over the five dimensions this repository
+has a genuine data source for, refusing to fabricate any other), and
+`evidence/calibration.py` (frozen calibration/thresholding,
+`decision_curve_analysis()`).
 
-What remains unimplemented is not code — it is real data. None of the
-modules above has ever processed a genuine development/internal-test/
-external-test prediction, because no cohort in `configs/cohorts.yaml` has
-local files present in this environment (`python -m evidence.audit`
-reports `overall_status: "blocked_no_real_data"`). Their synthetic-fixture
-paths prove the real Phase 1-6 training/scoring/statistics code executes
-correctly end to end; they are never read as evidence that a real
-candidate comparison, uncertainty estimate, subgroup breakdown,
-calibration, or external-cohort release has occurred. See
-`docs/EVIDENCE_PROTOCOL.md` for the complete list and reasoning.
+`evidence/uncertainty.py` (repeated grouped-resampling subject-level
+bootstrap CIs, structurally confined to `role="development"` input),
+`evidence/artifact_bundle.py` (the immutable `artifacts/evidence/<run_id>/`
+writer/reader), `evidence/publication.py` (sanitized publication summaries
+derived from a validated private bundle), `evidence/development.py`
+(canonical `development`/`internal-test`/`external-test` orchestration),
+and `evidence/runner.py` (the `python -m evidence.runner` CLI) HAVE now
+processed real GSE123352/GSE136831 predictions — see
+`docs/EVIDENCE_PROTOCOL.md` for the exact scope and numbers. `internal-test`
+and `external-test` remain honest, specifically-reasoned gates
+(`NO_FROZEN_TEST_PARTITION_EXISTS`, `NO_ELIGIBLE_EXTERNAL_COHORT`), not
+because the code is missing but because no cohort has ever had a frozen
+internal-test partition created/guarded and none carries
+`role_eligibility=[external_validation]`.
+
+What remains unimplemented for candidate comparison, subgroup diagnostics,
+and calibration is not code — it is real internal-test/external-test
+predictions, which do not exist for any cohort in this repository. Their
+synthetic-fixture paths prove the real Phase 1-6 training/scoring/
+statistics code executes correctly end to end; they are never read as
+evidence that a real candidate comparison, subgroup breakdown, or
+calibration has occurred. See `docs/EVIDENCE_PROTOCOL.md` for the complete
+list and reasoning.

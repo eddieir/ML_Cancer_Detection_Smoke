@@ -33,18 +33,18 @@ cohorts:
     expression_outcome_linkable_at_subject_level: false
     source_limitations:
       - "Vanderbilt/Habermann interstitial lung disease atlas (COPD/IPF/Control) — real per-donor cells/subject IDs, but no verified per-subject cigarette-exposure field."
-      - "Disease_Identity=COPD is a weak exposure proxy only (smoke_label_method=weak_proxy, confidence=low) — never used as a verified cigarette label."
+      - "Disease_Identity=COPD is a clinical disease diagnosis with strong smoking association but also documented non-smoking causes (alpha-1 antitrypsin deficiency, occupational/environmental exposure, biomass fuel smoke); Disease_Identity=Control does not prove never-smoking. Neither is a verified cigarette-exposure label — see evidence.tracks.run_copd_control_proxy_analysis (task=exploratory_disease_proxy_analysis, never smoke_classification)."
       - "Cannot independently provide verified cancer outcomes."
     licensing_access_limitations: "Public GEO series, no DUA required."
     checksum_rule: "sha256 of each raw_file_names entry under raw_subdir, per src/data/manifest.py."
     task_support:
-      smoke_classification: not_currently   # unknown labels excluded from supervised smoke metrics by default; weak-label experiment is a separate, explicitly enabled, separately reported path
+      smoke_classification: "no"   # no verified smoke label exists for this cohort at all — see exploratory_disease_proxy_analysis for the separate, non-smoke COPD-vs-Control proxy path
       malignancy_classification: "no"
       subject_level_cancer_prediction: "no"
       external_validation: "no"
     role_eligibility: [development]
     notes:
-      - "Unknown smoke labels are excluded from supervised smoke metrics unless an explicitly enabled weak-label experiment is run, and that experiment's results are reported separately and never merged with primary verified-label results."
+      - "This cohort supports no verified smoke_classification evidence. A separate, explicitly non-smoke COPD-vs-Control disease-status proxy sensitivity analysis exists (evidence.tracks.run_copd_control_proxy_analysis, scripts/run_gse136831_copd_control_proxy_analysis.py) — its task is exploratory_disease_proxy_analysis, its verified_label_count is always 0, and it can never be merged with or promoted into verified-label smoke evidence."
 
   - cohort_id: gse288003
     accession: GSE288003

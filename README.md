@@ -2370,13 +2370,18 @@ evidence that does not exist.
   It never trains, fits preprocessing, or downloads anything; it reports
   which datasets have local files, which cohorts are controlled-access and
   unauthorized, and a per-task eligibility table.
-- `src/evidence/clinical_readiness.py` + `configs/clinical_readiness.yaml`
-  + `docs/CLINICAL_READINESS.md` — a 22-dimension staged clinical-readiness
-  assessment. `assess_clinical_readiness()` can only report
-  `clinically_not_ready` unless every mandatory dimension is independently
-  `complete` with a real evidence reference, and `guard_clinical_claim()`
-  additionally requires a signed external-evidence manifest before any
-  code path may emit a clinical-readiness claim.
+- `src/evidence/clinical_readiness.py` + `src/evidence/clinical_manifest.py`
+  + `configs/clinical_readiness.yaml` + `docs/CLINICAL_READINESS.md` — a
+  22-dimension staged clinical-readiness assessment. `assess_clinical_readiness()`
+  can only report `clinically_not_ready` unless every mandatory dimension
+  is independently `complete` with a real evidence reference, and
+  `guard_clinical_claim()` requires a real, Ed25519-signed
+  `ClinicalEvidenceManifest` (`evidence/clinical_manifest.py`) whose
+  signature verifies against a caller-configured approved-public-key
+  allow-list and whose referenced evidence reports independently validate
+  — not a caller-controlled boolean. This repository's default
+  configuration ships no approved public key, so by default no manifest
+  can unlock a clinical-readiness claim regardless of its content.
 - `src/evidence/tracks.py` — Track A (smoke classification), Track B
   (malignancy classification), Track C (subject-level cancer prediction),
   each with a real registry-checked path (honestly `not_evaluable` for
@@ -2413,10 +2418,40 @@ evidence that does not exist.
 - `src/evidence/artifact_bundle.py` — an atomic, checksummed, immutable
   writer/reader for `artifacts/evidence/<run_id>/` run directories; a run
   directory already marked complete can never be written into again.
+- `src/evidence/run_identity.py` — real, versioned identity primitives for
+  non-fixture evidence reports: a genuine UTC timestamp
+  (`utc_now_iso`/`validate_real_timestamp` — placeholders like the Unix
+  epoch are rejected), a complete split manifest fingerprinted from the
+  actual train/validation/development-holdout partitions, seed,
+  stratification and label-mapping policy (`build_split_manifest` /
+  `split_manifest_fingerprint`, with `sanitize_split_manifest` producing a
+  publication-safe, count-only view), a real environment snapshot
+  (`build_environment_snapshot`), and real fitted-model/preprocessing
+  fingerprints for the bulk pipeline (`bulk_model_fingerprint` /
+  `bulk_preprocessing_fingerprint`, reusing
+  `benchmarks/model_fingerprint.py`'s whitelist-based canonicalization of
+  actual fitted state — never predictions, never a descriptive-label
+  fallback).
+- `src/evidence/development.py` — the canonical implementation behind
+  `evidence.runner development`/`internal-test`/`external-test`:
+  `run_development()` runs the real GSE123352 bulk-pipeline evaluation (or
+  a single-repeat estimate for any other cohort/task) plus
+  `run_gse123352_repeated_development()` for the repeated, seed-averaged
+  development estimate; `run_internal_test()`/`run_external_test()` are
+  honest gates that always return a specifically-reasoned `not_evaluable`
+  (no cohort has ever had a frozen internal-test partition created and
+  guarded; no cohort carries `role_eligibility=[external_validation]`) —
+  never a generic stub and never a fabricated result.
+- `src/evidence/publication.py` — derives a sanitized, non-identifying
+  summary (aggregate metrics, confusion matrix, fingerprints,
+  configuration, checksums — never subject/sample IDs, row-level
+  predictions, or local paths) from a validated private run bundle, writes
+  it to `evidence/published/<run_id>/summary.json`, and reloads +
+  re-validates it before returning.
 - `src/evidence/runner.py` — the `python -m evidence.runner` umbrella CLI
-  (`audit`, `inspect`, `validate`, `clinical-readiness` fully implemented
-  and read-only; `development`/`internal-test`/`external-test` are honest
-  stubs pending real-data pipeline integration).
+  (`audit`, `inspect`, `validate`, `clinical-readiness`, `development` are
+  fully implemented; `internal-test`/`external-test` are honest,
+  specifically-reasoned gates — see `evidence/development.py` above).
 
 **Current audited data availability in this environment:** GSE136831 and
 GSE123352 are downloaded locally (`data/raw/`, gitignored); the other five
@@ -2426,67 +2461,92 @@ not, and NLST's controlled-access authorization check is `false` (no
 `partial_local_data_present` accordingly, never a fabricated eligible
 count for the five cohorts that are still absent.
 
-**Evidence status, stated plainly:**
-- **Real weak-label smoke-exposure result (GSE136831): executed, reported
-  honestly weak.** `scripts/run_gse136831_weak_label_evidence.py` ran the
-  real single-cell pipeline (qc_filter, normalize, train-only HVG
-  selection/scaling, logistic regression) against the real downloaded
-  GSE136831 matrix. Of 78 real subjects, 32 IPF subjects were excluded (IPF
-  is not a smoke-exposure proxy); the remaining 46 COPD/Control subjects
-  were subject-level split 33/7/6 (train/val/test). Cells were subsampled
-  to 300/subject (deterministic, seeded) so the dense HVG-selection matrix
-  fits in this environment's 16GB RAM — see the script's module docstring.
-  On the 6 held-out test subjects: macro-F1 1.0, but both classes (4 vs 2
-  subjects) are below this repository's 5-subject learnability-claim
-  threshold, so `run_track_a_on_real_weak_label_data` correctly declines to
-  make a learnability claim from this result. This is a **weak-label
-  sensitivity experiment** (`Disease_Identity=COPD` as a correlational
-  proxy for cigarette exposure, `Control` as the "never" proxy) — it is
-  never a verified-label result and is never merged with one. Report:
-  `artifacts/evidence/gse136831_weak_label_smoke_v1/` (gitignored).
-- **Real verified-label smoke-classification result (GSE123352):
-  executed.** `src/data/bulk_pipeline.py` (a new, minimal bulk-microarray
-  path — GSE123352 is bulk, never entered into the single-cell MIL
-  pipeline) parsed real per-sample `ever_never_smoker` phenotype values
-  from the real downloaded series matrix for all 176 real subjects; every
-  subject carried a verified label (0 excluded). A 70/30 subject-level
-  split gave 126 train / 50 test subjects (34 cigarette, 16 unexposed in
-  test). A train-only top-variance-gene-selected, train-only-standardized
-  L2 logistic regression (a first honest bulk baseline, not tuned)
-  achieved **macro-F1 0.592, balanced accuracy 0.605** on the 50 held-out
-  real test subjects. This is this repository's first real, primary,
-  verified-label Track A result — `evidence_level=development_only_real_data`
-  (development-cohort only; no frozen-test guard has been acquired for
-  this cohort/task, so this is not an internal-held-out or external claim).
-  Report: `artifacts/evidence/gse123352_verified_label_smoke_v1/`
-  (gitignored).
-- **Real cancer-prediction performance: still not established.** No
-  cohort in this repository has both compatible expression input and a
-  genuinely linked subject-level cancer outcome — downloading more data
-  does not change this; see `configs/cohorts.yaml`'s cohort-by-cohort
-  `expression_outcome_linkable_at_subject_level: false`.
-- **Malignancy classification: still not established.** No single-cell
-  cohort carries a per-cell/per-sample malignancy label.
-- **External validation: still not performed.** No eligible external
-  cohort exists (GSE288003 is mouse; the remaining bulk cohorts and TCGA
-  cannot enter the single-cell pipeline; NLST is inaccessible without a
-  DUA) — this is unaffected by the two real results above, both of which
-  are `development`-role only.
-- **Clinical readiness: still not established.** See
-  `docs/CLINICAL_READINESS.md` — every mandatory dimension is
-  `not_started` or `blocked`, so `overall_status` is
-  `clinically_not_ready`.
+**Evidence status, stated plainly (current, canonical — supersedes PR #15's
+stale description and any number typed directly into a document rather than
+loaded from a validated evidence artifact):**
+- **GSE123352 verified binary bulk smoke-history result: exploratory,
+  development-only, real.** `src/data/bulk_pipeline.py` parses a real,
+  independently-verified per-subject **lifetime ever-versus-never
+  cigarette-smoking history** (not "at time of sampling" — a former smoker
+  is correctly included in the "ever" class) from the real downloaded
+  GSE123352 series matrix. Subject identity is independently verified per
+  sample (GEO `Sample_title`'s `patient_<N>` field, parsed and validated
+  one-to-one against GSM accessions — see `data/converters.py::
+  _infer_subject_id_column`); a sample whose subject identity cannot be
+  verified is excluded, never trusted. Strict boolean parsing
+  (`data.bulk_pipeline.parse_strict_bool`) means a malformed or ambiguous
+  `smoke_type_known` value is rejected outright, never silently coerced. A
+  single 70/30 split (124 train / 50 test) achieved **macro-F1 0.653,
+  balanced accuracy 0.700** on 50 held-out subjects (validated
+  2026-07-23, commit `94a78450d22cc92dcda2e379b1f95c11170bf6e8`) — this
+  remains a labeled, single-split **exploratory** finding, not the primary
+  estimate; the split changed from an earlier pre-remediation run because
+  it is now correctly keyed on verified donor subject IDs rather than raw
+  GSM accessions (see blocker 8 below).
+  `evidence.development.run_gse123352_repeated_development()` adds a
+  repeated grouped-development-holdout protocol across 8 predeclared seeds
+  (`configs/evidence.yaml`'s `development_repeat_seeds`) with fold-local C
+  selection (using only each seed's own outer-train partition) and
+  subject-level bootstrap confidence intervals per seed. Same validated
+  run: **macro-F1 mean 0.726 (std 0.037, range 0.667–0.783 across 8
+  seeds), balanced accuracy mean 0.728 (std 0.044)** — this is the current
+  primary development estimate; sanitized artifact:
+  `evidence/published/gse123352_verified_label_smoke_v1/summary.json`
+  (single-split) and `artifacts/evidence/gse123352_repeated_development_v1/`
+  (repeated, gitignored — regenerate + publish via
+  `evidence.development.run_gse123352_repeated_development` to reproduce).
+  Six-class single-cell smoke classification remains **not established**
+  on real data.
+- **GSE136831 COPD-vs-Control disease-status proxy analysis: real,
+  explicitly NOT smoke-classification evidence.** GSE136831 carries no
+  verified per-subject cigarette-exposure field. COPD is a clinical
+  diagnosis with strong smoking association but also documented
+  non-smoking causes; Control does not prove never-smoking.
+  `evidence.tracks.run_copd_control_proxy_analysis` (task=
+  `exploratory_disease_proxy_analysis`, never `smoke_classification`;
+  `verified_label_count` always `0`) scores this explicitly as a disease-
+  status proxy sensitivity analysis — a perfect score reflects, at most,
+  COPD-vs-Control disease-state separability, not smoke-exposure
+  classification performance. Its historical macro-F1 1.0 on 6
+  development-holdout subjects remains recorded only as a labeled,
+  low-support exploratory proxy result — it can never enter a verified
+  smoke-evidence table, cannot be selected by a caller flag, and cannot
+  satisfy any clinical-readiness dimension (see
+  `scripts/run_gse136831_copd_control_proxy_analysis.py`).
+- **Real cancer-prediction performance: not established.** No cohort in
+  this repository has both compatible expression input and a genuinely
+  linked subject-level cancer outcome — downloading more data does not
+  change this; see `configs/cohorts.yaml`'s cohort-by-cohort
+  `expression_outcome_linkable_at_subject_level: false`. TCGA bulk tumour
+  labels are never treated as per-cell malignancy labels; NLST outcomes
+  are never linked to unrelated expression cohorts.
+- **Malignancy classification: not established.** No single-cell cohort
+  carries a per-cell/per-sample malignancy label.
+- **External validation: not performed.** No cohort in `configs/cohorts.yaml`
+  carries `role_eligibility=[external_validation]`;
+  `evidence.development.run_external_test()` always returns a structured
+  `NO_ELIGIBLE_EXTERNAL_COHORT`.
+- **Clinical readiness: not established (`clinically_not_ready`).** See
+  `docs/CLINICAL_READINESS.md`. `guard_clinical_claim()` requires a real,
+  signed `ClinicalEvidenceManifest` verified against a configured
+  approved-public-key allow-list; the default repository configuration
+  ships no such key, so no manifest — however constructed — can unlock a
+  clinical-readiness claim by default.
+- **Historical 77.2% accuracy / 0.27 macro-F1** (referenced elsewhere in
+  this document) remains a training-set-only, pre-subject-split number,
+  incompatible with the current assay-separated, subject-level-split
+  evidence framework — not a current performance estimate.
 
-**What Phase 7 does and does not do:** Track A now has two real executed
-results (above), one weak-label and one verified-label, both
+**What Phase 7 does and does not do:** Track A has real, honestly-scoped
+results for GSE123352 (exploratory single-split + repeated development) and
+a real, explicitly-non-smoke GSE136831 disease-status proxy analysis, all
 `development`-role only. Track B (malignancy classification) and Track C
-(subject-level cancer prediction), the candidate comparison, uncertainty
-reporting, subgroup diagnostics, calibration/thresholding, and the
-artifact bundle remain implemented and tested only against synthetic
-fixtures — none has been run against real data, because no cohort
-satisfies their eligibility gates. `src/evidence/` is infrastructure plus
-two genuine development-only real-data results, not a claim that
-clinical, external, or cancer-prediction evidence exists — see
+(subject-level cancer prediction), the candidate comparison, subgroup
+diagnostics, and calibration/thresholding remain implemented and tested
+only against synthetic fixtures — none has been run against real data,
+because no cohort satisfies their eligibility gates. `src/evidence/` is
+infrastructure plus genuine development-only real-data results, not a
+claim that clinical, external, or cancer-prediction evidence exists — see
 `docs/EVIDENCE_PROTOCOL.md` for exactly which steps remain and why.
 
 ## Next steps

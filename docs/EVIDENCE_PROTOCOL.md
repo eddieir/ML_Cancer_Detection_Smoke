@@ -100,11 +100,16 @@ or above; external+ levels require `cohort_role=external_validation`).
   `audit` (thin wrapper around `evidence.audit.run_audit()`), `inspect` and
   `validate` (read-only, never write), `clinical-readiness` (re-validates
   the given run directory, then calls `assess_clinical_readiness()` —
-  never trains anything), and honest `development`/`internal-test`/
-  `external-test` stubs returning
-  `not_evaluable(reason_code="TRACK_RUNNER_NOT_YET_INTEGRATED")` since the
-  Steps 8-10 pipeline integration does not exist as a callable pipeline
-  yet. `--diagnostic-mode` is accepted only by `audit` (a no-op there) and
+  never trains anything), `development` (real orchestration via
+  `evidence/development.py::run_development` — today wired up for
+  `gse123352`/`smoke_classification`; any other cohort/task combination
+  returns a structured, specifically-reasoned `not_evaluable`), and
+  `internal-test`/`external-test` (honest gates via
+  `run_internal_test`/`run_external_test` — no cohort has ever had a
+  frozen internal-test partition created and guarded, and none carries
+  `role_eligibility=[external_validation]`, so both always return a
+  specifically-reasoned `not_evaluable`, never a fabricated result).
+  `--diagnostic-mode` is accepted only by `audit` (a no-op there) and
   raises a typed `EvidenceRunnerUsageError` on every other subcommand.
 - `tests/test_evidence_leakage_isolation.py` — Step 8: corruption-isolation
   tests reusing `benchmarks/sentinel.py`'s poison-object pattern, proving
@@ -156,35 +161,66 @@ calibration/thresholding, the artifact bundle writer/reader, and the
 `evidence.runner` umbrella CLI.
 
 GSE136831 and GSE123352 are downloaded locally in this environment
-(`data/raw/`, gitignored — never committed). Two real Track A runs have
+(`data/raw/`, gitignored — never committed). Real Track A results have
 been executed against them:
 
-- **GSE136831 weak-label smoke-exposure experiment (real data, weak
-  proxy).** `scripts/run_gse136831_weak_label_evidence.py` runs the real
+- **GSE123352 verified binary bulk smoke-history classification (real
+  data, real labels).** GSE123352 is bulk microarray —
+  `src/data/bulk_pipeline.py` is a separate path (never touches the
+  single-cell MIL pipeline; see `data/assay_policy.py`) that parses a real
+  per-sample, independently-verified **lifetime ever-versus-never
+  cigarette-smoking history** from the real downloaded series matrix.
+  Subject identity is independently verified from GEO `Sample_title`'s
+  `patient_<N>` field (`data/converters.py::_infer_subject_id_column`) — a
+  sample whose subject identity cannot be verified is excluded, never
+  trusted; `parse_strict_bool` rejects any malformed/ambiguous
+  `smoke_type_known` value outright. All 176 real subjects carried a
+  verified label and verified subject identity in the most recently
+  validated run (2026-07-23, commit
+  `94a78450d22cc92dcda2e379b1f95c11170bf6e8`). A single 70/30
+  subject-level split (124/50) with a train-only-fit logistic regression
+  scored **macro-F1 0.653, balanced accuracy 0.700, accuracy 0.66**
+  (confusion matrix `[[13,3],[14,20]]`, class counts unexposed=16/
+  cigarette=34) on the 50 held-out real test subjects — labeled a
+  single-split **exploratory** result, not the primary estimate.
+  `evidence.development.run_gse123352_repeated_development()` adds a
+  repeated grouped-development-holdout protocol (8 predeclared seeds in
+  `configs/evidence.yaml`'s `development_repeat_seeds`, fold-local C
+  selection using only each seed's own outer-train partition, subject-level
+  bootstrap confidence intervals per seed via `evidence/uncertainty.py`,
+  reused not reimplemented). Same validated run: **macro-F1 mean 0.726
+  (std 0.037, per-seed values 0.667–0.783 across seeds 1-8), balanced
+  accuracy mean 0.728 (std 0.044)** — this is the current primary
+  development estimate for GSE123352. `run_track_a_on_real_verified_label_data`
+  stamps the single-split result `evidence_level=development_only_real_data`,
+  `cohort_role=development`, `split_role=development_holdout` —
+  `gse123352`'s `role_eligibility` is `[development]` only; this is not an
+  internal-held-out or external claim. Report artifacts:
+  `artifacts/evidence/gse123352_verified_label_smoke_v1/` (single-split),
+  `artifacts/evidence/gse123352_repeated_development_v1/` (repeated —
+  both gitignored); sanitized single-split publication summary:
+  `evidence/published/gse123352_verified_label_smoke_v1/summary.json`.
+- **GSE136831 COPD-vs-Control disease-status proxy sensitivity analysis
+  (real data, explicitly NOT smoke-classification evidence).** GSE136831
+  carries no verified per-subject cigarette-exposure field.
+  `scripts/run_gse136831_copd_control_proxy_analysis.py` runs the real
   single-cell pipeline end to end; 46 real COPD/Control subjects (32 IPF
-  subjects excluded), subject-level split 33/7/6, cells subsampled to
-  300/subject for this environment's memory. Result:
-  `run_track_a_on_real_weak_label_data` — macro-F1 1.0 on 6 held-out test
+  subjects excluded — IPF is not a smoking-relevant comparator),
+  subject-level split 33/7/6, cells subsampled to 300/subject for this
+  environment's memory. Result:
+  `evidence.tracks.run_copd_control_proxy_analysis` —
+  `task=exploratory_disease_proxy_analysis` (never `smoke_classification`),
+  `verified_label_count=0` always, macro-F1 1.0 on 6 development-holdout
   subjects, but both classes are below the 5-subject learnability
-  threshold, so no learnability claim is made. `weak_label_experiment=True`
-  always; never merged with a verified-label result. Report artifact:
-  `artifacts/evidence/gse136831_weak_label_smoke_v1/`.
-- **GSE123352 verified-label smoke classification (real data, real
-  labels).** GSE123352 is bulk microarray — `src/data/bulk_pipeline.py` is
-  a new, minimal, separate path (never touches the single-cell MIL
-  pipeline; see `data/assay_policy.py`) that parses real per-sample
-  `ever_never_smoker` labels from the real downloaded series matrix. All
-  176 real subjects carried a verified label; 126/50 subject-level
-  train/test split; a train-only-fit logistic regression scored
-  **macro-F1 0.592, balanced accuracy 0.605** on the 50 held-out real test
-  subjects. `run_track_a_on_real_verified_label_data` stamps this
-  `evidence_level=development_only_real_data`,
-  `cohort_role=development` — `gse123352`'s `role_eligibility` is
-  `[development]` only; this is not an internal-held-out or external
-  claim. Report artifact:
-  `artifacts/evidence/gse123352_verified_label_smoke_v1/`.
+  threshold, so no learnability claim is made either way. COPD is a
+  clinical diagnosis with strong smoking association but also documented
+  non-smoking causes; Control does not prove never-smoking — this result
+  can never be merged with, aggregate into, or be selected in place of a
+  verified-label smoke-classification result, and cannot satisfy any
+  clinical-readiness dimension. Report artifact:
+  `artifacts/evidence/gse136831_copd_control_proxy_v1/`.
 
-What remains unimplemented past these two runs is, in every case, **not a
+What remains unimplemented past these results is, in every case, **not a
 missing piece of code — it is the absence of a suitable real dataset file,
 or a real cross-assay/expression-outcome linkage, in this environment**:
 
@@ -201,45 +237,33 @@ or a real cross-assay/expression-outcome linkage, in this environment**:
   honest `not_evaluable`. Their `..._on_fixture()` paths still run the
   real metric-computation code end-to-end only against synthetic data,
   stamped `synthetic_flag=True`.
-- **Candidate comparison (Step 9), repeated-resampling uncertainty
-  (Step 10), and subgroup diagnostics (Step 13) are consequently framework-
-  only.** `run_candidate_comparison_on_synthetic_fixture()`,
-  `repeated_development_oof_for_cancer_track()`, and `subgroup_report()`
-  all run the real comparison/statistics code against real Phase 1-6
-  training machinery, but only against a synthetic development context
-  (`benchmarks.runner.build_synthetic_context`) — no real candidate
-  comparison, uncertainty estimate, or subgroup breakdown has been
-  produced anywhere in this repository.
-- **Calibration/thresholding (Step 14) and the artifact bundle (Step 15)
-  have never been run against real predictions**, for the same reason —
-  there are no real development/internal-test/external-test predictions
-  to fit a frozen calibrator on or bundle into an artifact run.
-- **`evidence.runner development`/`internal-test`/`external-test`** are
-  honest stubs (`not_evaluable(reason_code="TRACK_RUNNER_NOT_YET_INTEGRATED")`)
-  — `audit`, `inspect`, `validate`, and `clinical-readiness` are fully
-  implemented and read-only.
-- **External-validation release against a REAL external cohort (Step 11)**
-  has not happened — no cohort in `configs/cohorts.yaml` currently has
-  `role_eligibility` including `external_validation`.
+- **Candidate comparison (Step 9) and subgroup diagnostics (Step 13) remain
+  framework-only.** `run_candidate_comparison_on_synthetic_fixture()` and
+  `subgroup_report()` run the real comparison/statistics code against real
+  Phase 1-6 training machinery, but only against a synthetic development
+  context (`benchmarks.runner.build_synthetic_context`) — no real
+  candidate comparison or subgroup breakdown has been produced anywhere in
+  this repository. Repeated-resampling uncertainty (Step 10) IS now
+  exercised against real data for GSE123352 —
+  `evidence.development.run_gse123352_repeated_development()` reuses
+  `evidence/uncertainty.py`'s `RepeatRecord`/`repeated_metric_summary`/
+  `subject_level_bootstrap_ci` against real repeated held-out predictions.
+- **Calibration/thresholding (Step 14) has never been run against real
+  predictions** — there are no real internal-test/external-test
+  predictions to fit a frozen calibrator on (development-only OOF
+  calibration against GSE123352 has not been separately wired up).
+- **`evidence.runner internal-test`/`external-test`** are honest,
+  specifically-reasoned gates (`NO_FROZEN_TEST_PARTITION_EXISTS`,
+  `NO_ELIGIBLE_EXTERNAL_COHORT`) — no cohort has ever had a frozen
+  internal-test partition created and guarded, and none carries
+  `role_eligibility=[external_validation]`.
 - **Step 18's adversarial test matrix** is complete for every framework
-  module above (1535 tests passing, including the leakage-isolation suite
-  in `tests/test_evidence_leakage_isolation.py`). The two real Track A
-  runs above are exercised by their own scripts/module tests against small
-  synthetic fixtures for speed (CI does not depend on the multi-gigabyte
-  real downloads); the real runs themselves were executed once, by hand,
-  against the real downloaded data, and their artifact bundles validate
-  cleanly via `evidence.runner validate`.
-- **External-validation release against a REAL external cohort (Step 11)**
-  has not happened — no cohort in `configs/cohorts.yaml` currently has
-  `role_eligibility` including `external_validation`, independent of the
-  two development-only real results above.
-- **Candidate comparison (Step 9), repeated-resampling uncertainty
-  (Step 10), subgroup diagnostics (Step 13), calibration/thresholding
-  (Step 14), and `evidence.runner development`/`internal-test`/
-  `external-test`** remain framework-only, run only against synthetic
-  development contexts — none of them has been run against the two real
-  Track A results above yet; that is genuine remaining work, not a data
-  blocker.
+  module above. The real Track A/development results above are exercised
+  by their own scripts/module tests against small synthetic fixtures for
+  speed (CI does not depend on the multi-gigabyte real downloads); the
+  real runs themselves were executed once, by hand, against the real
+  downloaded data, and their artifact bundles validate cleanly via
+  `evidence.runner validate`.
 
 No further engineering round changes real cancer-prediction, malignancy,
 external-validation, or clinical-readiness status: those blockers are
@@ -250,13 +274,16 @@ downloaded.
 ## Why this is the honest outcome
 
 Two of seven registered cohorts (GSE136831, GSE123352) have real local
-files in this environment, and both now have a genuine, once-executed,
-checksummed real-data Track A result — one weak-label, one verified-label,
-both `development`-role only. The other five cohorts remain undownloaded
-or (for NLST) unauthorized, and no cohort anywhere has a malignancy label
-or an expression<->outcome linkage, so Track B, Track C, external
-validation, and clinical readiness remain genuinely `not_evaluable`/
-`not_established` regardless of further downloads. Per the specification:
-state plainly what is real, what is weak-proxy, and what is still blocked
+files in this environment. GSE123352 has a genuine, checksummed,
+development-only verified-label smoke-history result (single-split
+exploratory plus a repeated grouped-development-holdout estimate).
+GSE136831 has a genuine, checksummed, EXPLICITLY NON-SMOKE COPD-vs-Control
+disease-status proxy analysis — it does not and cannot contribute to
+verified smoke evidence. The other five cohorts remain undownloaded or
+(for NLST) unauthorized, and no cohort anywhere has a malignancy label or
+an expression<->outcome linkage, so Track B, Track C, external validation,
+and clinical readiness remain genuinely `not_evaluable`/`not_established`
+regardless of further downloads. Per the specification: state plainly what
+is real, what is a non-smoke proxy, and what is still blocked
 — never merge the three. That is exactly the state this change leaves the
 repository in.

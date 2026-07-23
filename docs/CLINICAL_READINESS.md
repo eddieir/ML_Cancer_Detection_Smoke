@@ -60,7 +60,12 @@ supporting a `complete` status, so every mandatory dimension is
 
 Real held-out and external evidence, produced through `src/evidence/`,
 recorded with real `evidence_references` in each dimension, reviewed by
-someone qualified to assess clinical and regulatory readiness, and backed
-by a signed external-evidence manifest before `guard_clinical_claim()`
-would allow any downstream code to state readiness at all. No single
-metric improvement changes this status by itself.
+someone qualified to assess clinical and regulatory readiness, and bound
+into a real, Ed25519-signed `ClinicalEvidenceManifest`
+(`src/evidence/clinical_manifest.py`) verified against a configured
+approved-public-key allow-list — before `guard_clinical_claim()` would
+allow any downstream code to state readiness at all. This repository's
+default configuration ships no approved public key, so no manifest can
+satisfy that gate without a deployment first adding one deliberately, and
+even a valid signature is not itself regulatory or clinical approval. No
+single metric improvement changes this status by itself.
