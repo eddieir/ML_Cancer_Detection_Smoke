@@ -108,7 +108,11 @@ or above; external+ levels require `cohort_role=external_validation`).
   `run_internal_test`/`run_external_test` — no cohort has ever had a
   frozen internal-test partition created and guarded, and none carries
   `role_eligibility=[external_validation]`, so both always return a
-  specifically-reasoned `not_evaluable`, never a fabricated result).
+  specifically-reasoned `not_evaluable`, never a fabricated result;
+  `internal-test --cohort gse123352 --task smoke_classification` reports
+  the real computed `assess_frozen_internal_test_eligibility()` decision —
+  real subject/class counts against a versioned support policy — instead
+  of the generic gate).
   `--diagnostic-mode` is accepted only by `audit` (a no-op there) and
   raises a typed `EvidenceRunnerUsageError` on every other subcommand.
 - `tests/test_evidence_leakage_isolation.py` — Step 8: corruption-isolation
@@ -188,18 +192,57 @@ been executed against them:
   `configs/evidence.yaml`'s `development_repeat_seeds`, fold-local C
   selection using only each seed's own outer-train partition, subject-level
   bootstrap confidence intervals per seed via `evidence/uncertainty.py`,
-  reused not reimplemented). Same validated run: **macro-F1 mean 0.726
-  (std 0.037, per-seed values 0.667–0.783 across seeds 1-8), balanced
-  accuracy mean 0.728 (std 0.044)** — this is the current primary
-  development estimate for GSE123352. `run_track_a_on_real_verified_label_data`
-  stamps the single-split result `evidence_level=development_only_real_data`,
-  `cohort_role=development`, `split_role=development_holdout` —
-  `gse123352`'s `role_eligibility` is `[development]` only; this is not an
-  internal-held-out or external claim. Report artifacts:
-  `artifacts/evidence/gse123352_verified_label_smoke_v1/` (single-split),
-  `artifacts/evidence/gse123352_repeated_development_v1/` (repeated —
-  both gitignored); sanitized single-split publication summary:
-  `evidence/published/gse123352_verified_label_smoke_v1/summary.json`.
+  reused not reimplemented). Same validated run, all 8 seeds completed:
+  **macro-F1 mean 0.726 (std 0.037), balanced accuracy mean 0.728 (std
+  0.044)** — this is the current primary development estimate for
+  GSE123352. Alongside the primary metric, the same run reports:
+  - **required baselines**, fit on the identical per-seed subject partition
+    as the candidate (`evidence.development._baseline_predictions`) —
+    majority-class, constant-prevalence-probability, and an untuned
+    all-gene bulk logistic regression — compared via
+    `evidence.uncertainty.paired_candidate_comparison`. The candidate beats
+    majority/prevalence on 8/8 seeds (mean macro-F1 diff +0.321); it beats
+    the untuned all-gene linear baseline on 4/8 seeds and loses on 4/8
+    (mean diff +0.021) — reported honestly as a small, mixed margin, not
+    rounded into a clean win. No clinical/metadata baseline is reported
+    because no legitimate non-leaking clinical covariate exists for this
+    cohort beyond expression itself.
+  - **the full per-seed metric bundle**
+    (`evidence.development._full_metric_bundle`): balanced accuracy,
+    weighted F1, per-class precision/recall/F1/support, confusion matrix,
+    AUROC, AUPRC, Brier score, log loss, and expected calibration error —
+    every metric undefined for a seed's class support stays `None` with an
+    explicit reason, never silently 0.
+  - **a development-only calibration+threshold pathway**
+    (`benchmarks/calibration.py::build_frozen_policy`, reused not
+    reimplemented): fit on the SAME inner train/validation split each
+    seed's fold-local C-selection already builds, applied exactly once to
+    outer test via `FrozenThresholdPolicy.apply_to_test`. Because no
+    outer-train-disjoint data remains to calibrate the primary
+    full-outer-train candidate without touching outer test, this pathway
+    reports calibration for a model fit on the inner-train partition only
+    (~75% of each seed's outer-train subjects) — explicitly labeled as
+    such, never conflated with the primary candidate's own probabilities.
+  - a deterministic **frozen internal-test eligibility decision**
+    (`evidence.development.assess_frozen_internal_test_eligibility`,
+    policy in `configs/evidence.yaml`'s `frozen_internal_test_policy`):
+    GSE123352's 176 verified subjects (58 minority-class) fall below the
+    configured minimum (300 total / 50 per class), so the result is
+    `eligible=False` with the real computed counts — not a bare "no
+    partition exists" statement.
+
+  `run_track_a_on_real_verified_label_data` stamps the single-split result
+  `evidence_level=development_only_real_data`, `cohort_role=development`,
+  `split_role=development_holdout` — `gse123352`'s `role_eligibility` is
+  `[development]` only; this is not an internal-held-out or external claim.
+  Report artifacts: `artifacts/evidence/gse123352_verified_label_smoke_v1/`
+  (single-split), `artifacts/evidence/gse123352_repeated_development_v2/`
+  (repeated, baselines, full metrics, calibration, frozen-test eligibility —
+  both gitignored); sanitized publication summaries:
+  `evidence/published/gse123352_verified_label_smoke_v1/summary.json`
+  (single-split) and
+  `evidence/published/gse123352_repeated_development_v2/summary.json`
+  (repeated).
 - **GSE136831 COPD-vs-Control disease-status proxy sensitivity analysis
   (real data, explicitly NOT smoke-classification evidence).** GSE136831
   carries no verified per-subject cigarette-exposure field.
@@ -248,10 +291,13 @@ or a real cross-assay/expression-outcome linkage, in this environment**:
   `evidence.development.run_gse123352_repeated_development()` reuses
   `evidence/uncertainty.py`'s `RepeatRecord`/`repeated_metric_summary`/
   `subject_level_bootstrap_ci` against real repeated held-out predictions.
-- **Calibration/thresholding (Step 14) has never been run against real
-  predictions** — there are no real internal-test/external-test
-  predictions to fit a frozen calibrator on (development-only OOF
-  calibration against GSE123352 has not been separately wired up).
+- **Calibration/thresholding (Step 14) has been run against real,
+  development-only GSE123352 predictions** (see above — a per-seed
+  calibration+threshold pathway fit on an inner train/validation split of
+  each seed's own outer-train partition), but there are still no real
+  internal-test/external-test predictions to fit or evaluate a FROZEN
+  calibrator on — that remains blocked on the frozen-test-eligibility gap
+  above, not on missing code.
 - **`evidence.runner internal-test`/`external-test`** are honest,
   specifically-reasoned gates (`NO_FROZEN_TEST_PARTITION_EXISTS`,
   `NO_ELIGIBLE_EXTERNAL_COHORT`) — no cohort has ever had a frozen

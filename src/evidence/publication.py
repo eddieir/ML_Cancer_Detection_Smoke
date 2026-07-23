@@ -195,3 +195,51 @@ def publish_evidence_run(
         )
 
     return reloaded
+
+
+def publish_repeated_development_summary(
+    result: Dict[str, Any], *, run_id: str, published_root: Union[str, Path],
+    code_commit_sha: str,
+) -> Dict[str, Any]:
+    """Sanitizes and publishes a evidence.development.run_gse123352_repeated_development()
+    result. Unlike publish_evidence_run, this does not validate against the
+    single-report EvidenceReport schema (a repeated-development summary is
+    an aggregate across many seeds, not one report) — it instead applies
+    the SAME defense-in-depth scan (_scan_for_prohibited) used for every
+    other published artifact, since this result already carries no
+    subject/sample identifiers by construction (see
+    evidence/development.py::run_gse123352_repeated_development — only
+    aggregate counts, per-seed metric values, and fingerprints are
+    returned). Raises PublicationError if the scan finds anything
+    prohibited anyway, and re-validates the written file by reload before
+    returning."""
+    if result.get("status") != "complete":
+        raise PublicationError(
+            f"refusing to publish a repeated-development result with status={result.get('status')!r} "
+            "— only a complete result may be published."
+        )
+
+    summary = dict(result)
+    summary["schema_version"] = PUBLICATION_SCHEMA_VERSION
+    summary["run_id"] = run_id
+    summary["code_commit_sha"] = code_commit_sha
+    from .run_identity import utc_now_iso
+    summary["publication_timestamp"] = utc_now_iso()
+    summary["checksum_sha256"] = _content_checksum(summary)
+
+    _scan_for_prohibited(summary)
+
+    from benchmarks.atomic_io import atomic_write_json
+
+    out_path = Path(published_root) / run_id / "summary.json"
+    atomic_write_json(out_path, summary)
+
+    with open(out_path) as f:
+        reloaded = json.load(f)
+    _scan_for_prohibited(reloaded)
+    if reloaded != summary:
+        raise PublicationError(
+            f"published repeated-development summary at {out_path} does not byte-for-byte match "
+            "the derived summary after reload — the write or reload path is not faithful"
+        )
+    return reloaded

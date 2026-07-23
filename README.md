@@ -2486,17 +2486,40 @@ loaded from a validated evidence artifact):**
   `evidence.development.run_gse123352_repeated_development()` adds a
   repeated grouped-development-holdout protocol across 8 predeclared seeds
   (`configs/evidence.yaml`'s `development_repeat_seeds`) with fold-local C
-  selection (using only each seed's own outer-train partition) and
-  subject-level bootstrap confidence intervals per seed. Same validated
-  run: **macro-F1 mean 0.726 (std 0.037, range 0.667–0.783 across 8
-  seeds), balanced accuracy mean 0.728 (std 0.044)** — this is the current
-  primary development estimate; sanitized artifact:
-  `evidence/published/gse123352_verified_label_smoke_v1/summary.json`
-  (single-split) and `artifacts/evidence/gse123352_repeated_development_v1/`
-  (repeated, gitignored — regenerate + publish via
-  `evidence.development.run_gse123352_repeated_development` to reproduce).
-  Six-class single-cell smoke classification remains **not established**
-  on real data.
+  selection (using only each seed's own outer-train partition, never the
+  outer held-out subjects) and subject-level bootstrap confidence intervals
+  per seed. Same validated run, all 8 seeds completed (0 excluded):
+  **macro-F1 mean 0.726 (std 0.037), balanced accuracy mean 0.728 (std
+  0.044)** — this is the current primary development estimate. Paired
+  against three required baselines fit on the identical per-seed
+  train/test partition as the candidate: the candidate beats a majority-class
+  baseline and a constant-prevalence-probability baseline on all 8/8 seeds
+  (mean macro-F1 diff +0.321), and beats an untuned all-gene bulk logistic
+  baseline on 4/8 seeds with 4 losses (mean diff +0.021 — a modest,
+  honestly-reported margin, not a large one). The full per-seed metric
+  bundle (balanced accuracy, weighted F1, per-class precision/recall/F1/
+  support, confusion matrix, AUROC, AUPRC, Brier score, log loss, ECE) and a
+  development-only calibration+threshold pathway (fit on an inner
+  train/validation split of each seed's own outer-train partition, evaluated
+  once against outer test, method selected automatically between
+  uncalibrated/sigmoid/isotonic per `configs/evidence.yaml`'s
+  `calibration_policy`) are both reported alongside the primary macro-F1/
+  balanced-accuracy summary — see `evidence.development._full_metric_bundle`
+  and the `calibration_by_seed` field. A deterministic, versioned-policy
+  frozen-internal-test eligibility assessment
+  (`evidence.development.assess_frozen_internal_test_eligibility`,
+  `configs/evidence.yaml`'s `frozen_internal_test_policy`) reports GSE123352
+  as **ineligible** for a frozen internal-test partition today: 176 verified
+  subjects (58 minority-class) versus a configured minimum of 300 total /
+  50 per class — carving a third partition out of a cohort this small would
+  leave every partition too small to trust, so no frozen partition is
+  created. Sanitized artifacts: `evidence/published/gse123352_verified_label_smoke_v1/summary.json`
+  (single-split) and `evidence/published/gse123352_repeated_development_v2/summary.json`
+  (repeated, baselines, full metrics, calibration, and the frozen-test
+  eligibility decision); private bundles under `artifacts/evidence/`
+  (gitignored — regenerate via `evidence.development.run_gse123352_repeated_development`
+  to reproduce). Six-class single-cell smoke classification remains **not
+  established** on real data.
 - **GSE136831 COPD-vs-Control disease-status proxy analysis: real,
   explicitly NOT smoke-classification evidence.** GSE136831 carries no
   verified per-subject cigarette-exposure field. COPD is a clinical

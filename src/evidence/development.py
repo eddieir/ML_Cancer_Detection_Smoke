@@ -20,6 +20,8 @@ isn't wired up" placeholder, and never a path that fabricates a result.
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Union
 
+import numpy as np
+
 from .evidence_contract import not_evaluable
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -201,18 +203,112 @@ def _run_gse123352_development(*, output_root, run_id, seed, train_frac, test_fr
 DEFAULT_GSE123352_SEEDS = (1, 2, 3, 4, 5, 6, 7, 8)
 _C_GRID = (0.1, 1.0, 10.0)
 
+DEFAULT_FROZEN_INTERNAL_TEST_POLICY = {
+    "min_total_subjects": 300,
+    "min_per_class_subjects": 50,
+    "train_frac": 0.60,
+    "development_holdout_frac": 0.20,
+    "internal_test_frac": 0.20,
+}
 
-def _load_gse123352_repeat_seeds(evidence_config_path: Union[str, Path] = "configs/evidence.yaml") -> list:
+
+class SubjectOverlapError(ValueError):
+    """Raised when a hard partition-disjointness check fails — never
+    silently tolerated. See _assert_no_subject_overlap."""
+
+
+def _assert_no_subject_overlap(partitions: Dict[str, Sequence[str]]) -> None:
+    """Hard validation (Issue #16 step 3.1): no subject may appear in more
+    than one named partition (e.g. {'train': [...], 'test': [...]} or
+    {'inner_train': [...], 'inner_val': [...]}). Raises SubjectOverlapError
+    naming the exact overlapping subjects and partitions on failure — this
+    is a redundant, explicit re-check on top of
+    data.splitting.SplitManifest's own internal overlap assertion, so a
+    caller that builds a split without going through SplitManifest is still
+    caught."""
+    seen: Dict[str, str] = {}
+    overlaps: Dict[str, list] = {}
+    for name, subjects in partitions.items():
+        for s in subjects:
+            if s in seen and seen[s] != name:
+                overlaps.setdefault(s, [seen[s]]).append(name)
+            else:
+                seen[s] = name
+    if overlaps:
+        raise SubjectOverlapError(
+            f"Subject(s) appear in more than one partition: {overlaps}"
+        )
+
+
+def _load_evidence_config(evidence_config_path: Union[str, Path] = "configs/evidence.yaml") -> Dict[str, Any]:
     import yaml
     try:
         with open(evidence_config_path) as f:
-            raw = yaml.safe_load(f) or {}
-        seeds = raw.get("development_repeat_seeds", {}).get("gse123352_smoke_classification")
-        if seeds:
-            return [int(s) for s in seeds]
+            return yaml.safe_load(f) or {}
     except (OSError, yaml.YAMLError):
-        pass
+        return {}
+
+
+def _load_gse123352_repeat_seeds(evidence_config_path: Union[str, Path] = "configs/evidence.yaml") -> list:
+    raw = _load_evidence_config(evidence_config_path)
+    seeds = raw.get("development_repeat_seeds", {}).get("gse123352_smoke_classification")
+    if seeds:
+        return [int(s) for s in seeds]
     return list(DEFAULT_GSE123352_SEEDS)
+
+
+def _load_frozen_internal_test_policy(evidence_config_path: Union[str, Path] = "configs/evidence.yaml") -> Dict[str, Any]:
+    raw = _load_evidence_config(evidence_config_path)
+    policy = dict(DEFAULT_FROZEN_INTERNAL_TEST_POLICY)
+    policy.update(raw.get("frozen_internal_test_policy") or {})
+    return policy
+
+
+def assess_frozen_internal_test_eligibility(
+    *, unique_subject_count: int, class_counts: Dict[str, int],
+    config_path: Union[str, Path] = "configs/evidence.yaml",
+) -> Dict[str, Any]:
+    """Issue #16 step 3.7: a deterministic, versioned-policy eligibility
+    assessment for carving out a frozen internal-test partition — never a
+    bare 'no frozen partition exists' statement. Reports the real computed
+    subject/class counts against the configured minimum support policy and
+    the exact reason a frozen partition can or cannot be created. Does not
+    itself create or evaluate any partition."""
+    import hashlib
+    import json
+
+    policy = _load_frozen_internal_test_policy(config_path)
+    reasons = []
+    if unique_subject_count < policy["min_total_subjects"]:
+        reasons.append(
+            f"total verified subjects ({unique_subject_count}) below the configured minimum "
+            f"({policy['min_total_subjects']})"
+        )
+    under_min_class = {c: n for c, n in class_counts.items() if n < policy["min_per_class_subjects"]}
+    if under_min_class:
+        reasons.append(
+            f"per-class subject count(s) below the configured minimum ({policy['min_per_class_subjects']}): "
+            f"{under_min_class}"
+        )
+    eligible = not reasons
+    result = {
+        "eligible": eligible,
+        "unique_subject_count": unique_subject_count,
+        "class_counts": dict(class_counts),
+        "configured_policy": policy,
+        "policy_fingerprint": hashlib.sha256(
+            json.dumps(policy, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
+    if not eligible:
+        result["reason_code"] = "INSUFFICIENT_SUPPORT_FOR_FROZEN_INTERNAL_TEST"
+        result["reason"] = "; ".join(reasons)
+        result["required_next_action"] = (
+            "Acquire additional verified subjects for this cohort (or a compatible pooled cohort) "
+            "until both the total and per-class minimums in configured_policy are met, then re-run "
+            "this assessment before attempting to carve out a frozen internal-test partition."
+        )
+    return result
 
 
 def _macro_f1_metric(y_true, y_pred) -> Optional[float]:
@@ -229,13 +325,17 @@ def _balanced_accuracy_metric(y_true, y_pred) -> Optional[float]:
     return float(balanced_accuracy_score(y_true, [round(p) for p in y_pred]))
 
 
-def _select_c_fold_local(dataset, train_subject_ids, seed, n_top_variance_genes) -> float:
+def _fold_local_selection(dataset, train_subject_ids, seed, n_top_variance_genes) -> Dict[str, Any]:
     """Development-only hyperparameter search: splits the OUTER TRAIN
     partition (never the outer held-out partition) into an inner
     train/validation pair, fits each candidate C on the inner-train rows,
     and picks the C with the best macro-F1 on the inner-validation rows.
     The winning C is then refit on the FULL outer-train partition by the
-    caller — this function never touches outer-test data."""
+    caller — this function never touches outer-test data. The inner
+    train/validation row indices are also returned so callers can reuse the
+    SAME inner split for a leakage-safe, development-only calibration
+    pathway (evidence/development.py's calibration section below) without
+    building a second, uncoordinated inner split."""
     from data.splitting import subject_train_val_test_split
     from data.bulk_pipeline import fit_bulk_logistic_regression, apply_bulk_classifier
 
@@ -249,8 +349,20 @@ def _select_c_fold_local(dataset, train_subject_ids, seed, n_top_variance_genes)
     )
     inner_train_idx = [id_to_row[s] for s in inner_split.train_subjects if s in id_to_row]
     inner_val_idx = [id_to_row[s] for s in inner_split.test_subjects if s in id_to_row]
+    _assert_no_subject_overlap({
+        "inner_train": inner_split.train_subjects, "inner_val": inner_split.test_subjects,
+    })
+
     if len(inner_train_idx) < 4 or len(inner_val_idx) < 2 or len(set(dataset.y[inner_train_idx].tolist())) < 2:
-        return 1.0  # too few subjects for an honest inner split — fall back to the untuned default
+        return {
+            "selected_c": 1.0, "inner_train_idx": inner_train_idx, "inner_val_idx": inner_val_idx,
+            "feasible": False,
+            "reason": (
+                f"only {len(inner_train_idx)} inner-train / {len(inner_val_idx)} inner-val subjects "
+                "(or a single-class inner-train partition) — too few for an honest inner split; "
+                "falling back to the untuned default C=1.0, calibration NOT_EVALUABLE for this seed"
+            ),
+        }
 
     best_c, best_score = 1.0, -1.0
     for c in _C_GRID:
@@ -265,7 +377,79 @@ def _select_c_fold_local(dataset, train_subject_ids, seed, n_top_variance_genes)
         score = _macro_f1_metric(dataset.y[inner_val_idx].tolist(), y_pred.tolist())
         if score is not None and score > best_score:
             best_c, best_score = c, score
-    return best_c
+    return {
+        "selected_c": best_c, "inner_train_idx": inner_train_idx, "inner_val_idx": inner_val_idx,
+        "feasible": True, "reason": None, "selection_metric": "macro_f1", "selection_score": best_score,
+        "candidate_grid": list(_C_GRID),
+    }
+
+
+def _full_metric_bundle(y_true: Sequence[int], y_pred: Sequence[int], y_prob: Sequence[float]) -> Dict[str, Any]:
+    """The complete per-repeat metric bundle (Issue #16 step 3.5): macro-F1,
+    balanced accuracy, ordinary accuracy, weighted F1, per-class
+    precision/recall/F1/support, confusion matrix (via
+    benchmarks.metrics.full_smoke_metrics_report), plus AUROC/AUPRC/Brier/ECE
+    (via benchmarks.metrics.cancer_prediction_metrics, reused rather than
+    reimplemented) and log loss. Every metric that is mathematically
+    undefined for this repeat's class support (e.g. AUROC with a single
+    class present) stays None with an explicit reason — never silently 0."""
+    from sklearn.metrics import log_loss
+    from benchmarks.metrics import full_smoke_metrics_report, cancer_prediction_metrics
+
+    bundle = full_smoke_metrics_report(list(y_true), list(y_pred), num_classes=2)
+    proba_bundle = cancer_prediction_metrics(list(y_true), list(y_prob), threshold=0.5)
+    bundle.update({
+        "auroc": proba_bundle["auroc"], "auprc": proba_bundle["auprc"],
+        "auroc_auprc_undefined_reason": proba_bundle["auroc_auprc_undefined_reason"],
+        "brier": proba_bundle["brier"], "ece": proba_bundle["ece"],
+    })
+    if len(set(y_true)) < 2:
+        bundle["log_loss"] = None
+        bundle["log_loss_undefined_reason"] = f"only class(es) {set(y_true)} present in y_true"
+    else:
+        bundle["log_loss"] = float(log_loss(y_true, y_prob, labels=[0, 1]))
+        bundle["log_loss_undefined_reason"] = None
+    return bundle
+
+
+def _baseline_predictions(dataset, train_idx: Sequence[int], test_idx: Sequence[int], seed: int) -> Dict[str, tuple]:
+    """Fits the required Issue #16 step 3.4 baselines on the EXACT SAME
+    subject partition as the candidate (train_idx/test_idx, built once by
+    the caller and passed unchanged here) and returns
+    {baseline_name: (y_pred, y_prob)}. No legitimate non-leaking
+    clinical/metadata covariate exists for GSE123352 beyond expression
+    itself (see docs/DATA_CARD.md) — a 'clinical baseline' is deliberately
+    NOT invented here rather than fabricated from something leaky."""
+    from benchmarks.baselines import SmokeMajorityBaseline, SmokeLogisticRegression
+
+    X_train, y_train = dataset.X[train_idx], dataset.y[train_idx]
+    X_test = dataset.X[test_idx]
+
+    majority = SmokeMajorityBaseline().fit(X_train, y_train, seed=seed)
+    maj_pred = majority.predict(X_test)
+    maj_classes = list(majority.classes_)
+    maj_prob = (
+        majority.predict_proba(X_test)[:, maj_classes.index(1)] if 1 in maj_classes
+        else np.zeros(len(X_test)) if maj_classes else np.full(len(X_test), 0.5)
+    )
+
+    prevalence = float(np.mean(y_train)) if len(y_train) else 0.5
+    prev_prob = np.full(len(X_test), prevalence)
+    prev_pred = (prev_prob >= 0.5).astype(int)
+
+    linear = SmokeLogisticRegression(C=1.0).fit(X_train, y_train, seed=seed)
+    lin_pred = linear.predict(X_test)
+    lin_classes = list(linear.classes_)
+    lin_prob = (
+        linear.predict_proba(X_test)[:, lin_classes.index(1)] if 1 in lin_classes
+        else np.zeros(len(X_test))
+    )
+
+    return {
+        "majority": (maj_pred.tolist(), maj_prob.tolist()),
+        "prevalence": (prev_pred.tolist(), prev_prob.tolist()),
+        "bulk_linear_untuned": (lin_pred.tolist(), lin_prob.tolist()),
+    }
 
 
 def run_gse123352_repeated_development(
@@ -294,8 +478,12 @@ def run_gse123352_repeated_development(
     finding; this function's output is the repeated-development primary
     estimate.
     """
-    from .uncertainty import build_development_repeated_oof, build_repeat_record, repeated_metric_summary, subject_level_bootstrap_ci  # noqa: F401
+    from .uncertainty import (
+        build_development_repeated_oof, build_repeat_record, paired_candidate_comparison,
+        repeated_metric_summary, subject_level_bootstrap_ci,
+    )
     from data import bulk_pipeline
+    from benchmarks.calibration import build_frozen_policy
 
     seeds = list(seeds) if seeds is not None else _load_gse123352_repeat_seeds()
 
@@ -324,8 +512,12 @@ def run_gse123352_repeated_development(
             )
         dataset = bulk_pipeline.build_bulk_smoke_dataset(csv_path)
 
-    repeats = []
-    selected_hyperparameters = {}
+    candidate_repeats, majority_repeats, prevalence_repeats, linear_repeats = [], [], [], []
+    selected_hyperparameters: Dict[int, float] = {}
+    excluded_seeds: list = []
+    full_metric_bundle_by_seed: Dict[str, Any] = {}
+    calibration_by_seed: Dict[str, Any] = {}
+    inner_selection_by_seed: Dict[str, Any] = {}
 
     for seed in seeds:
         split = bulk_pipeline.split_bulk_subjects(
@@ -334,11 +526,23 @@ def run_gse123352_repeated_development(
         id_to_row = {sid: i for i, sid in enumerate(dataset.subject_ids)}
         train_idx = [id_to_row[s] for s in split.train_subjects if s in id_to_row]
         test_idx = [id_to_row[s] for s in split.test_subjects if s in id_to_row]
+        _assert_no_subject_overlap({"outer_train": split.train_subjects, "outer_test": split.test_subjects})
         if len(test_idx) == 0 or len(set(dataset.y[train_idx].tolist())) < 2:
+            excluded_seeds.append({
+                "seed": seed,
+                "reason": f"outer split infeasible for this seed (n_test={len(test_idx)}, "
+                          f"train classes={sorted(set(dataset.y[train_idx].tolist()))})",
+            })
             continue
 
-        selected_c = _select_c_fold_local(dataset, split.train_subjects, seed, n_top_variance_genes)
+        selection = _fold_local_selection(dataset, split.train_subjects, seed, n_top_variance_genes)
+        selected_c = selection["selected_c"]
         selected_hyperparameters[seed] = selected_c
+        inner_selection_by_seed[str(seed)] = {
+            "feasible": selection["feasible"], "reason": selection["reason"],
+            "selected_c": selected_c, "candidate_grid": list(_C_GRID),
+            "n_inner_train": len(selection["inner_train_idx"]), "n_inner_val": len(selection["inner_val_idx"]),
+        }
 
         fitted = bulk_pipeline.fit_bulk_logistic_regression(
             dataset.X[train_idx], dataset.y[train_idx], dataset.gene_names,
@@ -348,18 +552,72 @@ def run_gse123352_repeated_development(
         test_subject_ids = [dataset.subject_ids[i] for i in test_idx]
         test_y_true = dataset.y[test_idx].tolist()
 
-        repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, y_pred.tolist()))
+        candidate_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, y_pred.tolist()))
+        full_metric_bundle_by_seed[str(seed)] = _full_metric_bundle(test_y_true, y_pred.tolist(), y_prob.tolist())
 
-    if not repeats:
+        # Required baselines (Issue #16 step 3.4) — fit on the IDENTICAL
+        # train_idx/test_idx partition as the candidate above, never a
+        # separately-drawn split, so paired comparison is valid.
+        baseline_preds = _baseline_predictions(dataset, train_idx, test_idx, seed)
+        majority_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, baseline_preds["majority"][0]))
+        prevalence_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, baseline_preds["prevalence"][0]))
+        linear_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, baseline_preds["bulk_linear_untuned"][0]))
+
+        # Development-only calibration pathway (Issue #16 step 3.6). Reuses
+        # the SAME inner train/validation split _fold_local_selection just
+        # built (never a second, uncoordinated inner split) so the
+        # calibration-fitting set (inner_val) is disjoint from both
+        # inner_train (what the calibration-source model is fit on) and the
+        # outer test set. This calibration-source model is fit on
+        # inner_train ONLY, distinct from the primary candidate above
+        # (fit on the FULL outer train) — no outer-train-disjoint data
+        # would otherwise remain to fit and evaluate calibration without
+        # touching outer test, so this is reported as a separate, clearly
+        # labeled pathway rather than applied to the primary candidate's
+        # own probabilities.
+        if not selection["feasible"]:
+            calibration_by_seed[str(seed)] = {
+                "status": "not_evaluable", "reason": selection["reason"],
+                "calibration_fingerprint": "not_applicable",
+            }
+        else:
+            inner_train_idx, inner_val_idx = selection["inner_train_idx"], selection["inner_val_idx"]
+            calib_source = bulk_pipeline.fit_bulk_logistic_regression(
+                dataset.X[inner_train_idx], dataset.y[inner_train_idx], dataset.gene_names,
+                seed=seed, n_top_variance_genes=n_top_variance_genes, C=selected_c,
+            )
+            _, inner_val_prob = bulk_pipeline.apply_bulk_classifier(calib_source, dataset.X[inner_val_idx])
+            _, outer_test_prob_from_calib_source = bulk_pipeline.apply_bulk_classifier(calib_source, dataset.X[test_idx])
+            policy = build_frozen_policy(
+                dataset.y[inner_val_idx], inner_val_prob, calibration_method="auto", threshold_strategy="youden",
+            )
+            uncalibrated = _full_metric_bundle(
+                test_y_true, (outer_test_prob_from_calib_source >= 0.5).astype(int).tolist(),
+                outer_test_prob_from_calib_source.tolist(),
+            )
+            calibrated = policy.apply_to_test(np.asarray(test_y_true), outer_test_prob_from_calib_source)
+            calibration_by_seed[str(seed)] = {
+                "status": "complete",
+                "calibration_source_model": "fit_on_inner_train_only_not_the_primary_candidate",
+                "calibration_fitting_set_size": len(inner_val_idx),
+                "calibration_method": policy.calibrator.method,
+                "calibration_params": policy.calibrator.to_dict(),
+                "threshold": policy.threshold, "threshold_strategy": policy.threshold_strategy,
+                "threshold_reason": policy.threshold_reason,
+                "uncalibrated_outer_test_metrics": uncalibrated,
+                "calibrated_outer_test_metrics": calibrated,
+            }
+
+    if not candidate_repeats:
         return not_evaluable(
             reason_code="INSUFFICIENT_REPEATS", reason="No seed produced a usable development-holdout partition.",
             required_next_action="Check GSE123352 subject counts against the configured split fractions.",
             cohort_id="gse123352", task="smoke_classification",
         )
 
-    oof = build_development_repeated_oof(repeats, role="development")
-    macro_f1_summary = repeated_metric_summary(oof, _macro_f1_metric)
-    balanced_accuracy_summary = repeated_metric_summary(oof, _balanced_accuracy_metric)
+    candidate_oof = build_development_repeated_oof(candidate_repeats, role="development")
+    macro_f1_summary = repeated_metric_summary(candidate_oof, _macro_f1_metric)
+    balanced_accuracy_summary = repeated_metric_summary(candidate_oof, _balanced_accuracy_metric)
 
     # A per-repeat (not pooled-across-repeats) subject-level bootstrap CI —
     # pooling raw predictions across repeats would let the same subject
@@ -370,8 +628,45 @@ def run_gse123352_repeated_development(
     # (RepeatRecord enforces this), so per-repeat CIs stay genuinely
     # subject-level.
     per_seed_macro_f1_ci = {
-        str(r.seed): subject_level_bootstrap_ci(r, _macro_f1_metric) for r in repeats
+        str(r.seed): subject_level_bootstrap_ci(r, _macro_f1_metric) for r in candidate_repeats
     }
+
+    baseline_oofs = {
+        "majority": build_development_repeated_oof(majority_repeats, role="development"),
+        "prevalence": build_development_repeated_oof(prevalence_repeats, role="development"),
+        "bulk_linear_untuned": build_development_repeated_oof(linear_repeats, role="development"),
+    }
+    baseline_comparisons = {}
+    for name, baseline_oof in baseline_oofs.items():
+        comparison = paired_candidate_comparison(candidate_oof, baseline_oof, _macro_f1_metric)
+        n_defined_pairs = len(comparison["common_seeds"]) - comparison["n_undefined"]
+        comparison["candidate_name"] = "bulk_logistic_regression_fold_local_c"
+        comparison["baseline_name"] = name
+        comparison["shared_subject_partition"] = (
+            "identical train_idx/test_idx per seed by construction — both fit inside the same "
+            "loop iteration on the same outer split"
+        )
+        comparison["ci"] = None
+        if n_defined_pairs >= 2:
+            defined_diffs = [p["diff"] for p in comparison["per_seed"] if p["diff"] is not None]
+            from benchmarks.metrics import bootstrap_ci
+            comparison["ci"] = bootstrap_ci(defined_diffs)
+            comparison["status"] = "reported"
+        else:
+            comparison["status"] = "insufficient_evidence"
+            comparison["insufficient_evidence_reason"] = (
+                f"only {n_defined_pairs} seed(s) produced a defined paired macro-F1 difference — "
+                "at least 2 are required for a paired confidence interval."
+            )
+        baseline_comparisons[name] = comparison
+
+    unique_subject_count = len(set(dataset.subject_ids))
+    class_counts = {
+        name: int((dataset.y == i).sum()) for i, name in enumerate(dataset.class_names)
+    }
+    frozen_test_eligibility = assess_frozen_internal_test_eligibility(
+        unique_subject_count=unique_subject_count, class_counts=class_counts,
+    )
 
     return {
         "status": "complete",
@@ -379,13 +674,21 @@ def run_gse123352_repeated_development(
         "dataset_accession": "GSE123352",
         "protocol": "repeated_grouped_development_holdout",
         "seeds": seeds,
-        "n_repeats": len(repeats),
-        "independent_development_holdout_subject_count": oof.independent_subject_count(),
+        "n_requested_seeds": len(seeds),
+        "n_completed_seeds": len(candidate_repeats),
+        "n_excluded_seeds": len(excluded_seeds),
+        "excluded_seeds": excluded_seeds,
+        "independent_development_holdout_subject_count": candidate_oof.independent_subject_count(),
         "selected_hyperparameters_by_seed": {str(k): v for k, v in selected_hyperparameters.items()},
+        "inner_selection_by_seed": inner_selection_by_seed,
         "primary_metric": "macro_f1",
         "macro_f1": macro_f1_summary,
         "balanced_accuracy": balanced_accuracy_summary,
         "per_seed_macro_f1_subject_bootstrap_ci": per_seed_macro_f1_ci,
+        "full_metric_bundle_by_seed": full_metric_bundle_by_seed,
+        "baseline_comparisons": baseline_comparisons,
+        "calibration_by_seed": calibration_by_seed,
+        "frozen_internal_test_eligibility": frozen_test_eligibility,
         "limitations": [
             "Repeated grouped development-holdout estimate — every held-out subject here is "
             "still a development-role subject (gse123352's role_eligibility is [development] "
@@ -395,18 +698,37 @@ def run_gse123352_repeated_development(
             "The original single 70/30-split exploratory result "
             "(evidence.tracks.run_track_a_on_real_verified_label_data) remains a separate, "
             "still-valid single-split exploratory finding and is not superseded by this result.",
+            "Calibration is evaluated on a model fit only on the inner-train partition (roughly "
+            "75% of each seed's outer-train subjects), not on the primary full-outer-train "
+            "candidate reported above — no outer-train-disjoint data remains to fit and evaluate "
+            "calibration for the primary candidate without touching outer test.",
+            "No legitimate non-leaking clinical/metadata covariate exists for GSE123352 beyond "
+            "expression itself, so no separate clinical/metadata baseline is reported (see "
+            "docs/DATA_CARD.md).",
+            f"Frozen internal-test eligibility: {frozen_test_eligibility.get('reason', 'eligible under configured policy')}.",
         ],
     }
 
 
-def run_internal_test(run_dir: Union[str, Path], authorization_file: Optional[str]) -> Dict[str, Any]:
+def run_internal_test(
+    run_dir: Union[str, Path], authorization_file: Optional[str],
+    *, cohort_id: Optional[str] = None, task: Optional[str] = None,
+) -> Dict[str, Any]:
     """Honest gate: no cohort in this repository has ever had a frozen
     internal-test partition created and guarded (see configs/cohorts.yaml —
     every registered cohort's role_eligibility is [development] only), so
-    this always returns a structured not_evaluable naming that specific
-    blocker — never a generic 'not yet integrated' stub, and never a
-    fabricated frozen-test result regardless of what run_dir or
-    authorization_file is supplied."""
+    this always returns a structured not_evaluable — never a generic 'not
+    yet integrated' stub, and never a fabricated frozen-test result
+    regardless of what run_dir or authorization_file is supplied.
+
+    When cohort_id='gse123352'/task='smoke_classification' is given, the
+    not_evaluable reason is the REAL, computed
+    assess_frozen_internal_test_eligibility() decision (Issue #16 step
+    3.7) — not a bare 'no partition exists' statement — proving, with real
+    subject/class counts, why a frozen partition cannot honestly be carved
+    out today. Any other cohort/task (or none given) falls back to the
+    structural NO_FROZEN_TEST_PARTITION_EXISTS gate, since no eligibility
+    assessment has been wired up for it."""
     from .artifact_bundle import validate_evidence_run
     from .errors import ArtifactValidationError
 
@@ -419,6 +741,50 @@ def run_internal_test(run_dir: Union[str, Path], authorization_file: Optional[st
             reason=f"the development run at {run_dir} did not validate: {exc}",
             required_next_action="Re-run evidence.runner development to produce a valid, complete run bundle first.",
         )
+
+    if cohort_id == "gse123352" and task == "smoke_classification":
+        raw_files = [GSE123352_RAW_DIR / name for name in GSE123352_RAW_FILE_NAMES]
+        missing = [str(p) for p in raw_files if not p.exists()]
+        if missing:
+            return not_evaluable(
+                reason_code="REAL_DATA_NOT_PRESENT",
+                reason=f"missing real raw GSE123352 file(s) under {GSE123352_RAW_DIR}: {missing}",
+                required_next_action="Download the real GSE123352 raw files to this path before assessing frozen-test eligibility.",
+                cohort_id="gse123352", task="smoke_classification",
+            )
+        from data.converters import convert_accession
+        from data import bulk_pipeline
+        csv_path = convert_accession("GSE123352")
+        dataset = bulk_pipeline.build_bulk_smoke_dataset(csv_path)
+        unique_subject_count = len(set(dataset.subject_ids))
+        class_counts = {name: int((dataset.y == i).sum()) for i, name in enumerate(dataset.class_names)}
+        eligibility = assess_frozen_internal_test_eligibility(
+            unique_subject_count=unique_subject_count, class_counts=class_counts,
+        )
+        if eligibility["eligible"]:
+            return not_evaluable(
+                reason_code="FROZEN_PARTITION_ELIGIBLE_BUT_NOT_YET_CREATED",
+                reason=(
+                    f"gse123352/smoke_classification meets the configured frozen internal-test "
+                    f"support policy ({unique_subject_count} subjects, class counts {class_counts}) "
+                    "but no frozen partition manifest has been created and guarded for it yet in "
+                    "this repository."
+                ),
+                required_next_action=(
+                    "Create and freeze an internal-test subject partition (persisting its manifest "
+                    "without ever reading its expression/labels during development), update "
+                    "configs/cohorts.yaml role_eligibility to include 'internal_test', and acquire "
+                    "the one-shot frozen-test guard (benchmarks.test_guard) before calling this "
+                    "subcommand again."
+                ),
+                **eligibility,
+            )
+        return not_evaluable(
+            reason_code=eligibility["reason_code"], reason=eligibility["reason"],
+            required_next_action=eligibility["required_next_action"], cohort_id="gse123352",
+            task="smoke_classification", **{k: v for k, v in eligibility.items() if k not in ("reason_code", "reason", "required_next_action")},
+        )
+
     return not_evaluable(
         reason_code="NO_FROZEN_TEST_PARTITION_EXISTS",
         reason=(

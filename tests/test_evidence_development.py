@@ -14,11 +14,14 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from evidence.cohort_registry import load_cohort_registry
 from evidence.development import (
+    SubjectOverlapError,
+    assess_frozen_internal_test_eligibility,
     run_development,
     run_external_test,
     run_gse123352_repeated_development,
     run_internal_test,
 )
+from evidence.development import _assert_no_subject_overlap
 from evidence.evidence_contract import is_not_evaluable
 
 COHORTS_YAML = Path(__file__).parents[1] / "configs" / "cohorts.yaml"
@@ -110,7 +113,9 @@ def test_repeated_development_produces_aggregated_macro_f1():
         seeds=[1, 2, 3], n_top_variance_genes=10, _dataset_override=dataset,
     )
     assert result["status"] == "complete"
-    assert result["n_repeats"] == 3
+    assert result["n_completed_seeds"] == 3
+    assert result["n_requested_seeds"] == 3
+    assert result["n_excluded_seeds"] == 0
     assert result["macro_f1"]["n_repeats"] == 3
     assert result["macro_f1"]["mean"] is not None
     assert 0.0 <= result["macro_f1"]["mean"] <= 1.0
@@ -149,3 +154,134 @@ def test_repeated_development_deterministic_given_same_seeds():
     result1 = run_gse123352_repeated_development(seeds=[1, 2, 3], n_top_variance_genes=10, _dataset_override=dataset1)
     result2 = run_gse123352_repeated_development(seeds=[1, 2, 3], n_top_variance_genes=10, _dataset_override=dataset2)
     assert result1["macro_f1"]["per_repeat_values"] == result2["macro_f1"]["per_repeat_values"]
+
+
+# ─── baselines, full metric bundle, calibration (Issue #16 step 3.3-3.6) ──
+
+def test_repeated_development_reports_required_baselines():
+    dataset = _synthetic_bulk_dataset(seed=3)
+    result = run_gse123352_repeated_development(seeds=[1, 2, 3], n_top_variance_genes=10, _dataset_override=dataset)
+    assert set(result["baseline_comparisons"].keys()) == {"majority", "prevalence", "bulk_linear_untuned"}
+    for name, comparison in result["baseline_comparisons"].items():
+        assert comparison["baseline_name"] == name
+        assert comparison["status"] in ("reported", "insufficient_evidence")
+        assert "wins_a_over_b" in comparison and "losses_a_over_b" in comparison and "ties" in comparison
+        assert "mean_paired_diff" in comparison
+
+
+def test_repeated_development_baselines_never_invent_a_clinical_baseline():
+    dataset = _synthetic_bulk_dataset(seed=4)
+    result = run_gse123352_repeated_development(seeds=[1, 2], n_top_variance_genes=10, _dataset_override=dataset)
+    assert "clinical" not in result["baseline_comparisons"]
+    assert any("no legitimate non-leaking clinical/metadata covariate" in lim.lower() for lim in result["limitations"])
+
+
+def test_repeated_development_full_metric_bundle_has_required_fields():
+    dataset = _synthetic_bulk_dataset(seed=6)
+    result = run_gse123352_repeated_development(seeds=[1, 2], n_top_variance_genes=10, _dataset_override=dataset)
+    for seed_key, bundle in result["full_metric_bundle_by_seed"].items():
+        for field in (
+            "balanced_accuracy", "per_class", "confusion_matrix", "auroc", "auprc",
+            "brier", "ece", "log_loss",
+        ):
+            assert field in bundle, f"missing {field} for seed {seed_key}"
+
+
+def test_repeated_development_calibration_pathway_is_disjoint_from_candidate():
+    dataset = _synthetic_bulk_dataset(seed=7, n_samples=160)
+    result = run_gse123352_repeated_development(seeds=[1, 2], n_top_variance_genes=10, _dataset_override=dataset)
+    for seed_key, calib in result["calibration_by_seed"].items():
+        assert calib["status"] in ("complete", "not_evaluable")
+        if calib["status"] == "complete":
+            assert calib["calibration_source_model"] == "fit_on_inner_train_only_not_the_primary_candidate"
+            assert "uncalibrated_outer_test_metrics" in calib
+            assert "calibrated_outer_test_metrics" in calib
+            assert calib["calibration_method"] in ("none", "sigmoid", "isotonic")
+
+
+def test_repeated_development_degenerate_calibration_is_not_evaluable_not_fabricated():
+    """A seed whose inner split is too small to fit calibration must report
+    status='not_evaluable' with a reason — never a fabricated calibration
+    curve/method."""
+    dataset = _synthetic_bulk_dataset(seed=11, n_samples=20)
+    result = run_gse123352_repeated_development(seeds=[1], train_frac=0.9, test_frac=0.1, n_top_variance_genes=5, _dataset_override=dataset)
+    for calib in result["calibration_by_seed"].values():
+        if calib["status"] == "not_evaluable":
+            assert calib["reason"]
+            assert calib["calibration_fingerprint"] == "not_applicable"
+
+
+# ─── frozen internal-test eligibility (Issue #16 step 3.7) ────────────────
+
+def test_frozen_internal_test_ineligible_reports_computed_counts():
+    result = assess_frozen_internal_test_eligibility(
+        unique_subject_count=176, class_counts={"unexposed": 58, "cigarette": 118},
+    )
+    assert result["eligible"] is False
+    assert result["reason_code"] == "INSUFFICIENT_SUPPORT_FOR_FROZEN_INTERNAL_TEST"
+    assert result["unique_subject_count"] == 176
+    assert result["class_counts"] == {"unexposed": 58, "cigarette": 118}
+    assert "policy_fingerprint" in result
+    assert result["required_next_action"]
+
+
+def test_frozen_internal_test_eligible_synthetic_cohort():
+    result = assess_frozen_internal_test_eligibility(
+        unique_subject_count=500, class_counts={"unexposed": 200, "cigarette": 300},
+    )
+    assert result["eligible"] is True
+    assert "reason_code" not in result
+
+
+def test_frozen_internal_test_eligibility_fingerprint_changes_with_policy(tmp_path):
+    policy_config = tmp_path / "evidence.yaml"
+    policy_config.write_text(
+        "frozen_internal_test_policy:\n  min_total_subjects: 50\n  min_per_class_subjects: 10\n"
+        "  train_frac: 0.6\n  development_holdout_frac: 0.2\n  internal_test_frac: 0.2\n"
+    )
+    default_result = assess_frozen_internal_test_eligibility(
+        unique_subject_count=176, class_counts={"unexposed": 58, "cigarette": 118},
+    )
+    custom_result = assess_frozen_internal_test_eligibility(
+        unique_subject_count=176, class_counts={"unexposed": 58, "cigarette": 118},
+        config_path=policy_config,
+    )
+    assert custom_result["eligible"] is True
+    assert default_result["policy_fingerprint"] != custom_result["policy_fingerprint"]
+
+
+def test_run_internal_test_gse123352_reports_real_eligibility_not_generic_gate():
+    """Regression for Issue #16 step 3.7: the internal-test CLI gate for a
+    real, wired cohort must name the SPECIFIC computed reason (real subject
+    counts vs configured policy), not the generic 'no cohort has ever had a
+    frozen partition' statement."""
+    import evidence.development as development_module
+
+    if not (development_module.GSE123352_RAW_DIR / development_module.GSE123352_RAW_FILE_NAMES[0]).exists():
+        pytest.skip("real GSE123352 raw files not present locally")
+
+    from evidence.artifact_bundle import write_evidence_run
+    import tempfile
+    root = Path(tempfile.mkdtemp())
+    write_evidence_run(root, "run1", {"configuration.json": {"x": 1}}, run_status="complete")
+    result = run_internal_test(root / "run1", None, cohort_id="gse123352", task="smoke_classification")
+    assert is_not_evaluable(result)
+    assert result["reason_code"] != "NO_FROZEN_TEST_PARTITION_EXISTS"
+    assert "unique_subject_count" in result
+
+
+# ─── hard subject-overlap validation (Issue #16 step 3.1) ─────────────────
+
+def test_assert_no_subject_overlap_passes_for_disjoint_partitions():
+    _assert_no_subject_overlap({"train": ["a", "b"], "test": ["c", "d"]})
+
+
+def test_assert_no_subject_overlap_raises_for_shared_subject():
+    with pytest.raises(SubjectOverlapError):
+        _assert_no_subject_overlap({"train": ["a", "b"], "test": ["b", "c"]})
+
+
+def test_repeated_development_outer_partitions_never_overlap():
+    dataset = _synthetic_bulk_dataset(seed=13)
+    result = run_gse123352_repeated_development(seeds=[1, 2, 3, 4], n_top_variance_genes=10, _dataset_override=dataset)
+    assert result["status"] == "complete"  # would have raised SubjectOverlapError internally otherwise

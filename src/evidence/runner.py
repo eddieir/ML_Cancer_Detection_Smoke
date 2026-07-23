@@ -204,9 +204,12 @@ def cmd_development(args: argparse.Namespace) -> int:
 def cmd_internal_test(args: argparse.Namespace) -> int:
     _reject_diagnostic_mode(args, "internal-test")
     from .development import run_internal_test
-    result = run_internal_test(args.run_dir, args.authorization_file)
+    from .evidence_contract import is_not_evaluable
+    result = run_internal_test(
+        args.run_dir, args.authorization_file, cohort_id=args.cohort, task=args.task,
+    )
     _print(result)
-    return 1
+    return 1 if is_not_evaluable(result) else 0
 
 
 def cmd_external_test(args: argparse.Namespace) -> int:
@@ -265,6 +268,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_internal = sub.add_parser("internal-test", help="Frozen internal-test gate (currently always blocked — see module docstring).")
     p_internal.add_argument("--run-dir", required=True)
     p_internal.add_argument("--authorization-file", default=None)
+    p_internal.add_argument("--cohort", default=None, help="If given with --task, reports the real computed frozen-test eligibility decision for this cohort/task instead of the generic gate.")
+    p_internal.add_argument("--task", default=None)
     p_internal.add_argument("--diagnostic-mode", action="store_true")
     p_internal.set_defaults(func=cmd_internal_test)
 
