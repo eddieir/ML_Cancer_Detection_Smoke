@@ -17,8 +17,10 @@ from evidence.runner import (
     build_parser,
     cmd_audit,
     cmd_clinical_readiness,
+    cmd_development,
+    cmd_external_test,
     cmd_inspect,
-    cmd_track_stub,
+    cmd_internal_test,
     cmd_validate,
     main,
 )
@@ -153,35 +155,67 @@ def test_clinical_readiness_disclaimers_present(run_dir, capsys):
     assert any("not a medical device" in d.lower() for d in payload["disclaimers"])
 
 
-# ─── development / internal-test / external-test — honest stubs ───────────
+# ─── development — real orchestration for wired-up cohort/task pairs ──────
 
-@pytest.mark.parametrize("subcommand", ["development", "internal-test", "external-test"])
-def test_track_stub_returns_not_evaluable(subcommand, capsys):
-    code = main([subcommand])
-    assert code == 0
+def test_development_unregistered_cohort_returns_not_evaluable(capsys):
+    code = main(["development", "--cohort", "not_a_real_cohort", "--task", "smoke_classification"])
+    assert code == 1
     payload = json.loads(capsys.readouterr().out)
     assert is_not_evaluable(payload)
-    assert payload["reason_code"] == "TRACK_RUNNER_NOT_YET_INTEGRATED"
-    assert payload["subcommand"] == subcommand
+    assert payload["reason_code"] == "NO_ELIGIBLE_COHORT"
 
 
-@pytest.mark.parametrize("subcommand", ["development", "internal-test", "external-test"])
-def test_track_stub_rejects_diagnostic_mode(subcommand):
-    code = main([subcommand, "--diagnostic-mode"])
+def test_development_ineligible_task_returns_not_evaluable(capsys):
+    # gse136831 no longer supports smoke_classification at all (see Issue #16
+    # blocker 2 — its only smoke-adjacent path is the separate,
+    # non-smoke-classification COPD-vs-Control proxy analysis).
+    code = main(["development", "--cohort", "gse136831", "--task", "smoke_classification"])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert is_not_evaluable(payload)
+
+
+def test_development_rejects_diagnostic_mode():
+    code = main(["development", "--cohort", "gse123352", "--task", "smoke_classification", "--diagnostic-mode"])
     assert code == 2
 
 
-@pytest.mark.parametrize("subcommand", ["development", "internal-test", "external-test"])
-def test_track_stub_rejects_run_dir_flag(subcommand, tmp_path):
-    code = main([subcommand, "--run-dir", str(tmp_path)])
+# ─── internal-test / external-test — honest gates, never fabricated ───────
+
+def test_internal_test_always_blocked_no_frozen_partition(run_dir, capsys):
+    code = main(["internal-test", "--run-dir", str(run_dir)])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert is_not_evaluable(payload)
+    assert payload["reason_code"] == "NO_FROZEN_TEST_PARTITION_EXISTS"
+
+
+def test_external_test_always_blocked_no_eligible_cohort(run_dir, capsys):
+    code = main(["external-test", "--run-dir", str(run_dir)])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert is_not_evaluable(payload)
+    assert payload["reason_code"] == "NO_ELIGIBLE_EXTERNAL_COHORT"
+
+
+def test_internal_test_rejects_diagnostic_mode(run_dir):
+    code = main(["internal-test", "--run-dir", str(run_dir), "--diagnostic-mode"])
     assert code == 2
 
 
-def test_track_stub_never_fabricates_success_via_direct_call():
-    parser = build_parser()
-    args = parser.parse_args(["development"])
-    result_code = cmd_track_stub(args, "development")
-    assert result_code == 0
+def test_external_test_rejects_diagnostic_mode(run_dir):
+    code = main(["external-test", "--run-dir", str(run_dir), "--diagnostic-mode"])
+    assert code == 2
+
+
+def test_internal_test_requires_run_dir():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["internal-test"])
+
+
+def test_external_test_requires_run_dir():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["external-test"])
 
 
 # ─── CLI-level plumbing ─────────────────────────────────────────────────────

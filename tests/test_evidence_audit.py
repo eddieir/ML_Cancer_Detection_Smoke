@@ -4,7 +4,7 @@ tests/test_evidence_audit.py — Phase 7 read-only real-data audit CLI.
 These tests run against the actual repository configs. Some environments
 have real GSE136831/GSE123352 files downloaded under data/raw/ (gitignored,
 never committed) for the real-data evidence runs in evidence/tracks.py and
-scripts/run_gse136831_weak_label_evidence.py; others have no local files at
+scripts/run_gse136831_copd_control_proxy_analysis.py; others have no local files at
 all. Either way, the audit must report an honest, structured result — never
 a fabricated subject/label count, and never a controlled-access cohort
 (NLST) treated as evaluated without an authorized local copy.

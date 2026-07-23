@@ -1,21 +1,20 @@
 """
-scripts/run_gse136831_weak_label_evidence.py
+scripts/run_gse136831_copd_control_proxy_analysis.py
 
-Runs a real, end-to-end WEAK-LABEL smoke-exposure sensitivity experiment
-against the real downloaded GSE136831 data (Vanderbilt/Habermann lung
-scRNA-seq IPF/COPD/Control atlas) and writes the resulting EvidenceReport
-through evidence.artifact_bundle into artifacts/evidence/.
+Runs a real, end-to-end COPD-vs-Control disease-status PROXY sensitivity
+analysis against the real downloaded GSE136831 data (Vanderbilt/Habermann
+lung scRNA-seq IPF/COPD/Control atlas) and writes the resulting
+EvidenceReport through evidence.artifact_bundle into artifacts/evidence/.
 
 GSE136831 has NO verified per-subject cigarette-exposure field — see
 configs/cohorts.yaml's gse136831 source_limitations and
-data/converters.py::_load_gse136831_cell_metadata. Disease_Identity=COPD is
-used here as a documented weak/correlational proxy for cigarette exposure
-("cigarette_proxy"), and Disease_Identity=Control as the weak "never" proxy
-("never_proxy"); IPF subjects are dropped entirely (IPF is not a
-smoke-exposure proxy of any kind). This is explicitly a weak-label
-sensitivity experiment, never a verified-label result — see
-evidence.tracks.run_track_a_on_real_weak_label_data, which this script
-calls and which hard-codes weak_label_experiment=True.
+data/converters.py::_load_gse136831_cell_metadata. This script does not
+produce smoke-classification evidence: COPD is a clinical diagnosis with
+strong smoking association but also documented non-smoking causes, and
+Control status does not prove never-smoking. See
+evidence.tracks.run_copd_control_proxy_analysis, which this script calls
+and which stamps task=TASK_PROXY_ANALYSIS (never TASK_SMOKE) and
+verified_label_count=0 unconditionally.
 
 Pipeline (reusing existing repository infrastructure end to end, not a new
 bespoke one):
@@ -33,10 +32,10 @@ bespoke one):
   7. benchmarks.baselines.SmokeLogisticRegression fit on train cells,
      evaluated on held-out test cells, majority-voted to one prediction per
      subject via benchmarks.metrics.subject_weighted_full_smoke_metrics_report
-     (called inside evidence.tracks.run_track_a_on_real_weak_label_data).
+     (called inside evidence.tracks.run_copd_control_proxy_analysis).
 
 Usage:
-    PYTHONPATH=src python3 scripts/run_gse136831_weak_label_evidence.py
+    PYTHONPATH=src python3 scripts/run_gse136831_copd_control_proxy_analysis.py
 
 Requires the raw GSE136831 files to already be present under
 data/raw/cigarette/GSE136831/. Never downloads anything itself. This is a
@@ -72,7 +71,7 @@ RAW_FILE_NAMES = (
 )
 
 KEEP_DISEASE_IDENTITIES = ("COPD", "Control")  # IPF dropped — not a smoke-exposure proxy
-CLASS_NAMES = ["never_proxy", "cigarette_proxy"]  # index 0 / 1
+CLASS_NAMES = ["control_proxy", "copd_proxy"]  # index 0 / 1 — disease status, not smoke exposure
 
 
 def main(argv=None) -> int:
@@ -82,7 +81,7 @@ def main(argv=None) -> int:
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--test-frac", type=float, default=0.15)
     parser.add_argument("--n-hvgs", type=int, default=2000)
-    parser.add_argument("--run-id", type=str, default="gse136831_weak_label_smoke_v1")
+    parser.add_argument("--run-id", type=str, default="gse136831_copd_control_proxy_v1")
     parser.add_argument(
         "--max-cells-per-subject", type=int, default=300,
         help="Deterministic per-subject cell subsample cap, applied before "
@@ -106,6 +105,14 @@ def main(argv=None) -> int:
     from benchmarks.baselines import SmokeLogisticRegression
     from evidence import tracks
     from evidence.artifact_bundle import write_evidence_run
+    from evidence.run_identity import (
+        baseline_model_fingerprint,
+        build_environment_snapshot,
+        build_split_manifest,
+        environment_snapshot_fingerprint,
+        real_git_commit_sha,
+        split_manifest_fingerprint as compute_split_manifest_fingerprint,
+    )
 
     cached_h5ad_path = ROOT / "data" / "processed" / "converted" / "GSE136831.h5ad"
     if cached_h5ad_path.exists():
@@ -133,8 +140,8 @@ def main(argv=None) -> int:
           f"subject(s); kept {n_kept_subjects} COPD/Control subjects "
           f"({adata.n_obs:,} cells).")
 
-    weak_label = (adata.obs["disease_identity"].astype(str) == "COPD").astype(int).values
-    adata.obs["weak_label_smoke_binary"] = weak_label
+    disease_status = (adata.obs["disease_identity"].astype(str) == "COPD").astype(int).values
+    adata.obs["copd_control_disease_status"] = disease_status
 
     n_cells_before_subsample = adata.n_obs
     if args.max_cells_per_subject is not None:
@@ -151,10 +158,10 @@ def main(argv=None) -> int:
         print(f"[run] subsampled {n_cells_before_subsample:,} -> {adata.n_obs:,} cells "
               f"(cap={args.max_cells_per_subject} cells/subject, seed={args.seed}) "
               "for dense-matrix memory feasibility in this environment.")
-        weak_label = adata.obs["weak_label_smoke_binary"].values
+        disease_status = adata.obs["copd_control_disease_status"].values
 
     subject_ids_per_cell = adata.obs["subject_id"].astype(str).tolist()
-    labels_per_cell = weak_label.tolist()
+    labels_per_cell = disease_status.tolist()
 
     split = subject_train_val_test_split(
         subject_ids=subject_ids_per_cell, labels=labels_per_cell,
@@ -180,7 +187,7 @@ def main(argv=None) -> int:
     X = transformed.X
     if hasattr(X, "toarray"):
         X = X.toarray()
-    y = transformed.obs["weak_label_smoke_binary"].values
+    y = transformed.obs["copd_control_disease_status"].values
 
     X_train, y_train = X[train_mask], y[train_mask]
     X_test, y_test, subj_test = X[test_mask], y[test_mask], subj[test_mask]
@@ -201,24 +208,48 @@ def main(argv=None) -> int:
             "training/evaluation sample size was reduced."
         )
 
-    report = tracks.run_track_a_on_real_weak_label_data(
+    commit_sha = real_git_commit_sha(ROOT)
+    env_snapshot = build_environment_snapshot(commit_sha, ROOT)
+    split_manifest = build_split_manifest(
+        task=tracks.TASK_PROXY_ANALYSIS, endpoint="copd_vs_control_disease_status",
+        dataset_accession="GSE136831",
+        train_subject_ids=split.train_subjects, validation_subject_ids=split.val_subjects,
+        development_holdout_subject_ids=split.test_subjects,
+        seed=args.seed, train_frac=args.train_frac, val_frac=args.val_frac, test_frac=args.test_frac,
+        stratification_policy="subject_train_val_test_split (label-stratified subject-level split)",
+        class_mapping={name: i for i, name in enumerate(CLASS_NAMES)},
+        rare_class_policy="not_applicable_binary_proxy_analysis",
+        label_state_policy="weak_disease_status_proxy — never a verified smoke-exposure label",
+        weak_label_policy="Disease_Identity=COPD/Control used as a disease-status proxy comparator only",
+        subject_identity_field="subject_id (donor_id)",
+        grouping_policy="all cells from one subject stay in one partition",
+        dataset_manifest_fingerprint=tracks._real_raw_file_fingerprint(raw_files),
+    )
+
+    report = tracks.run_copd_control_proxy_analysis(
         y_true=y_test.tolist(), y_pred=y_pred_test.tolist(),
         subject_ids=subj_test.tolist(), num_classes=2,
         raw_file_paths=raw_files, class_names=CLASS_NAMES,
         dataset_accession="GSE136831",
-        excluded_subject_count=n_ipf_subjects,
-        excluded_subject_reason=f"{n_ipf_subjects} IPF subject(s) excluded — not a smoke-exposure proxy.",
+        split_manifest_fingerprint=compute_split_manifest_fingerprint(split_manifest),
+        model_fingerprint=baseline_model_fingerprint(
+            baseline=model, preprocessing_fingerprint=artifact.scientific_fingerprint(),
+            train_subject_ids=split.train_subjects,
+        ),
+        environment_fingerprint=environment_snapshot_fingerprint(env_snapshot),
         preprocessing_artifact_fingerprint=artifact.scientific_fingerprint(),
+        excluded_subject_count=n_ipf_subjects,
+        excluded_subject_reason=f"{n_ipf_subjects} IPF subject(s) excluded — not a smoking-relevant comparator.",
         random_seed=args.seed,
         extra_limitations=extra_limitations,
     )
 
-    print("\n[run] GSE136831 weak-label smoke-exposure experiment — real held-out subject metrics:")
+    print("\n[run] GSE136831 COPD-vs-Control disease-status proxy analysis — real held-out subject metrics:")
     print(json.dumps(report["metrics"], indent=2, default=str))
     print(f"\n[run] total subjects in accession: {n_total_subjects}  "
           f"(IPF excluded: {n_ipf_subjects}, COPD/Control kept: {n_kept_subjects})")
     print(f"[run] class counts (all kept cells): "
-          f"cigarette_proxy={int(weak_label.sum())}  never_proxy={int((weak_label == 0).sum())}")
+          f"copd_proxy={int(disease_status.sum())}  control_proxy={int((disease_status == 0).sum())}")
     print(f"[run] train cells: {X_train.shape[0]:,}  test cells: {X_test.shape[0]:,}  "
           f"test subjects: {len(set(subj_test.tolist()))}")
 
@@ -233,7 +264,7 @@ def main(argv=None) -> int:
             {"subject_id": sid, "y_true": int(yt), "y_pred": int(yp)}
             for sid, yt, yp in zip(subj_test.tolist(), y_test.tolist(), y_pred_test.tolist())
         ],
-        "metrics/track_a_real_weak_label.json": report,
+        "metrics/track_a_copd_control_proxy.json": report,
         "cohort_flow.json": {
             "total_subjects_in_accession": int(n_total_subjects),
             "ipf_subjects_excluded": int(n_ipf_subjects),
@@ -243,10 +274,15 @@ def main(argv=None) -> int:
             "test_subjects": split.test_subjects,
         },
         "preprocessing/artifact.json": artifact.to_dict(),
+        "environment.json": env_snapshot,
+        "split_manifest.json": split_manifest,
     }
     run_dir = write_evidence_run(
         ROOT / "artifacts" / "evidence", args.run_id, files,
-        extra_manifest_fields={"dataset_accession": "GSE136831", "track": "A", "weak_label_experiment": True},
+        extra_manifest_fields={
+            "dataset_accession": "GSE136831", "track": "A_proxy_analysis",
+            "task": tracks.TASK_PROXY_ANALYSIS,
+        },
     )
     print(f"\n[run] wrote evidence artifact bundle to {run_dir}")
     return 0

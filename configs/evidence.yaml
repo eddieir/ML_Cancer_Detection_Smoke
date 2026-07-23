@@ -133,6 +133,13 @@ uncertainty_policy:
 subgroup_policy:
   min_subjects_per_subgroup: 10
 
+# Predeclared seeds for repeated grouped development evaluation (Issue #16
+# blocker 6 — evidence/development.py::run_gse123352_repeated_development).
+# Fixed and committed here rather than chosen ad hoc at run time, so a
+# repeated-development result cannot be seed-shopped after seeing outcomes.
+development_repeat_seeds:
+  gse123352_smoke_classification: [1, 2, 3, 4, 5, 6, 7, 8]
+
 notes:
   - "not_evaluable is the only sanctioned representation of missing evidence — never 0, false, an empty metric dict, NaN without explanation, or a warning attached to a fabricated result."
   - "development_only_flag=true reports can never claim internal_held_out_real_data or stronger."
