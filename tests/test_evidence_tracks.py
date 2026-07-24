@@ -63,9 +63,15 @@ def test_track_b_against_registry_is_not_evaluable(cohorts):
 
 
 def test_track_c_against_registry_is_not_evaluable(cohorts):
+    # tcga_lung_vital_status is now a real, structurally eligible cohort
+    # (see configs/cohorts.yaml) — this registry-consulting path never opens
+    # a dataset file itself (see evidence.development.run_development for
+    # the real orchestration), so it still returns not_evaluable, but for a
+    # different, still-honest reason than "no eligible cohort exists".
     result = tracks.run_track_c_against_registry(cohorts)
     assert is_not_evaluable(result)
-    assert result["reason_code"] == "NO_ELIGIBLE_EXPRESSION_OUTCOME_LINKAGE"
+    assert result["reason_code"] == "REAL_FITTING_NOT_IMPLEMENTED"
+    assert "tcga_lung_vital_status" in result["candidate_cohorts"]
     assert result["task"] == tracks.TASK_CANCER_PREDICTION
 
 
@@ -244,3 +250,46 @@ def test_track_a_real_verified_label_data_requires_real_fingerprints(tmp_path):
         tracks.run_track_a_on_real_verified_label_data(
             [0, 1], [0, 1], ["s0", "s1"], num_classes=2, raw_file_paths=[raw_file],
         )
+
+
+# ─── Track C — real TCGA vital-status cancer-outcome prediction ───────────
+
+def _real_tcga_identity_kwargs():
+    return dict(
+        dataset_manifest_fingerprint=FAKE_FP, split_manifest_fingerprint=FAKE_FP,
+        model_fingerprint=FAKE_FP, environment_fingerprint=FAKE_FP,
+        preprocessing_artifact_fingerprint=FAKE_FP,
+    )
+
+
+def test_track_c_real_tcga_vital_status_is_stamped_correctly():
+    y_true = [0, 1, 1, 0, 1, 0]
+    y_prob = [0.2, 0.9, 0.6, 0.1, 0.8, 0.3]
+    subject_ids = [f"case{i}" for i in range(6)]
+    out = tracks.run_track_c_on_real_tcga_vital_status_data(
+        y_true, y_prob, subject_ids, **_real_tcga_identity_kwargs(),
+    )
+    validate_report(report_from_dict(out))
+    assert out["identity"]["synthetic_flag"] is False
+    assert out["identity"]["development_only_flag"] is True
+    assert out["identity"]["evidence_level"] == "development_only_real_data"
+    assert out["identity"]["task"] == tracks.TASK_CANCER_PREDICTION
+    assert out["identity"]["dataset_accession"] == "TCGA-LUAD+TCGA-LUSC"
+    assert out["metrics"]["endpoint_fields"]["censoring_status"] == "not_modeled_binary_vital_status_only"
+    assert any("time-to-event" in lim for lim in out["identity"]["limitations"])
+
+
+def test_track_c_real_tcga_vital_status_requires_real_fingerprints():
+    with pytest.raises(TypeError):
+        tracks.run_track_c_on_real_tcga_vital_status_data([0, 1], [0.1, 0.9], ["s0", "s1"])
+
+
+def test_track_c_real_tcga_never_claims_survival_semantics():
+    y_true = [0, 1, 1, 0]
+    y_prob = [0.2, 0.9, 0.6, 0.1]
+    subject_ids = ["case0", "case1", "case2", "case3"]
+    out = tracks.run_track_c_on_real_tcga_vital_status_data(
+        y_true, y_prob, subject_ids, **_real_tcga_identity_kwargs(),
+    )
+    assert out["metrics"]["endpoint_fields"]["prediction_horizon_years"] is None
+    assert out["metrics"]["endpoint_fields"]["follow_up_complete"] is False

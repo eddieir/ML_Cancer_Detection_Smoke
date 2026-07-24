@@ -213,6 +213,42 @@ cohorts:
     notes:
       - "Never treated as single-cell data; never enters per-cell malignancy training."
 
+  - cohort_id: tcga_lung_vital_status
+    accession: "TCGA-LUAD+TCGA-LUSC"
+    dataset_id: tcga_lung_vital_status
+    version_or_retrieval_date: "GDC open API, downloaded directly (open-access tier, no DUA)"
+    access_level: public
+    species: human
+    assay_type: bulk_rna_seq
+    single_cell_or_bulk: bulk
+    biological_tissue: lung_tumor
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    verified_smoke_label_fields: []
+    weak_smoke_label_fields: []
+    malignancy_label_fields: []
+    cancer_outcome_fields: [vital_status, days_to_death]
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: true
+    source_limitations:
+      - "vital_status is a binary outcome at last recorded GDC follow-up, not a time-to-event survival label — no censoring or follow-up duration is modeled."
+      - "Combines TCGA-LUAD and TCGA-LUSC primary-tumor samples on their shared gene set for statistical power; not a single-histology result."
+      - "Does not carry verified smoke type; never enters smoke-classification evidence."
+      - "Bulk RNA-seq, one sample per real GDC case_id — never single-cell, never enters the single-cell MIL pipeline."
+    licensing_access_limitations: "Public open GDC access (STAR - Counts gene expression + demographic vital_status are both open-access tier), no DUA required."
+    checksum_rule: "sha256 of the converted per-project genes-x-samples CSVs; see data/converters.py::convert_tcga_vital_status."
+    task_support:
+      smoke_classification: "no"
+      malignancy_classification: not_currently
+      subject_level_cancer_prediction: "yes"
+      external_validation: "no"
+    role_eligibility: [development]
+    notes:
+      - "The first cohort in this repository with genuinely linked, subject-level expression<->cancer-outcome data — see evidence.tracks.run_track_c_on_real_tcga_vital_status_data."
+      - "Distinct from tcga_luad/tcga_lusc, which describe the raw per-project GDC data and remain excluded/not-currently-supported for their originally-scoped tumor/normal malignancy task."
+
   - cohort_id: nlst
     accession: NLST
     dataset_id: nlst

@@ -285,3 +285,74 @@ def test_repeated_development_outer_partitions_never_overlap():
     dataset = _synthetic_bulk_dataset(seed=13)
     result = run_gse123352_repeated_development(seeds=[1, 2, 3, 4], n_top_variance_genes=10, _dataset_override=dataset)
     assert result["status"] == "complete"  # would have raised SubjectOverlapError internally otherwise
+
+
+# ─── TCGA vital-status cancer-outcome prediction (real, linked cohort) ────
+
+def _synthetic_tcga_outcome_dataset(n_samples=120, n_genes=40, seed=0):
+    from data.tcga_outcome_pipeline import TCGAOutcomeDataset
+
+    rng = np.random.RandomState(seed)
+    subject_ids = [f"case{i}" for i in range(n_samples)]
+    labels = np.array([i % 2 for i in range(n_samples)])
+    X = rng.normal(loc=0.0, scale=1.0, size=(n_samples, n_genes)).astype(np.float32)
+    signal_genes = list(range(5))
+    X[:, signal_genes] += (labels[:, None] * 1.5)
+    gene_names = [f"ENSG{i}" for i in range(n_genes)]
+    return TCGAOutcomeDataset(
+        X=X, y=labels, subject_ids=subject_ids, sample_ids=subject_ids, gene_names=gene_names,
+    )
+
+
+def test_run_development_dispatches_tcga_lung_vital_status(cohorts, tmp_path):
+    import evidence.development as development_module
+    if not development_module.TCGA_LUAD_CSV.exists() and not (development_module.TCGA_LUAD_RAW_DIR / "outcome_meta.csv").exists():
+        pytest.skip("real TCGA data not present locally")
+    result = run_development(
+        "tcga_lung_vital_status", "subject_level_cancer_prediction", cohorts=cohorts,
+        output_root=tmp_path / "tcga_dev_dispatch_test",
+    )
+    assert result["status"] in ("complete",)
+
+
+def test_run_development_tcga_without_local_data_returns_not_evaluable(cohorts, tmp_path, monkeypatch):
+    import evidence.development as development_module
+    monkeypatch.setattr(development_module, "TCGA_LUAD_RAW_DIR", tmp_path / "nope_luad")
+    monkeypatch.setattr(development_module, "TCGA_LUSC_RAW_DIR", tmp_path / "nope_lusc")
+    monkeypatch.setattr(development_module, "TCGA_LUAD_CSV", tmp_path / "nope_luad.csv")
+    monkeypatch.setattr(development_module, "TCGA_LUSC_CSV", tmp_path / "nope_lusc.csv")
+    result = run_development(
+        "tcga_lung_vital_status", "subject_level_cancer_prediction", cohorts=cohorts,
+        output_root=tmp_path / "artifacts",
+    )
+    assert is_not_evaluable(result)
+    assert result["reason_code"] == "REAL_DATA_NOT_PRESENT"
+
+
+def test_tcga_repeated_development_produces_baselines_and_full_metrics():
+    from evidence.development import run_tcga_lung_vital_status_repeated_development
+
+    dataset = _synthetic_tcga_outcome_dataset(seed=3)
+    result = run_tcga_lung_vital_status_repeated_development(
+        seeds=[1, 2, 3], n_top_variance_genes=10, _dataset_override=dataset,
+    )
+    assert result["status"] == "complete"
+    assert result["n_completed_seeds"] == 3
+    assert set(result["baseline_comparisons"].keys()) == {"majority", "prevalence", "bulk_linear_untuned"}
+    for seed_key, bundle in result["full_metric_bundle_by_seed"].items():
+        assert "auroc" in bundle and "brier" in bundle
+    assert "frozen_internal_test_eligibility" in result
+    assert "eligible" in result["frozen_internal_test_eligibility"]
+
+
+def test_tcga_repeated_development_without_local_data_returns_not_evaluable(tmp_path, monkeypatch):
+    import evidence.development as development_module
+    monkeypatch.setattr(development_module, "TCGA_LUAD_RAW_DIR", tmp_path / "nope_luad")
+    monkeypatch.setattr(development_module, "TCGA_LUSC_RAW_DIR", tmp_path / "nope_lusc")
+    monkeypatch.setattr(development_module, "TCGA_LUAD_CSV", tmp_path / "nope_luad.csv")
+    monkeypatch.setattr(development_module, "TCGA_LUSC_CSV", tmp_path / "nope_lusc.csv")
+    from evidence.development import run_tcga_lung_vital_status_repeated_development
+
+    result = run_tcga_lung_vital_status_repeated_development(seeds=[1, 2])
+    assert is_not_evaluable(result)
+    assert result["reason_code"] == "REAL_DATA_NOT_PRESENT"

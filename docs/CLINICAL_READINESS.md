@@ -36,7 +36,7 @@ supporting a `complete` status, so every mandatory dimension is
 | Intended use | yes | not_started | No intended-use statement has been reviewed and signed off. |
 | Target population | yes | not_started | No target population has been defined or characterized against real cohort demographics. |
 | Clinical setting | yes | not_started | No clinical setting has been specified. |
-| Prediction target and time horizon | yes | not_started | Track C (subject-level cancer prediction) is not_evaluable — see `docs/EVIDENCE_PROTOCOL.md`. |
+| Prediction target and time horizon | yes | not_started | Track C now has one real, development-only result (TCGA vital-status, weak signal — see `docs/EVIDENCE_PROTOCOL.md`), but it predicts a binary outcome at last follow-up, not a defined time horizon — no genuine time-to-event/prediction-horizon definition exists for any cohort yet. |
 | Input specimen and assay | yes | partial | Specimen/assay are well-documented per cohort (`configs/cohorts.yaml`), but no cohort currently supports the full pipeline end to end on real data. |
 | Data provenance | yes | partial | `configs/datasets.yaml` / `src/data/manifest.py` provide real provenance and checksums for whichever files are actually present; none are present in this environment. |
 | Analytical validity | yes | blocked | Requires a real held-out evaluation, which does not exist. |

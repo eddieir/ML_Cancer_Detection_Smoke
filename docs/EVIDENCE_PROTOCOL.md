@@ -262,24 +262,63 @@ been executed against them:
   verified-label smoke-classification result, and cannot satisfy any
   clinical-readiness dimension. Report artifact:
   `artifacts/evidence/gse136831_copd_control_proxy_v1/`.
+- **TCGA-LUAD+TCGA-LUSC vital-status subject-level cancer-outcome
+  prediction (real data, real linked outcome, Track C).** The first cohort
+  in this repository with genuinely linked, subject-level expression<->
+  cancer-outcome data: real primary-tumor bulk RNA-seq (GDC "STAR - Counts",
+  open-access) and real `vital_status` (Dead/Alive at last GDC follow-up)
+  from the same case's demographic record — downloaded directly from
+  `api.gdc.cancer.gov`, no DUA required
+  (`data/converters.py::convert_tcga_vital_status`,
+  `data/tcga_outcome_pipeline.py`, cohort `tcga_lung_vital_status` in
+  `configs/cohorts.yaml`). Explicitly NOT a survival/time-to-event label —
+  `evidence.tracks.run_track_c_on_real_tcga_vital_status_data` stamps
+  `endpoint_fields.censoring_status='not_modeled_binary_vital_status_only'`
+  on every report. 996 real subjects (602 alive / 394 dead) after excluding
+  unknown-vital-status and cross-project-duplicate-case_id samples. A
+  single 70/30 split scored AUROC ≈0.51 (near chance); the repeated
+  grouped-development protocol (8 seeds, same fold-local C selection,
+  baselines, full metric bundle, and calibration pathway as GSE123352)
+  scored **macro-F1 mean 0.493 (std 0.015)** — a real but weak signal.
+  Paired against the required baselines on the identical per-seed
+  partition: beats majority/prevalence (mean diff +0.116, 8/8 seeds) but
+  **loses to the untuned all-gene linear baseline on 6/8 seeds** (mean diff
+  −0.026) — reported as found. Unlike GSE123352, this cohort's real counts
+  (996 total, 394 minority-class) clear the configured frozen-internal-test
+  support policy (`eligible=True`) — no frozen partition has been created
+  yet, but the computed decision genuinely differs from GSE123352's.
+  Report artifacts: `artifacts/evidence/tcga_lung_vital_status_v1/`
+  (single-split), `artifacts/evidence/tcga_lung_vital_status_repeated_development_v1/`
+  (repeated — both gitignored); sanitized publication summaries:
+  `evidence/published/tcga_lung_vital_status_v1/summary.json` and
+  `evidence/published/tcga_lung_vital_status_repeated_development_v1/summary.json`.
 
 What remains unimplemented past these results is, in every case, **not a
 missing piece of code — it is the absence of a suitable real dataset file,
 or a real cross-assay/expression-outcome linkage, in this environment**:
 
-- **Five of seven registered cohorts still have no real local files
-  present** (GSE288003, GSE307690/CANUCK, TCGA-LUAD, TCGA-LUSC, NLST — the
-  last controlled-access). `python -m evidence.audit` reports
-  `partial_local_data_present` given GSE136831/GSE123352 are present.
-- **Track B (malignancy) and Track C (subject-level cancer prediction)
-  still have nothing eligible to evaluate**, independent of which cohorts
-  are downloaded: no single-cell cohort carries a malignancy label, and no
-  cohort has a genuine expression<->outcome linkage
-  (`expression_outcome_linkable_at_subject_level: false` everywhere in
-  `configs/cohorts.yaml`). `run_track_b/c_against_registry()` remain
-  honest `not_evaluable`. Their `..._on_fixture()` paths still run the
+- **Four of eight registered cohorts still have no real local files
+  present, or remain controlled-access** (GSE288003, GSE307690/CANUCK,
+  NLST — controlled-access, no DUA obtained). `tcga_luad`/`tcga_lusc`'s raw
+  files ARE now present (used by `tcga_lung_vital_status`); their
+  originally-scoped tumor/normal `malignancy_classification` task remains
+  `not_currently` supported (no bulk malignancy-classification pipeline
+  exists). `python -m evidence.audit` reports `partial_local_data_present`.
+- **Track B (malignancy) still has nothing eligible to evaluate**: no
+  single-cell cohort carries a malignancy label. `run_track_b_against_registry()`
+  remains honest `not_evaluable`. Its `..._on_fixture()` path still runs the
   real metric-computation code end-to-end only against synthetic data,
   stamped `synthetic_flag=True`.
+- **Track C (subject-level cancer prediction) now has one real, wired
+  cohort** (`tcga_lung_vital_status`, above) — `run_track_c_against_registry()`
+  now finds it structurally eligible and returns `REAL_FITTING_NOT_IMPLEMENTED`
+  only in the sense that the registry-consulting path itself never opens a
+  dataset file (by design — see this module's docstring); the real
+  orchestration lives in `evidence.development.run_development`/
+  `run_tcga_lung_vital_status_repeated_development`, both of which DO run
+  against real data. True time-to-event survival prediction (with
+  censoring/follow-up duration) remains unimplemented — no cohort in this
+  repository carries genuine censoring data.
 - **Candidate comparison (Step 9) and subgroup diagnostics (Step 13) remain
   framework-only.** `run_candidate_comparison_on_synthetic_fixture()` and
   `subgroup_report()` run the real comparison/statistics code against real

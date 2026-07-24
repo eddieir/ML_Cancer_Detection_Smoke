@@ -2536,13 +2536,42 @@ loaded from a validated evidence artifact):**
   smoke-evidence table, cannot be selected by a caller flag, and cannot
   satisfy any clinical-readiness dimension (see
   `scripts/run_gse136831_copd_control_proxy_analysis.py`).
-- **Real cancer-prediction performance: not established.** No cohort in
-  this repository has both compatible expression input and a genuinely
-  linked subject-level cancer outcome — downloading more data does not
-  change this; see `configs/cohorts.yaml`'s cohort-by-cohort
-  `expression_outcome_linkable_at_subject_level: false`. TCGA bulk tumour
-  labels are never treated as per-cell malignancy labels; NLST outcomes
-  are never linked to unrelated expression cohorts.
+- **Real cancer-outcome (vital-status) prediction: real, development-only,
+  weak signal.** TCGA-LUAD + TCGA-LUSC (`cohort_id: tcga_lung_vital_status`)
+  is the first cohort in this repository with a genuinely linked,
+  subject-level expression<->outcome pair: real primary-tumor bulk RNA-seq
+  (GDC "STAR - Counts", open-access, no DUA) and real `vital_status`
+  (Dead/Alive at last GDC follow-up, from the same case's demographic
+  record) — downloaded directly from `api.gdc.cancer.gov`
+  (`data/converters.py::convert_tcga_vital_status`,
+  `data/tcga_outcome_pipeline.py`). This is explicitly NOT a time-to-event
+  survival label — no censoring or follow-up duration is modeled; see
+  `evidence.tracks.run_track_c_on_real_tcga_vital_status_data`'s
+  `endpoint_fields.censoring_status='not_modeled_binary_vital_status_only'`.
+  996 subjects (602 alive / 394 dead) after excluding samples with unknown
+  vital status or a case_id duplicated across projects. Repeated grouped
+  development evaluation across 8 seeds: **macro-F1 mean 0.493 (std
+  0.015), AUROC ~0.51 on the single-split result** — a real but weak
+  signal, at or near chance. Honestly reported against required baselines
+  on the identical per-seed partition: beats majority/prevalence (mean
+  diff +0.116, 8/8 seeds) but **loses to an untuned all-gene logistic
+  baseline on 6/8 seeds** (mean diff −0.026) — the top-variance gene
+  selection this pipeline uses does not clearly help for this outcome, and
+  that is reported as found, not smoothed over. Unlike GSE123352, this
+  cohort's real subject/class counts (996 total, 394 minority-class)
+  genuinely clear the configured frozen-internal-test support policy
+  (`frozen_internal_test_eligibility.eligible=True`) — no frozen partition
+  has actually been created yet, but the real computed decision differs
+  from GSE123352's. Sanitized artifacts:
+  `evidence/published/tcga_lung_vital_status_v1/summary.json` (single-split),
+  `evidence/published/tcga_lung_vital_status_repeated_development_v1/summary.json`
+  (repeated). Real per-cell malignancy classification and true
+  time-to-event survival prediction both remain **not established** — no
+  single-cell cohort carries a malignancy label, and no cohort in this
+  repository has genuine censoring/follow-up-duration data. NLST outcomes
+  are still never linked to unrelated expression cohorts (NLST itself
+  remains controlled-access — no DUA has been obtained in this
+  environment).
 - **Malignancy classification: not established.** No single-cell cohort
   carries a per-cell/per-sample malignancy label.
 - **External validation: not performed.** No cohort in `configs/cohorts.yaml`

@@ -15,6 +15,7 @@ files are authoritative.
 | GSE307690 (CANUCK) | human | bulk microarray/RNA-seq | bulk | public | cannabis/never smoker | none | Same bulk limitation as GSE123352. |
 | TCGA-LUAD | human | bulk RNA-seq | bulk | public (open GDC) | none | tumor/normal sample_type only | Bulk tumour/normal status only; never per-cell malignancy; no verified smoking history. |
 | TCGA-LUSC | human | bulk RNA-seq | bulk | public (open GDC) | none | tumor/normal sample_type only | Same as TCGA-LUAD. |
+| TCGA-LUAD+TCGA-LUSC (tcga_lung_vital_status) | human | bulk RNA-seq | bulk | public (open GDC, no DUA) | none | vital_status (Dead/Alive at last GDC follow-up), real subject-level linkage | The first cohort here with genuine expression<->outcome linkage; NOT a survival/time-to-event label (no censoring/follow-up duration modeled); combines LUAD+LUSC on shared genes. |
 | NLST | human | clinical/tabular | not applicable | controlled (DUA required) | CIGSMOK/CIGAR | candx | No expression data at all; controlled access; not accessed in this environment. |
 
 ## What "verified" vs "weak/proxy" means here

@@ -73,6 +73,13 @@ def run_development(
             n_top_variance_genes=n_top_variance_genes,
         )
 
+    if cohort_id == "tcga_lung_vital_status" and task == "subject_level_cancer_prediction":
+        return _run_tcga_lung_vital_status_development(
+            output_root=output_root, run_id=run_id or "tcga_lung_vital_status_v1",
+            seed=seed, train_frac=train_frac, test_frac=test_frac,
+            n_top_variance_genes=n_top_variance_genes,
+        )
+
     return not_evaluable(
         reason_code="TRACK_RUNNER_NOT_YET_INTEGRATED",
         reason=(
@@ -196,6 +203,147 @@ def _run_gse123352_development(*, output_root, run_id, seed, train_frac, test_fr
     run_dir = write_evidence_run(
         output_root, run_id, files,
         extra_manifest_fields={"dataset_accession": "GSE123352", "track": "A", "task": tracks.TASK_SMOKE},
+    )
+    return {"status": "complete", "run_dir": str(run_dir), "report": report}
+
+
+TCGA_LUAD_CSV = ROOT / "data" / "processed" / "converted" / "TCGA-LUAD_vital_status.csv"
+TCGA_LUSC_CSV = ROOT / "data" / "processed" / "converted" / "TCGA-LUSC_vital_status.csv"
+TCGA_LUAD_RAW_DIR = ROOT / "data" / "raw" / "malignancy" / "TCGA-LUAD"
+TCGA_LUSC_RAW_DIR = ROOT / "data" / "raw" / "malignancy" / "TCGA-LUSC"
+
+
+def _tcga_lung_vital_status_dataset():
+    """Builds the real, converted TCGA-LUAD+TCGA-LUSC vital-status dataset,
+    converting from real downloaded GDC files first if the converted CSVs
+    are not already present. Returns None (never fabricates a dataset) if
+    the real raw GDC files are not present locally."""
+    from data import tcga_outcome_pipeline
+    from data.converters import convert_tcga_vital_status
+
+    if not TCGA_LUAD_CSV.exists():
+        if not (TCGA_LUAD_RAW_DIR / "outcome_meta.csv").exists():
+            return None, "TCGA-LUAD"
+        if convert_tcga_vital_status("TCGA-LUAD", TCGA_LUAD_RAW_DIR) is None:
+            return None, "TCGA-LUAD"
+    if not TCGA_LUSC_CSV.exists():
+        if not (TCGA_LUSC_RAW_DIR / "outcome_meta.csv").exists():
+            return None, "TCGA-LUSC"
+        if convert_tcga_vital_status("TCGA-LUSC", TCGA_LUSC_RAW_DIR) is None:
+            return None, "TCGA-LUSC"
+
+    dataset = tcga_outcome_pipeline.build_tcga_outcome_dataset([TCGA_LUAD_CSV, TCGA_LUSC_CSV])
+    return dataset, None
+
+
+def _run_tcga_lung_vital_status_development(*, output_root, run_id, seed, train_frac, test_frac, n_top_variance_genes) -> Dict[str, Any]:
+    dataset, missing = _tcga_lung_vital_status_dataset()
+    if dataset is None:
+        return not_evaluable(
+            reason_code="REAL_DATA_NOT_PRESENT",
+            reason=f"missing real downloaded GDC files for {missing} under data/raw/malignancy/{missing}/ "
+                   "(run the GDC open-access download for STAR-Counts gene expression + case vital_status first).",
+            required_next_action="Download the real TCGA-LUAD/TCGA-LUSC open-access GDC files before running development.",
+            cohort_id="tcga_lung_vital_status", task="subject_level_cancer_prediction",
+        )
+
+    from data import bulk_pipeline, tcga_outcome_pipeline
+    from . import tracks
+    from .artifact_bundle import write_evidence_run
+    from .run_identity import (
+        build_environment_snapshot,
+        build_split_manifest,
+        bulk_model_fingerprint,
+        bulk_preprocessing_fingerprint,
+        environment_snapshot_fingerprint,
+        real_git_commit_sha,
+        split_manifest_fingerprint as compute_split_manifest_fingerprint,
+    )
+    import hashlib
+
+    split = tcga_outcome_pipeline.split_tcga_outcome_subjects(
+        dataset, seed=seed, train_frac=train_frac, test_frac=test_frac,
+    )
+    id_to_row = {sid: i for i, sid in enumerate(dataset.subject_ids)}
+    train_idx = [id_to_row[s] for s in split.train_subjects]
+    test_idx = [id_to_row[s] for s in split.test_subjects]
+    _assert_no_subject_overlap({"train": split.train_subjects, "test": split.test_subjects})
+
+    fitted = bulk_pipeline.fit_bulk_logistic_regression(
+        dataset.X[train_idx], dataset.y[train_idx], dataset.gene_names,
+        seed=seed, n_top_variance_genes=n_top_variance_genes, C=1.0,
+    )
+    y_pred, y_prob = bulk_pipeline.apply_bulk_classifier(fitted, dataset.X[test_idx])
+    test_subjects = [dataset.subject_ids[i] for i in test_idx]
+    train_subjects = [dataset.subject_ids[i] for i in train_idx]
+    test_true = dataset.y[test_idx].tolist()
+
+    preprocessing_fp = bulk_preprocessing_fingerprint(
+        gene_indices=fitted.gene_indices, gene_names_selected=fitted.gene_names_selected,
+        n_genes_available=fitted.n_genes_available, n_top_variance_genes_requested=n_top_variance_genes,
+        selection_policy="top_variance_train_only", scaler=fitted.scaler,
+        train_subject_ids=train_subjects, missing_value_handling="none — missing genes filled 0 at conversion",
+    )
+    model_fp = bulk_model_fingerprint(
+        model=fitted.model, hyperparameters={"C": 1.0, "class_weight": "balanced", "random_state": seed},
+        class_names=list(tcga_outcome_pipeline.SUPPORTED_VITAL_CLASSES),
+        preprocessing_fingerprint=preprocessing_fp, train_subject_ids=train_subjects,
+    )
+    commit_sha = real_git_commit_sha(ROOT)
+    env_snapshot = build_environment_snapshot(commit_sha, ROOT)
+    split_manifest = build_split_manifest(
+        task=tracks.TASK_CANCER_PREDICTION, endpoint="subject_level_vital_status_at_last_follow_up",
+        dataset_accession="TCGA-LUAD+TCGA-LUSC", train_subject_ids=train_subjects, validation_subject_ids=[],
+        development_holdout_subject_ids=test_subjects, seed=seed, train_frac=train_frac,
+        val_frac=0.0, test_frac=test_frac,
+        stratification_policy="subject_train_val_test_split (label-stratified subject-level split)",
+        class_mapping={name: i for i, name in enumerate(tcga_outcome_pipeline.SUPPORTED_VITAL_CLASSES)},
+        rare_class_policy="not_applicable_binary_cohort",
+        label_state_policy="verified_only — vital_status_known=True required from real GDC demographic record",
+        weak_label_policy="not_applicable — vital_status is a real, independently-recorded GDC outcome field",
+        subject_identity_field="subject_id (real GDC case_id — authoritative, not inferred)",
+        grouping_policy="one verified subject (case_id) per row; duplicate case_id rejected upstream",
+        dataset_manifest_fingerprint=hashlib.sha256(
+            (TCGA_LUAD_CSV.read_bytes() + TCGA_LUSC_CSV.read_bytes())
+        ).hexdigest(),
+    )
+
+    report = tracks.run_track_c_on_real_tcga_vital_status_data(
+        y_true=test_true, y_prob=y_prob.tolist(), subject_ids=test_subjects,
+        dataset_manifest_fingerprint=split_manifest["dataset_manifest_fingerprint"],
+        split_manifest_fingerprint=compute_split_manifest_fingerprint(split_manifest),
+        model_fingerprint=model_fp, environment_fingerprint=environment_snapshot_fingerprint(env_snapshot),
+        preprocessing_artifact_fingerprint=preprocessing_fp,
+        excluded_subject_count=len(dataset.excluded_sample_ids),
+        excluded_subject_reason=(f"excluded_sample_ids: {dataset.excluded_reason_counts}" if dataset.excluded_sample_ids else None),
+        random_seed=seed,
+    )
+
+    files = {
+        "configuration.json": {
+            "accession": "TCGA-LUAD+TCGA-LUSC", "seed": seed, "train_frac": train_frac, "test_frac": test_frac,
+            "n_top_variance_genes": n_top_variance_genes,
+        },
+        "predictions/test_predictions.csv": [
+            {"subject_id": sid, "y_true": yt, "y_prob": float(yp)}
+            for sid, yt, yp in zip(test_subjects, test_true, y_prob.tolist())
+        ],
+        "metrics/track_c_real_tcga_vital_status.json": report,
+        "cohort_flow.json": {
+            "total_samples_parsed": dataset.X.shape[0] + len(dataset.excluded_sample_ids),
+            "verified_samples_kept": dataset.X.shape[0],
+            "excluded_sample_ids": dataset.excluded_sample_ids,
+            "excluded_reason_counts": dataset.excluded_reason_counts,
+            "train_subjects": train_subjects, "test_subjects": test_subjects,
+        },
+        "environment.json": env_snapshot,
+        "split_manifest.json": split_manifest,
+    }
+    run_dir = write_evidence_run(
+        output_root, run_id, files,
+        extra_manifest_fields={
+            "dataset_accession": "TCGA-LUAD+TCGA-LUSC", "track": "C", "task": tracks.TASK_CANCER_PREDICTION,
+        },
     )
     return {"status": "complete", "run_dir": str(run_dir), "report": report}
 
@@ -705,6 +853,223 @@ def run_gse123352_repeated_development(
             "No legitimate non-leaking clinical/metadata covariate exists for GSE123352 beyond "
             "expression itself, so no separate clinical/metadata baseline is reported (see "
             "docs/DATA_CARD.md).",
+            f"Frozen internal-test eligibility: {frozen_test_eligibility.get('reason', 'eligible under configured policy')}.",
+        ],
+    }
+
+
+DEFAULT_TCGA_VITAL_STATUS_SEEDS = (1, 2, 3, 4, 5, 6, 7, 8)
+
+
+def _macro_f1_metric_from_prob(y_true, y_prob) -> Optional[float]:
+    """Same convention as _macro_f1_metric — rounds probabilities to a hard
+    label at 0.5 before scoring. Kept separate (not reused for smoke's
+    y_pred, which is already a hard label) purely for naming clarity at
+    call sites that pass probabilities."""
+    return _macro_f1_metric(y_true, y_prob)
+
+
+def run_tcga_lung_vital_status_repeated_development(
+    *, seeds: Optional[Sequence[int]] = None, train_frac: float = 0.70, test_frac: float = 0.30,
+    n_top_variance_genes: int = 2000, _dataset_override: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Repeated grouped development evaluation for the real TCGA-LUAD+
+    TCGA-LUSC vital-status cohort — the same protocol as
+    run_gse123352_repeated_development() (fold-local hyperparameter
+    selection, required baselines on the identical partition, the full
+    per-seed metric bundle, a development-only calibration pathway, and a
+    frozen-internal-test eligibility decision), applied to this repository's
+    first genuinely linked expression<->cancer-outcome cohort. Returns
+    not_evaluable if the real downloaded GDC data is not present locally."""
+    from .uncertainty import (
+        build_development_repeated_oof, build_repeat_record, paired_candidate_comparison,
+        repeated_metric_summary, subject_level_bootstrap_ci,
+    )
+    from data import bulk_pipeline
+    from benchmarks.calibration import build_frozen_policy
+
+    seeds = list(seeds) if seeds is not None else list(DEFAULT_TCGA_VITAL_STATUS_SEEDS)
+
+    if _dataset_override is not None:
+        dataset = _dataset_override
+    else:
+        dataset, missing = _tcga_lung_vital_status_dataset()
+        if dataset is None:
+            return not_evaluable(
+                reason_code="REAL_DATA_NOT_PRESENT",
+                reason=f"missing real downloaded GDC files for {missing}.",
+                required_next_action="Download the real TCGA-LUAD/TCGA-LUSC open-access GDC files before running repeated development.",
+                cohort_id="tcga_lung_vital_status", task="subject_level_cancer_prediction",
+            )
+
+    candidate_repeats, majority_repeats, prevalence_repeats, linear_repeats = [], [], [], []
+    selected_hyperparameters: Dict[int, float] = {}
+    excluded_seeds: list = []
+    full_metric_bundle_by_seed: Dict[str, Any] = {}
+    calibration_by_seed: Dict[str, Any] = {}
+    inner_selection_by_seed: Dict[str, Any] = {}
+
+    for seed in seeds:
+        from data.splitting import subject_train_val_test_split
+        split = subject_train_val_test_split(
+            subject_ids=dataset.subject_ids, labels=list(dataset.y),
+            train_frac=train_frac, val_frac=0.0, test_frac=test_frac, seed=seed,
+        )
+        id_to_row = {sid: i for i, sid in enumerate(dataset.subject_ids)}
+        train_idx = [id_to_row[s] for s in split.train_subjects if s in id_to_row]
+        test_idx = [id_to_row[s] for s in split.test_subjects if s in id_to_row]
+        _assert_no_subject_overlap({"outer_train": split.train_subjects, "outer_test": split.test_subjects})
+        if len(test_idx) == 0 or len(set(dataset.y[train_idx].tolist())) < 2:
+            excluded_seeds.append({
+                "seed": seed,
+                "reason": f"outer split infeasible for this seed (n_test={len(test_idx)}, "
+                          f"train classes={sorted(set(dataset.y[train_idx].tolist()))})",
+            })
+            continue
+
+        selection = _fold_local_selection(dataset, split.train_subjects, seed, n_top_variance_genes)
+        selected_c = selection["selected_c"]
+        selected_hyperparameters[seed] = selected_c
+        inner_selection_by_seed[str(seed)] = {
+            "feasible": selection["feasible"], "reason": selection["reason"],
+            "selected_c": selected_c, "candidate_grid": list(_C_GRID),
+            "n_inner_train": len(selection["inner_train_idx"]), "n_inner_val": len(selection["inner_val_idx"]),
+        }
+
+        fitted = bulk_pipeline.fit_bulk_logistic_regression(
+            dataset.X[train_idx], dataset.y[train_idx], dataset.gene_names,
+            seed=seed, n_top_variance_genes=n_top_variance_genes, C=selected_c,
+        )
+        y_pred, y_prob = bulk_pipeline.apply_bulk_classifier(fitted, dataset.X[test_idx])
+        test_subject_ids = [dataset.subject_ids[i] for i in test_idx]
+        test_y_true = dataset.y[test_idx].tolist()
+
+        candidate_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, y_prob.tolist()))
+        full_metric_bundle_by_seed[str(seed)] = _full_metric_bundle(test_y_true, y_pred.tolist(), y_prob.tolist())
+
+        baseline_preds = _baseline_predictions(dataset, train_idx, test_idx, seed)
+        majority_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, baseline_preds["majority"][1]))
+        prevalence_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, baseline_preds["prevalence"][1]))
+        linear_repeats.append(build_repeat_record(seed, test_subject_ids, test_y_true, baseline_preds["bulk_linear_untuned"][1]))
+
+        if not selection["feasible"]:
+            calibration_by_seed[str(seed)] = {
+                "status": "not_evaluable", "reason": selection["reason"],
+                "calibration_fingerprint": "not_applicable",
+            }
+        else:
+            inner_train_idx, inner_val_idx = selection["inner_train_idx"], selection["inner_val_idx"]
+            calib_source = bulk_pipeline.fit_bulk_logistic_regression(
+                dataset.X[inner_train_idx], dataset.y[inner_train_idx], dataset.gene_names,
+                seed=seed, n_top_variance_genes=n_top_variance_genes, C=selected_c,
+            )
+            _, inner_val_prob = bulk_pipeline.apply_bulk_classifier(calib_source, dataset.X[inner_val_idx])
+            _, outer_test_prob_from_calib_source = bulk_pipeline.apply_bulk_classifier(calib_source, dataset.X[test_idx])
+            policy = build_frozen_policy(
+                dataset.y[inner_val_idx], inner_val_prob, calibration_method="auto", threshold_strategy="youden",
+            )
+            uncalibrated = _full_metric_bundle(
+                test_y_true, (outer_test_prob_from_calib_source >= 0.5).astype(int).tolist(),
+                outer_test_prob_from_calib_source.tolist(),
+            )
+            calibrated = policy.apply_to_test(np.asarray(test_y_true), outer_test_prob_from_calib_source)
+            calibration_by_seed[str(seed)] = {
+                "status": "complete",
+                "calibration_source_model": "fit_on_inner_train_only_not_the_primary_candidate",
+                "calibration_fitting_set_size": len(inner_val_idx),
+                "calibration_method": policy.calibrator.method,
+                "calibration_params": policy.calibrator.to_dict(),
+                "threshold": policy.threshold, "threshold_strategy": policy.threshold_strategy,
+                "threshold_reason": policy.threshold_reason,
+                "uncalibrated_outer_test_metrics": uncalibrated,
+                "calibrated_outer_test_metrics": calibrated,
+            }
+
+    if not candidate_repeats:
+        return not_evaluable(
+            reason_code="INSUFFICIENT_REPEATS", reason="No seed produced a usable development-holdout partition.",
+            required_next_action="Check TCGA-LUAD+TCGA-LUSC subject counts against the configured split fractions.",
+            cohort_id="tcga_lung_vital_status", task="subject_level_cancer_prediction",
+        )
+
+    candidate_oof = build_development_repeated_oof(candidate_repeats, role="development")
+    macro_f1_summary = repeated_metric_summary(candidate_oof, _macro_f1_metric_from_prob)
+    balanced_accuracy_summary = repeated_metric_summary(candidate_oof, _balanced_accuracy_metric)
+    per_seed_macro_f1_ci = {
+        str(r.seed): subject_level_bootstrap_ci(r, _macro_f1_metric_from_prob) for r in candidate_repeats
+    }
+
+    baseline_oofs = {
+        "majority": build_development_repeated_oof(majority_repeats, role="development"),
+        "prevalence": build_development_repeated_oof(prevalence_repeats, role="development"),
+        "bulk_linear_untuned": build_development_repeated_oof(linear_repeats, role="development"),
+    }
+    baseline_comparisons = {}
+    for name, baseline_oof in baseline_oofs.items():
+        comparison = paired_candidate_comparison(candidate_oof, baseline_oof, _macro_f1_metric_from_prob)
+        n_defined_pairs = len(comparison["common_seeds"]) - comparison["n_undefined"]
+        comparison["candidate_name"] = "bulk_logistic_regression_fold_local_c"
+        comparison["baseline_name"] = name
+        comparison["shared_subject_partition"] = (
+            "identical train_idx/test_idx per seed by construction — both fit inside the same "
+            "loop iteration on the same outer split"
+        )
+        comparison["ci"] = None
+        if n_defined_pairs >= 2:
+            defined_diffs = [p["diff"] for p in comparison["per_seed"] if p["diff"] is not None]
+            from benchmarks.metrics import bootstrap_ci
+            comparison["ci"] = bootstrap_ci(defined_diffs)
+            comparison["status"] = "reported"
+        else:
+            comparison["status"] = "insufficient_evidence"
+            comparison["insufficient_evidence_reason"] = (
+                f"only {n_defined_pairs} seed(s) produced a defined paired macro-F1 difference — "
+                "at least 2 are required for a paired confidence interval."
+            )
+        baseline_comparisons[name] = comparison
+
+    unique_subject_count = len(set(dataset.subject_ids))
+    class_counts = {name: int((dataset.y == i).sum()) for i, name in enumerate(dataset.class_names)}
+    frozen_test_eligibility = assess_frozen_internal_test_eligibility(
+        unique_subject_count=unique_subject_count, class_counts=class_counts,
+    )
+
+    return {
+        "status": "complete",
+        "task": "subject_level_cancer_prediction",
+        "dataset_accession": "TCGA-LUAD+TCGA-LUSC",
+        "protocol": "repeated_grouped_development_holdout",
+        "seeds": seeds,
+        "n_requested_seeds": len(seeds),
+        "n_completed_seeds": len(candidate_repeats),
+        "n_excluded_seeds": len(excluded_seeds),
+        "excluded_seeds": excluded_seeds,
+        "independent_development_holdout_subject_count": candidate_oof.independent_subject_count(),
+        "selected_hyperparameters_by_seed": {str(k): v for k, v in selected_hyperparameters.items()},
+        "inner_selection_by_seed": inner_selection_by_seed,
+        "primary_metric": "macro_f1",
+        "macro_f1": macro_f1_summary,
+        "balanced_accuracy": balanced_accuracy_summary,
+        "per_seed_macro_f1_subject_bootstrap_ci": per_seed_macro_f1_ci,
+        "full_metric_bundle_by_seed": full_metric_bundle_by_seed,
+        "baseline_comparisons": baseline_comparisons,
+        "calibration_by_seed": calibration_by_seed,
+        "frozen_internal_test_eligibility": frozen_test_eligibility,
+        "limitations": [
+            "Repeated grouped development-holdout estimate — every held-out subject here is "
+            "still a development-role subject; this is NOT internal-test or external-validation "
+            "evidence, even if the frozen-internal-test eligibility decision below is 'eligible' — "
+            "eligibility means a frozen partition COULD be created, not that one has been.",
+            "vital_status is a binary outcome at last recorded GDC follow-up, not a time-to-event "
+            "survival label — no censoring or follow-up duration is modeled.",
+            "Hyperparameter (C) selection is fold-local per seed, using only that seed's "
+            "outer-train partition — no outer held-out subject ever influenced selection.",
+            "Calibration is evaluated on a model fit only on the inner-train partition, not on the "
+            "primary full-outer-train candidate reported above — no outer-train-disjoint data "
+            "remains to fit and evaluate calibration for the primary candidate without touching "
+            "outer test.",
+            "No legitimate non-leaking clinical/metadata baseline is reported beyond expression "
+            "itself for this development-only bulk pipeline.",
             f"Frozen internal-test eligibility: {frozen_test_eligibility.get('reason', 'eligible under configured policy')}.",
         ],
     }

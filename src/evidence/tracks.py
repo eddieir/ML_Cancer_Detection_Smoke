@@ -747,3 +747,118 @@ def run_track_c_on_fixture(
         "censoring_status": "not_applicable_binary_fixed_horizon",
     }
     return build_report(identity, out_metrics).to_dict()
+
+
+def run_track_c_on_real_tcga_vital_status_data(
+    y_true: Sequence[int], y_prob: Sequence[float], subject_ids: Sequence[str],
+    *, dataset_manifest_fingerprint: str,
+    split_manifest_fingerprint: str,
+    model_fingerprint: str,
+    environment_fingerprint: str,
+    preprocessing_artifact_fingerprint: str,
+    dataset_accession: str = "TCGA-LUAD+TCGA-LUSC",
+    excluded_subject_count: int = 0,
+    excluded_subject_reason: Optional[str] = None,
+    threshold: float = 0.5,
+    random_seed: int = 0,
+) -> dict:
+    """Real-data Track C path for TCGA-LUAD/TCGA-LUSC's genuinely linked
+    subject-level expression<->vital-status outcome (see
+    data/converters.py::convert_tcga_vital_status and
+    data/tcga_outcome_pipeline.py) — the first cohort in this repository
+    with real expression AND a real, independently-recorded, subject-level
+    cancer outcome (not a fabricated linkage; not a bulk sample_type
+    tumor/normal proxy). `subject_ids` here are real GDC `case_id` values.
+
+    Honest scope, stated in every report this produces: `vital_status`
+    ("Dead"/"Alive" at last recorded GDC follow-up) is NOT a time-to-event
+    survival label. No censoring, follow-up duration, or time horizon is
+    modeled — this function never upgrades a binary vital-status label into
+    a survival/time-to-event claim, and never computes a survival metric
+    (C-index, time-dependent AUROC, integrated Brier score) that would
+    require genuinely valid censoring data this pipeline does not have.
+
+    Stamped development_only_flag=True / evidence_level=
+    'development_only_real_data': no frozen internal/external guard has
+    ever been acquired for this cohort/task — see
+    evidence_contract.validate_identity and
+    cohort_registry.Cohort.eligible_for_role. All fingerprint arguments
+    must be real (see evidence/run_identity.py) — none has a
+    descriptive-label fallback; a caller that cannot supply the real value
+    must not call this function.
+    """
+    y_true = [int(v) for v in y_true]
+    y_prob = [float(v) for v in y_prob]
+    subject_ids = [str(s) for s in subject_ids]
+    n_subjects = len(set(subject_ids))
+
+    metrics = cancer_prediction_metrics(y_true, y_prob, threshold=threshold)
+    curve = reliability_curve(np.asarray(y_true, dtype=float), np.asarray(y_prob, dtype=float))
+    class_counts = {"dead": int(sum(1 for v in y_true if v == 1)), "alive": int(sum(1 for v in y_true if v == 0))}
+
+    limitations = [
+        "vital_status ('Dead'/'Alive' at last recorded GDC follow-up) is a binary outcome "
+        "label, NOT a time-to-event survival label — no censoring, follow-up duration, or "
+        "time horizon is modeled; this is not a Cox/survival-analysis result.",
+        "Bulk RNA-seq primary-tumor expression, one sample per real GDC case_id — never "
+        "single-cell, never entered into the single-cell MIL pipeline (data/assay_policy.py).",
+        "development_only_flag=True — no frozen-test guard has ever been acquired for this "
+        "cohort/task.",
+        "Simple L2 logistic regression over train-only top-variance genes — a first honest "
+        "bulk baseline, not a tuned, externally validated, or clinically calibrated model.",
+        "TCGA-LUAD and TCGA-LUSC are combined on their shared gene set for statistical power; "
+        "any histology-specific (adenocarcinoma vs. squamous) difference in signal is not "
+        "separately analyzed here.",
+    ]
+    if excluded_subject_reason:
+        limitations.append(excluded_subject_reason)
+
+    identity = {
+        "task": TASK_CANCER_PREDICTION,
+        "endpoint": "subject_level_vital_status_at_last_follow_up",
+        "endpoint_definition": (
+            "binary vital status (deceased vs. alive) as recorded in the subject's GDC "
+            "demographic record at last follow-up — not a fixed-horizon or time-to-event "
+            "survival outcome; predicted from primary-tumor bulk RNA-seq expression for the "
+            "same real subject (GDC case_id)"
+        ),
+        "prediction_unit": "subject",
+        "biological_specimen_type": "lung_tumor_tissue",
+        "assay_modality": "bulk_rna_seq",
+        "dataset_accession": dataset_accession,
+        "cohort_role": "development",
+        "species": "human",
+        "sample_count": len(y_true),
+        "unique_subject_count": n_subjects,
+        "class_counts": class_counts,
+        "verified_label_count": len(y_true),
+        "unknown_label_count": 0,
+        "excluded_subject_count": excluded_subject_count,
+        "split_role": "development_holdout",
+        "split_manifest_fingerprint": split_manifest_fingerprint,
+        "dataset_manifest_fingerprint": dataset_manifest_fingerprint,
+        "preprocessing_artifact_fingerprint": preprocessing_artifact_fingerprint,
+        "model_fingerprint": model_fingerprint,
+        "random_seed": random_seed,
+        "code_commit_sha": _git_commit_sha(),
+        "environment_fingerprint": environment_fingerprint,
+        "synthetic_flag": False,
+        "development_only_flag": True,
+        "frozen_test_access_status": "not_applicable",
+        "evidence_level": "development_only_real_data",
+        "limitations": limitations,
+        "evaluation_timestamp": utc_now_iso(),
+        "report_schema_version": "1",
+        "threshold_fingerprint": _fp("tcga_vital_status_threshold", threshold),
+    }
+    out_metrics = dict(metrics)
+    out_metrics["calibration_curve"] = curve
+    out_metrics["threshold_method"] = "fixed_default"
+    out_metrics["endpoint_fields"] = {
+        "event_indicator_field": "demographic.vital_status",
+        "time_origin": "not_applicable",
+        "prediction_horizon_years": None,
+        "follow_up_complete": False,
+        "censoring_status": "not_modeled_binary_vital_status_only",
+    }
+    return build_report(identity, out_metrics).to_dict()

@@ -854,6 +854,114 @@ def convert_tcga(project: str, src_dir: Path) -> Optional[Path]:
     return csv_path
 
 
+_TCGA_STAR_STAT_ROWS = {"N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous"}
+
+
+def _read_tcga_star_gene_counts(path: Path, value_col: str = "tpm_unstranded") -> pd.Series:
+    """One GDC 'STAR - Counts' augmented gene-count file (open-access tier —
+    downloaded directly via the GDC /data/{file_id} API, no gdc-client/token
+    needed) -> a gene_id (Ensembl, version-stripped) -> value Series. Drops
+    the four alignment-statistics pseudo-rows GDC includes in the same file
+    (N_unmapped/N_multimapping/N_noFeature/N_ambiguous) — these are QC
+    counters, not genes, and would otherwise silently enter the expression
+    matrix as four bogus "genes" with mostly-empty values."""
+    df = pd.read_csv(path, sep="\t", comment="#", dtype=str, compression=None)
+    df = df[~df["gene_id"].isin(_TCGA_STAR_STAT_ROWS)]
+    df["gene_id"] = df["gene_id"].str.split(".").str[0]
+    return df.set_index("gene_id")[value_col].astype(float)
+
+
+def convert_tcga_vital_status(project: str, src_dir: Path, value_col: str = "tpm_unstranded") -> Optional[Path]:
+    """
+    TCGA-LUAD/TCGA-LUSC primary-tumor gene expression -> genuine subject-level
+    vital-status (deceased vs. alive at last follow-up) outcome CSV, for the
+    real subject-level cancer-outcome-prediction task Issue #16 could not
+    previously produce (no cohort had both compatible expression AND a
+    genuinely linked subject-level outcome). Unlike `convert_tcga`'s
+    tumor/normal `sample_type` malignancy label (a property of which
+    specimen was dissected, known at collection time), vital_status is a
+    real, independently-recorded clinical outcome from GDC's demographic
+    record for the same `case_id` the expression file is filed under — a
+    genuine expression -> outcome subject-level link, not an inferred or
+    fabricated one.
+
+    Reads `src_dir/outcome_meta.csv` (file_id, case_id, submitter_id,
+    vital_status, days_to_death — written by the real GDC case-query results
+    used to build the download manifest) and `src_dir/<file_id>.tsv.gz`
+    (GDC's open-access "STAR - Counts" augmented gene-count file for that
+    case's primary-tumor sample; despite the extension these are plain
+    tab-separated text, not gzip-compressed — GDC serves them that way).
+
+    A case is excluded (never coerced) if: its vital_status is neither
+    'Alive' nor 'Dead'; its expression file is missing; or more than one
+    downloaded file resolves to the same case_id (this simple pipeline, like
+    data/bulk_pipeline.py, requires exactly one sample per subject and does
+    not implement multi-sample aggregation).
+    """
+    out_dir = _mkout()
+    meta_csv = src_dir / "outcome_meta.csv"
+    if not meta_csv.exists():
+        print(f"[convert] {project}  no outcome_meta.csv in {src_dir} — re-download real TCGA vital-status data first.")
+        return None
+
+    meta = pd.read_csv(meta_csv, dtype=str)
+    duplicate_cases = meta["case_id"].value_counts()
+    duplicate_cases = set(duplicate_cases[duplicate_cases > 1].index)
+
+    columns, vital_status, subject_id, excluded, reasons = {}, {}, {}, [], {}
+    for _, row in meta.iterrows():
+        file_id = row["file_id"]
+        case_id = row["case_id"]
+        vs = row["vital_status"]
+        fpath = src_dir / f"{file_id}.tsv.gz"
+        if case_id in duplicate_cases:
+            excluded.append(file_id)
+            reasons["duplicate_case_id"] = reasons.get("duplicate_case_id", 0) + 1
+            continue
+        if vs not in ("Alive", "Dead"):
+            excluded.append(file_id)
+            reasons["vital_status_unknown"] = reasons.get("vital_status_unknown", 0) + 1
+            continue
+        if not fpath.exists():
+            excluded.append(file_id)
+            reasons["file_missing"] = reasons.get("file_missing", 0) + 1
+            continue
+        try:
+            columns[file_id] = _read_tcga_star_gene_counts(fpath, value_col=value_col)
+        except Exception as exc:
+            excluded.append(file_id)
+            reasons["parse_error"] = reasons.get("parse_error", 0) + 1
+            print(f"[convert] {project}  failed to parse {fpath.name}: {exc}")
+            continue
+        vital_status[file_id] = 1.0 if vs == "Dead" else 0.0
+        subject_id[file_id] = case_id
+
+    if not columns:
+        print(f"[convert] {project}  no usable vital-status expression samples found under {src_dir}.")
+        return None
+
+    expr = pd.DataFrame(columns).fillna(0.0)
+    csv_path = out_dir / f"{project}_vital_status.csv"
+    meta_path = out_dir / f"{project}_vital_status_samples_meta.csv"
+    expr.to_csv(csv_path)
+    pd.DataFrame({
+        "sample_id": expr.columns,
+        "subject_id": [subject_id[s] for s in expr.columns],
+        # case_id comes directly from GDC's own case record for this
+        # file — an authoritative, GDC-assigned subject identifier, not an
+        # inference from a title/metadata field the way GSE123352's
+        # subject_id is — so it is always verified when present.
+        "subject_id_verified": True,
+        "vital_status_known": True,
+        "vital_status": [vital_status[s] for s in expr.columns],
+    }).to_csv(meta_path, index=False)
+
+    n_dead = sum(v == 1.0 for v in vital_status.values())
+    print(f"[convert] {project}  {expr.shape[1]} samples x {expr.shape[0]} genes → {csv_path.name}"
+          f"  ({n_dead} dead / {expr.shape[1] - n_dead} alive; excluded {len(excluded)}: {reasons})")
+    return csv_path
+
+
 # ─── NLST outcomes ─────────────────────────────────────────────────────────────
 
 def convert_nlst_outcomes(prsn_csv: Path) -> Path:
