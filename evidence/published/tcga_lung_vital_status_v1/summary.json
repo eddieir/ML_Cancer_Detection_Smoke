@@ -1,0 +1,152 @@
+{
+  "schema_version": "1",
+  "task": "subject_level_cancer_prediction",
+  "endpoint": "subject_level_vital_status_at_last_follow_up",
+  "endpoint_definition": "binary vital status (deceased vs. alive) as recorded in the subject's GDC demographic record at last follow-up \u2014 not a fixed-horizon or time-to-event survival outcome; predicted from primary-tumor bulk RNA-seq expression for the same real subject (GDC case_id)",
+  "prediction_unit": "subject",
+  "biological_specimen_type": "lung_tumor_tissue",
+  "assay_modality": "bulk_rna_seq",
+  "dataset_accession": "TCGA-LUAD+TCGA-LUSC",
+  "cohort_role": "development",
+  "species": "human",
+  "sample_count": 297,
+  "unique_subject_count": 297,
+  "class_counts": {
+    "dead": 117,
+    "alive": 180
+  },
+  "verified_label_count": 297,
+  "unknown_label_count": 0,
+  "excluded_subject_count": 0,
+  "split_role": "development_holdout",
+  "split_manifest_fingerprint": "dc39b7ff2d95c41ed6d32e141a1114c65809c009a7983a66a6c0c66f12369d8d",
+  "dataset_manifest_fingerprint": "347eaf86dd025c2795d1bbb39855f75f4329694a49d724a9a11db08101f0ddb2",
+  "preprocessing_artifact_fingerprint": "07c4e373b171409e2304bdf92a634536455de9dbac74269de172dd432b7f68df",
+  "model_fingerprint": "7f0c9d215e081b4c6c950805bab56dd53a559bbf86f60bfec8bcb75a429b5986",
+  "random_seed": 42,
+  "code_commit_sha": "545dda88e2d3c64a77245012cb7f3bbf97f9a1ee",
+  "environment_fingerprint": "7eb5101638ac52d8bf6908970fa6e62cc6b1310c044d659eb707a4fcc44b6f5f",
+  "synthetic_flag": false,
+  "development_only_flag": true,
+  "frozen_test_access_status": "not_applicable",
+  "evidence_level": "development_only_real_data",
+  "limitations": [
+    "vital_status ('Dead'/'Alive' at last recorded GDC follow-up) is a binary outcome label, NOT a time-to-event survival label \u2014 no censoring, follow-up duration, or time horizon is modeled; this is not a Cox/survival-analysis result.",
+    "Bulk RNA-seq primary-tumor expression, one sample per real GDC case_id \u2014 never single-cell, never entered into the single-cell MIL pipeline (data/assay_policy.py).",
+    "development_only_flag=True \u2014 no frozen-test guard has ever been acquired for this cohort/task.",
+    "Simple L2 logistic regression over train-only top-variance genes \u2014 a first honest bulk baseline, not a tuned, externally validated, or clinically calibrated model.",
+    "TCGA-LUAD and TCGA-LUSC are combined on their shared gene set for statistical power; any histology-specific (adenocarcinoma vs. squamous) difference in signal is not separately analyzed here."
+  ],
+  "evaluation_timestamp": "2026-07-24T09:29:37.516742Z",
+  "report_schema_version": "1",
+  "threshold_fingerprint": "ddc0f662135b364c826881550261a7f1e735775500826e9c9da0be4273589442",
+  "metrics": {
+    "balanced_accuracy": 0.5286324786324786,
+    "calibration_curve": [
+      {
+        "bin_lo": 0.0,
+        "bin_hi": 0.1,
+        "n": 144,
+        "mean_predicted": 0.017601856084831183,
+        "empirical_rate": 0.375
+      },
+      {
+        "bin_lo": 0.1,
+        "bin_hi": 0.2,
+        "n": 16,
+        "mean_predicted": 0.14579340768978,
+        "empirical_rate": 0.4375
+      },
+      {
+        "bin_lo": 0.2,
+        "bin_hi": 0.30000000000000004,
+        "n": 14,
+        "mean_predicted": 0.25894768642527716,
+        "empirical_rate": 0.42857142857142855
+      },
+      {
+        "bin_lo": 0.30000000000000004,
+        "bin_hi": 0.4,
+        "n": 4,
+        "mean_predicted": 0.33585067838430405,
+        "empirical_rate": 0.25
+      },
+      {
+        "bin_lo": 0.4,
+        "bin_hi": 0.5,
+        "n": 10,
+        "mean_predicted": 0.4601343870162964,
+        "empirical_rate": 0.2
+      },
+      {
+        "bin_lo": 0.5,
+        "bin_hi": 0.6000000000000001,
+        "n": 11,
+        "mean_predicted": 0.5509329654953696,
+        "empirical_rate": 0.45454545454545453
+      },
+      {
+        "bin_lo": 0.6000000000000001,
+        "bin_hi": 0.7000000000000001,
+        "n": 12,
+        "mean_predicted": 0.6495588421821594,
+        "empirical_rate": 0.5833333333333334
+      },
+      {
+        "bin_lo": 0.7000000000000001,
+        "bin_hi": 0.8,
+        "n": 11,
+        "mean_predicted": 0.7524452372030779,
+        "empirical_rate": 0.45454545454545453
+      },
+      {
+        "bin_lo": 0.8,
+        "bin_hi": 0.9,
+        "n": 15,
+        "mean_predicted": 0.8709643403689067,
+        "empirical_rate": 0.5333333333333333
+      },
+      {
+        "bin_lo": 0.9,
+        "bin_hi": 1.0,
+        "n": 60,
+        "mean_predicted": 0.9738382210334142,
+        "empirical_rate": 0.36666666666666664
+      }
+    ],
+    "threshold_method": "fixed_default"
+  },
+  "report_content_fingerprint": "9bd06e91f9214f6da9f2465bb195b05de3bc3ade24345f08c5c84a0c2717f686",
+  "source_private_bundle_fingerprint": "754c7ebaee7bb8ea2e1d34b658c794256a1ba18665115f05315953bdb60a8aa1",
+  "run_status": "complete",
+  "split_configuration": {
+    "schema_version": "1",
+    "task": "subject_level_cancer_prediction",
+    "endpoint": "subject_level_vital_status_at_last_follow_up",
+    "dataset_accession": "TCGA-LUAD+TCGA-LUSC",
+    "external_cohort_accession": null,
+    "seed": 42,
+    "train_frac": 0.7,
+    "val_frac": 0.0,
+    "test_frac": 0.3,
+    "stratification_policy": "subject_train_val_test_split (label-stratified subject-level split)",
+    "class_mapping": {
+      "alive": 0,
+      "dead": 1
+    },
+    "rare_class_policy": "not_applicable_binary_cohort",
+    "label_state_policy": "verified_only \u2014 vital_status_known=True required from real GDC demographic record",
+    "weak_label_policy": "not_applicable \u2014 vital_status is a real, independently-recorded GDC outcome field",
+    "subject_identity_field": "subject_id (real GDC case_id \u2014 authoritative, not inferred)",
+    "grouping_policy": "one verified subject (case_id) per row; duplicate case_id rejected upstream",
+    "per_partition_class_counts": {},
+    "dataset_manifest_fingerprint": "347eaf86dd025c2795d1bbb39855f75f4329694a49d724a9a11db08101f0ddb2",
+    "train_subject_ids_count": 697,
+    "validation_subject_ids_count": 0,
+    "development_holdout_subject_ids_count": 297,
+    "internal_test_subject_ids_count": 0,
+    "external_subject_ids_count": 0,
+    "fingerprint": "dc39b7ff2d95c41ed6d32e141a1114c65809c009a7983a66a6c0c66f12369d8d"
+  },
+  "checksum_sha256": "1bc8ffd5ef071ca6dedacbcd3ecb55ecf38addca6d328bd37dcccc6b9aac2dbb"
+}

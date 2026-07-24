@@ -33,18 +33,18 @@ cohorts:
     expression_outcome_linkable_at_subject_level: false
     source_limitations:
       - "Vanderbilt/Habermann interstitial lung disease atlas (COPD/IPF/Control) — real per-donor cells/subject IDs, but no verified per-subject cigarette-exposure field."
-      - "Disease_Identity=COPD is a weak exposure proxy only (smoke_label_method=weak_proxy, confidence=low) — never used as a verified cigarette label."
+      - "Disease_Identity=COPD is a clinical disease diagnosis with strong smoking association but also documented non-smoking causes (alpha-1 antitrypsin deficiency, occupational/environmental exposure, biomass fuel smoke); Disease_Identity=Control does not prove never-smoking. Neither is a verified cigarette-exposure label — see evidence.tracks.run_copd_control_proxy_analysis (task=exploratory_disease_proxy_analysis, never smoke_classification)."
       - "Cannot independently provide verified cancer outcomes."
     licensing_access_limitations: "Public GEO series, no DUA required."
     checksum_rule: "sha256 of each raw_file_names entry under raw_subdir, per src/data/manifest.py."
     task_support:
-      smoke_classification: not_currently   # unknown labels excluded from supervised smoke metrics by default; weak-label experiment is a separate, explicitly enabled, separately reported path
+      smoke_classification: "no"   # no verified smoke label exists for this cohort at all — see exploratory_disease_proxy_analysis for the separate, non-smoke COPD-vs-Control proxy path
       malignancy_classification: "no"
       subject_level_cancer_prediction: "no"
       external_validation: "no"
     role_eligibility: [development]
     notes:
-      - "Unknown smoke labels are excluded from supervised smoke metrics unless an explicitly enabled weak-label experiment is run, and that experiment's results are reported separately and never merged with primary verified-label results."
+      - "This cohort supports no verified smoke_classification evidence. A separate, explicitly non-smoke COPD-vs-Control disease-status proxy sensitivity analysis exists (evidence.tracks.run_copd_control_proxy_analysis, scripts/run_gse136831_copd_control_proxy_analysis.py) — its task is exploratory_disease_proxy_analysis, its verified_label_count is always 0, and it can never be merged with or promoted into verified-label smoke evidence."
 
   - cohort_id: gse288003
     accession: GSE288003
@@ -212,6 +212,42 @@ cohorts:
     role_eligibility: [excluded]
     notes:
       - "Never treated as single-cell data; never enters per-cell malignancy training."
+
+  - cohort_id: tcga_lung_vital_status
+    accession: "TCGA-LUAD+TCGA-LUSC"
+    dataset_id: tcga_lung_vital_status
+    version_or_retrieval_date: "GDC open API, downloaded directly (open-access tier, no DUA)"
+    access_level: public
+    species: human
+    assay_type: bulk_rna_seq
+    single_cell_or_bulk: bulk
+    biological_tissue: lung_tumor
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    verified_smoke_label_fields: []
+    weak_smoke_label_fields: []
+    malignancy_label_fields: []
+    cancer_outcome_fields: [vital_status, days_to_death]
+    outcome_time_horizon: null
+    censoring_fields: []
+    expression_outcome_linkable_at_subject_level: true
+    source_limitations:
+      - "vital_status is a binary outcome at last recorded GDC follow-up, not a time-to-event survival label — no censoring or follow-up duration is modeled."
+      - "Combines TCGA-LUAD and TCGA-LUSC primary-tumor samples on their shared gene set for statistical power; not a single-histology result."
+      - "Does not carry verified smoke type; never enters smoke-classification evidence."
+      - "Bulk RNA-seq, one sample per real GDC case_id — never single-cell, never enters the single-cell MIL pipeline."
+    licensing_access_limitations: "Public open GDC access (STAR - Counts gene expression + demographic vital_status are both open-access tier), no DUA required."
+    checksum_rule: "sha256 of the converted per-project genes-x-samples CSVs; see data/converters.py::convert_tcga_vital_status."
+    task_support:
+      smoke_classification: "no"
+      malignancy_classification: not_currently
+      subject_level_cancer_prediction: "yes"
+      external_validation: "no"
+    role_eligibility: [development]
+    notes:
+      - "The first cohort in this repository with genuinely linked, subject-level expression<->cancer-outcome data — see evidence.tracks.run_track_c_on_real_tcga_vital_status_data."
+      - "Distinct from tcga_luad/tcga_lusc, which describe the raw per-project GDC data and remain excluded/not-currently-supported for their originally-scoped tumor/normal malignancy task."
 
   - cohort_id: nlst
     accession: NLST

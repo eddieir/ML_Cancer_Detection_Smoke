@@ -1,0 +1,117 @@
+{
+  "schema_version": "1",
+  "task": "exploratory_disease_proxy_analysis",
+  "endpoint": "copd_vs_control_disease_status",
+  "endpoint_definition": "COPD clinical diagnosis vs Control disease status, one label per subject, IPF subjects excluded \u2014 a disease-status proxy sensitivity analysis, NOT a smoke-exposure endpoint. See this function's docstring.",
+  "prediction_unit": "subject",
+  "biological_specimen_type": "lung_tissue",
+  "assay_modality": "single_cell_rna_seq",
+  "dataset_accession": "GSE136831",
+  "cohort_role": "development",
+  "species": "human",
+  "sample_count": 1800,
+  "unique_subject_count": 6,
+  "class_counts": {
+    "control_proxy": 4,
+    "copd_proxy": 2
+  },
+  "verified_label_count": 0,
+  "unknown_label_count": 0,
+  "excluded_subject_count": 32,
+  "split_role": "development_holdout",
+  "split_manifest_fingerprint": "476847312f7103a436e21f7c48b48d65cac57d7afede6b143a1503134b5aca0d",
+  "dataset_manifest_fingerprint": "933dc31e639bdf91f0d173d89fa4fde5b428eb93e6a53460c96842a97395ecef",
+  "preprocessing_artifact_fingerprint": "e2718fc3e9094828873a0fbc4d809a02655a890c8421d346e2670fa0c2f115b6",
+  "model_fingerprint": "4ddc9654f050b2aa3a05577b08a53c712f51695161c33099686124705dc1b007",
+  "random_seed": 42,
+  "code_commit_sha": "94a78450d22cc92dcda2e379b1f95c11170bf6e8",
+  "environment_fingerprint": "1d6a369ec2cfbf53b53cd2b0cee2edf1fb9c0ab27ede2b1b2319f219f206c150",
+  "synthetic_flag": false,
+  "development_only_flag": true,
+  "frozen_test_access_status": "not_applicable",
+  "evidence_level": "development_only_real_data",
+  "limitations": [
+    "This is an exploratory COPD-vs-Control DISEASE-STATUS proxy analysis, not verified smoke-exposure classification. COPD is a clinical diagnosis with strong smoking association but also documented non-smoking causes (alpha-1 antitrypsin deficiency, occupational/environmental exposure, biomass fuel smoke); Control does not prove never-smoking. A high score here may reflect COPD disease-state expression biology rather than smoke-exposure biology. verified_label_count=0. This result must never be merged with, aggregated into, or used to select among verified-label smoke classification results \u2014 its task (exploratory_disease_proxy_analysis) is structurally distinct from smoke_classification and cannot satisfy smoke-evidence eligibility or any clinical-readiness dimension.",
+    "GSE136831 (Vanderbilt/Habermann IPF/COPD/Control atlas). IPF subjects are excluded entirely (IPF is not a smoking-exposure-relevant comparator for this analysis).",
+    "One vote per subject via cell-level majority vote; abstention/coverage is secondary only.",
+    "development_only_flag=True \u2014 gse136831's role_eligibility is [development] only and no frozen-test guard has ever been acquired for this cohort/task.",
+    "classes ['control_proxy', 'copd_proxy'] are below the subject-support threshold (5) \u2014 no strong learnability claim is made for them.",
+    "32 IPF subject(s) excluded \u2014 not a smoking-relevant comparator.",
+    "Cells were subsampled from 165,759 to 13,424 (cap=300 cells/subject, seed=42) before preprocessing, purely because this environment's available memory (16GB) cannot hold the full dense HVG-selection matrix; subject-level labels and the held-out subject split are exact and unaffected \u2014 only the per-cell training/evaluation sample size was reduced."
+  ],
+  "evaluation_timestamp": "2026-07-23T10:02:01.633730Z",
+  "report_schema_version": "1",
+  "metrics": {
+    "primary_metric": "macro_f1",
+    "macro_f1": 1.0,
+    "weighted_f1": 1.0,
+    "balanced_accuracy": 1.0,
+    "per_class": {
+      "0": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 4
+      },
+      "1": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 2
+      }
+    },
+    "confusion_matrix": [
+      [
+        4,
+        0
+      ],
+      [
+        0,
+        2
+      ]
+    ],
+    "accuracy": 1.0,
+    "effective_label_mapping": {
+      "0": "control_proxy",
+      "1": "copd_proxy"
+    },
+    "weak_label_experiment": true,
+    "classes_below_support_threshold": [
+      "control_proxy",
+      "copd_proxy"
+    ]
+  },
+  "report_content_fingerprint": "7ef454820205d4386fc5899cdfb5f531bd910aea9a31c74b449fd53f147f0e2e",
+  "source_private_bundle_fingerprint": "1edd7d8aae2caeb15f49203c6635abc3e4643f6924245f843e1ae21390ee898e",
+  "run_status": "complete",
+  "split_configuration": {
+    "schema_version": "1",
+    "task": "exploratory_disease_proxy_analysis",
+    "endpoint": "copd_vs_control_disease_status",
+    "dataset_accession": "GSE136831",
+    "external_cohort_accession": null,
+    "seed": 42,
+    "train_frac": 0.7,
+    "val_frac": 0.15,
+    "test_frac": 0.15,
+    "stratification_policy": "subject_train_val_test_split (label-stratified subject-level split)",
+    "class_mapping": {
+      "control_proxy": 0,
+      "copd_proxy": 1
+    },
+    "rare_class_policy": "not_applicable_binary_proxy_analysis",
+    "label_state_policy": "weak_disease_status_proxy \u2014 never a verified smoke-exposure label",
+    "weak_label_policy": "Disease_Identity=COPD/Control used as a disease-status proxy comparator only",
+    "subject_identity_field": "subject_id (donor_id)",
+    "grouping_policy": "all cells from one subject stay in one partition",
+    "per_partition_class_counts": {},
+    "dataset_manifest_fingerprint": "933dc31e639bdf91f0d173d89fa4fde5b428eb93e6a53460c96842a97395ecef",
+    "train_subject_ids_count": 33,
+    "validation_subject_ids_count": 7,
+    "development_holdout_subject_ids_count": 6,
+    "internal_test_subject_ids_count": 0,
+    "external_subject_ids_count": 0,
+    "fingerprint": "476847312f7103a436e21f7c48b48d65cac57d7afede6b143a1503134b5aca0d"
+  },
+  "checksum_sha256": "d4d9c6f413ae2a45cf83ebce110bd6b7a685c02d5050b6bd988dbae42ea4f51d"
+}

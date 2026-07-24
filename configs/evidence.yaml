@@ -133,6 +133,31 @@ uncertainty_policy:
 subgroup_policy:
   min_subjects_per_subgroup: 10
 
+# Predeclared seeds for repeated grouped development evaluation (Issue #16
+# blocker 6 — evidence/development.py::run_gse123352_repeated_development).
+# Fixed and committed here rather than chosen ad hoc at run time, so a
+# repeated-development result cannot be seed-shopped after seeing outcomes.
+development_repeat_seeds:
+  gse123352_smoke_classification: [1, 2, 3, 4, 5, 6, 7, 8]
+
+# Step 3.7 — deterministic frozen internal-test eligibility policy enforced
+# by src/evidence/development.py::assess_frozen_internal_test_eligibility.
+# min_total_subjects=300 / min_per_class_subjects=50 are a conservative,
+# explicitly-declared rule of thumb: a genuine 3-way split (train/
+# development-holdout/frozen-internal-test) needs enough subjects left in
+# EACH partition, per class, for a macro-F1 estimate to mean anything —
+# not just enough total subjects to survive being cut into three pieces.
+# GSE123352 (176 verified subjects, 58 in its minority class) fails both
+# minimums today; carving a third partition out of a cohort this small
+# would shrink an already-narrow development pool for a frozen-test
+# partition too small to trust, which this policy declines to do.
+frozen_internal_test_policy:
+  min_total_subjects: 300
+  min_per_class_subjects: 50
+  train_frac: 0.60
+  development_holdout_frac: 0.20
+  internal_test_frac: 0.20
+
 notes:
   - "not_evaluable is the only sanctioned representation of missing evidence — never 0, false, an empty metric dict, NaN without explanation, or a warning attached to a fabricated result."
   - "development_only_flag=true reports can never claim internal_held_out_real_data or stronger."

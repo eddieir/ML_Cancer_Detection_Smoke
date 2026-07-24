@@ -20,12 +20,19 @@ Design rules enforced by this module (never bypassed by any flag):
     dimension records — defaulting every dimension to "not_started" when,
     as in this repository today, no real dimension evidence has been
     assembled. It never fabricates a "complete" dimension.
-  - `development` / `internal-test` / `external-test` are honest stubs:
-    the leakage-safe candidate-comparison pipeline integration (Steps
-    8-10) does not exist as a callable pipeline in this repository yet, so
-    these subcommands return a structured not_evaluable(reason_code=
-    'TRACK_RUNNER_NOT_YET_INTEGRATED') rather than pretending to run
-    something that isn't there.
+  - `development` is real orchestration (evidence/development.py::
+    run_development) for cohort/task combinations that have a genuine
+    dataset-specific pipeline wired up (today: gse123352/
+    smoke_classification, via data/bulk_pipeline.py). Any other cohort/task
+    combination returns a structured not_evaluable naming the specific
+    reason (no eligible cohort, or no pipeline wired up yet).
+  - `internal-test` / `external-test` are honest gates
+    (evidence/development.py::run_internal_test / run_external_test): no
+    cohort in configs/cohorts.yaml has ever had a frozen internal-test
+    partition created and guarded, and none carries
+    role_eligibility=[external_validation], so both subcommands always
+    return a structured, specifically-reasoned not_evaluable rather than a
+    generic stub or a fabricated result.
   - `--diagnostic-mode` is accepted only by `audit` (where it is a no-op —
     audit.py has no diagnostic path at all) and is REJECTED with a typed
     EvidenceRunnerUsageError on every other subcommand. This mirrors how
@@ -53,10 +60,10 @@ from .errors import ArtifactValidationError, EvidenceRunnerUsageError  # noqa: E
 from .evidence_contract import not_evaluable  # noqa: E402
 
 DEFAULT_DIMENSION_CONFIG = "configs/clinical_readiness.yaml"
+DEFAULT_COHORT_CONFIG = "configs/cohorts.yaml"
 REAL_SUBCOMMANDS = (
     "clinical-readiness", "inspect", "validate", "development", "internal-test", "external-test",
 )
-TRACK_STUB_SUBCOMMANDS = ("development", "internal-test", "external-test")
 
 
 def _git_commit_sha() -> str:
@@ -174,31 +181,43 @@ def cmd_clinical_readiness(args: argparse.Namespace) -> int:
     return 0
 
 
-# ─── development / internal-test / external-test — honest stubs ───────────
+# ─── development — real orchestration for wired-up cohort/task pairs ──────
 
-def cmd_track_stub(args: argparse.Namespace, subcommand: str) -> int:
-    _reject_diagnostic_mode(args, subcommand)
-    if getattr(args, "run_dir", None) is not None:
-        raise EvidenceRunnerUsageError(
-            f"--run-dir is not a supported flag for the {subcommand!r} subcommand — it does not "
-            "read or write any run directory; it only reports that the underlying pipeline "
-            "integration does not exist yet."
-        )
-    result = not_evaluable(
-        reason_code="TRACK_RUNNER_NOT_YET_INTEGRATED",
-        reason=(
-            f"evidence.runner {subcommand!r} has no callable leakage-safe candidate-comparison "
-            "pipeline to invoke in this repository yet — the Steps 8-10 pipeline integration is "
-            "being built in a separate round."
-        ),
-        required_next_action=(
-            "Re-run this subcommand once the development/internal-test/external-test pipeline "
-            "integration (Steps 8-10) lands in this repository."
-        ),
-        subcommand=subcommand,
+def cmd_development(args: argparse.Namespace) -> int:
+    _reject_diagnostic_mode(args, "development")
+    from .cohort_registry import load_cohort_registry
+    from .development import run_development
+    from .evidence_contract import is_not_evaluable
+
+    cohorts = load_cohort_registry(args.cohort_config)
+    result = run_development(
+        args.cohort, args.task, cohorts=cohorts, output_root=args.output_root,
+        run_id=args.run_id, seed=args.seed, train_frac=args.train_frac,
+        test_frac=args.test_frac, n_top_variance_genes=args.n_top_variance_genes,
     )
     _print(result)
-    return 0
+    return 1 if is_not_evaluable(result) else 0
+
+
+# ─── internal-test / external-test — honest gates, not stubs ──────────────
+
+def cmd_internal_test(args: argparse.Namespace) -> int:
+    _reject_diagnostic_mode(args, "internal-test")
+    from .development import run_internal_test
+    from .evidence_contract import is_not_evaluable
+    result = run_internal_test(
+        args.run_dir, args.authorization_file, cohort_id=args.cohort, task=args.task,
+    )
+    _print(result)
+    return 1 if is_not_evaluable(result) else 0
+
+
+def cmd_external_test(args: argparse.Namespace) -> int:
+    _reject_diagnostic_mode(args, "external-test")
+    from .development import run_external_test
+    result = run_external_test(args.run_dir, args.external_cohort)
+    _print(result)
+    return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -231,11 +250,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_cr.add_argument("--diagnostic-mode", action="store_true")
     p_cr.set_defaults(func=cmd_clinical_readiness)
 
-    for name in TRACK_STUB_SUBCOMMANDS:
-        p = sub.add_parser(name, help=f"Stub — {name} pipeline integration is not wired up yet.")
-        p.add_argument("--run-dir", default=None)
-        p.add_argument("--diagnostic-mode", action="store_true")
-        p.set_defaults(func=lambda args, _name=name: cmd_track_stub(args, _name))
+    p_dev = sub.add_parser("development", help="Real development orchestration for wired-up cohort/task pairs.")
+    p_dev.add_argument("--cohort", required=True)
+    p_dev.add_argument("--task", required=True)
+    p_dev.add_argument("--config", default="configs/default.yaml")
+    p_dev.add_argument("--evidence-config", default="configs/evidence.yaml")
+    p_dev.add_argument("--cohort-config", default=DEFAULT_COHORT_CONFIG)
+    p_dev.add_argument("--output-root", default="artifacts/evidence")
+    p_dev.add_argument("--run-id", default=None)
+    p_dev.add_argument("--seed", type=int, default=42)
+    p_dev.add_argument("--train-frac", type=float, default=0.70)
+    p_dev.add_argument("--test-frac", type=float, default=0.30)
+    p_dev.add_argument("--n-top-variance-genes", type=int, default=2000)
+    p_dev.add_argument("--diagnostic-mode", action="store_true")
+    p_dev.set_defaults(func=cmd_development)
+
+    p_internal = sub.add_parser("internal-test", help="Frozen internal-test gate (currently always blocked — see module docstring).")
+    p_internal.add_argument("--run-dir", required=True)
+    p_internal.add_argument("--authorization-file", default=None)
+    p_internal.add_argument("--cohort", default=None, help="If given with --task, reports the real computed frozen-test eligibility decision for this cohort/task instead of the generic gate.")
+    p_internal.add_argument("--task", default=None)
+    p_internal.add_argument("--diagnostic-mode", action="store_true")
+    p_internal.set_defaults(func=cmd_internal_test)
+
+    p_external = sub.add_parser("external-test", help="External-validation gate (currently always blocked — see module docstring).")
+    p_external.add_argument("--run-dir", required=True)
+    p_external.add_argument("--external-cohort", default=None)
+    p_external.add_argument("--diagnostic-mode", action="store_true")
+    p_external.set_defaults(func=cmd_external_test)
 
     return parser
 

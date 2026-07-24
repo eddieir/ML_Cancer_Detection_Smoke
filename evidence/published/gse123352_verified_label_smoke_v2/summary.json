@@ -1,0 +1,110 @@
+{
+  "schema_version": "1",
+  "task": "smoke_classification",
+  "endpoint": "subject_level_smoke_class_verified_bulk",
+  "endpoint_definition": "verified lifetime ever-versus-never cigarette-smoking history, one label per subject \u2014 the source phenotype (ever_never_smoker) records whether a subject has ever smoked cigarettes, not current exposure at the time of sampling; an 'ever'/'cigarette' label may include former smokers and does not imply active exposure at sampling",
+  "prediction_unit": "subject",
+  "biological_specimen_type": "airway_epithelium",
+  "assay_modality": "bulk_microarray",
+  "dataset_accession": "GSE123352",
+  "cohort_role": "development",
+  "species": "human",
+  "sample_count": 50,
+  "unique_subject_count": 50,
+  "class_counts": {
+    "unexposed": 16,
+    "cigarette": 34
+  },
+  "verified_label_count": 50,
+  "unknown_label_count": 0,
+  "excluded_subject_count": 0,
+  "split_role": "development_holdout",
+  "split_manifest_fingerprint": "a18e2ecb3b55bcb3045c9636c526c440a8e0e793683218c39dcdda5cf782dec3",
+  "dataset_manifest_fingerprint": "98d2c10b690fd3ff84262dacea056126c41ad4db7a7826a0ee3e347e4da39f9f",
+  "preprocessing_artifact_fingerprint": "6acade252ac0e38d518f09899cf8ea05958ced4e74d193533a93e50e40aee31a",
+  "model_fingerprint": "a581c773597f7802cd7b76df600d8e6abd21e114594f45ff5b8f8f713e8ffcbb",
+  "random_seed": 42,
+  "code_commit_sha": "c28eeee166ae98b3198ede46bcfc426bdd62a4f7",
+  "environment_fingerprint": "8155b48f9f8e49f2fbbcf79fec276ffde18e8e1d959217b3b7de8a36cc83198a",
+  "synthetic_flag": false,
+  "development_only_flag": true,
+  "frozen_test_access_status": "not_applicable",
+  "evidence_level": "development_only_real_data",
+  "limitations": [
+    "GSE123352 is bulk/pseudo-bulk microarray data (one sample per subject) \u2014 never single-cell, never entered into the single-cell MIL pipeline (see data/assay_policy.py and data/bulk_pipeline.py's module docstring).",
+    "development_only_flag=True \u2014 gse123352's role_eligibility is [development] only and no frozen-test guard has ever been acquired for this cohort/task.",
+    "Simple L2 logistic regression over train-only top-variance genes \u2014 a first honest bulk baseline, not a tuned or externally validated model."
+  ],
+  "evaluation_timestamp": "2026-07-23T12:16:31.893315Z",
+  "report_schema_version": "1",
+  "metrics": {
+    "primary_metric": "macro_f1",
+    "macro_f1": 0.6532027743778049,
+    "weighted_f1": 0.6706813545491636,
+    "balanced_accuracy": 0.7003676470588236,
+    "per_class": {
+      "0": {
+        "precision": 0.48148148148148145,
+        "recall": 0.8125,
+        "f1": 0.6046511627906976,
+        "support": 16
+      },
+      "1": {
+        "precision": 0.8695652173913043,
+        "recall": 0.5882352941176471,
+        "f1": 0.7017543859649122,
+        "support": 34
+      }
+    },
+    "confusion_matrix": [
+      [
+        13,
+        3
+      ],
+      [
+        14,
+        20
+      ]
+    ],
+    "accuracy": 0.66,
+    "effective_label_mapping": {
+      "0": "unexposed",
+      "1": "cigarette"
+    },
+    "weak_label_experiment": false,
+    "classes_below_support_threshold": []
+  },
+  "report_content_fingerprint": "3044a328e9ec67c05761463ace42eb0d56e9c7a428e73c399680fc740afd4d87",
+  "source_private_bundle_fingerprint": "644f2a305f2497c0340a82f42ab0fb0a6363b59573d04ae34ffd6019577fae62",
+  "run_status": "complete",
+  "split_configuration": {
+    "schema_version": "1",
+    "task": "smoke_classification",
+    "endpoint": "subject_level_smoke_class_verified_bulk",
+    "dataset_accession": "GSE123352",
+    "external_cohort_accession": null,
+    "seed": 42,
+    "train_frac": 0.7,
+    "val_frac": 0.0,
+    "test_frac": 0.3,
+    "stratification_policy": "subject_train_val_test_split (label-stratified subject-level split)",
+    "class_mapping": {
+      "cigarette": 1,
+      "unexposed": 0
+    },
+    "rare_class_policy": "not_applicable_binary_verified_cohort",
+    "label_state_policy": "verified_only \u2014 smoke_type_known=True required, strict boolean parsing",
+    "weak_label_policy": "not_applicable \u2014 GSE123352 carries a verified ever_never_smoker label",
+    "subject_identity_field": "subject_id (verified via GEO Sample_title patient_<N> parsing)",
+    "grouping_policy": "one verified subject per row; duplicate subject_id rejected upstream",
+    "per_partition_class_counts": {},
+    "dataset_manifest_fingerprint": "98d2c10b690fd3ff84262dacea056126c41ad4db7a7826a0ee3e347e4da39f9f",
+    "train_subject_ids_count": 124,
+    "validation_subject_ids_count": 0,
+    "development_holdout_subject_ids_count": 50,
+    "internal_test_subject_ids_count": 0,
+    "external_subject_ids_count": 0,
+    "fingerprint": "a18e2ecb3b55bcb3045c9636c526c440a8e0e793683218c39dcdda5cf782dec3"
+  },
+  "checksum_sha256": "369dc0b91881cc67c69d24447684deb02f6f2db8bbcdfb84e10530d034e99c5a"
+}

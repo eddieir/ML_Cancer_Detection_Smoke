@@ -183,6 +183,32 @@ datasets:
     known_limitations:
       - "Same TCGA bulk/smoking limitations as TCGA-LUAD above."
 
+  - dataset_id: tcga_lung_vital_status
+    accession: "TCGA-LUAD+TCGA-LUSC"
+    raw_subdir: "malignancy/TCGA-LUAD,malignancy/TCGA-LUSC"
+    source_url: https://api.gdc.cancer.gov/
+    official_record_url: https://portal.gdc.cancer.gov/
+    publication_reference: "TCGA Research Network — LUAD/LUSC combined vital-status outcome"
+    species: human
+    genome_build: GRCh38
+    gene_identifier_type: ensembl_gene_id
+    assay_type: bulk_rna_seq
+    matrix_representation: bulk_samples_x_genes
+    subject_identifier_field: case_id
+    sample_identifier_field: file_id
+    cell_identifier_field: null
+    smoke_metadata_fields: []
+    cancer_metadata_fields: [vital_status, days_to_death]
+    malignancy_metadata_fields: []
+    label_policy_version: "1"
+    license_or_access_level: public_open_gdc
+    controlled_access: false
+    synthetic_or_real: real
+    raw_file_names: []
+    known_limitations:
+      - "vital_status is a binary outcome at last recorded GDC follow-up, not a time-to-event survival label."
+      - "Combines TCGA-LUAD and TCGA-LUSC on their shared gene set; not a single-histology result."
+
   - dataset_id: nlst
     accession: NLST
     raw_subdir: subjects/NLST

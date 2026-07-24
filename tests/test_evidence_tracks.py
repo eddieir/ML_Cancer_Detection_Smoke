@@ -13,6 +13,17 @@ from evidence.evidence_contract import is_not_evaluable, validate_report, report
 from evidence import tracks
 
 COHORTS_YAML = Path(__file__).parents[1] / "configs" / "cohorts.yaml"
+FAKE_FP = "b" * 64
+FAKE_FP2 = "c" * 64
+
+
+def _real_identity_kwargs():
+    return dict(
+        split_manifest_fingerprint=FAKE_FP,
+        model_fingerprint=FAKE_FP,
+        environment_fingerprint=FAKE_FP,
+        preprocessing_artifact_fingerprint=FAKE_FP,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -52,9 +63,15 @@ def test_track_b_against_registry_is_not_evaluable(cohorts):
 
 
 def test_track_c_against_registry_is_not_evaluable(cohorts):
+    # tcga_lung_vital_status is now a real, structurally eligible cohort
+    # (see configs/cohorts.yaml) — this registry-consulting path never opens
+    # a dataset file itself (see evidence.development.run_development for
+    # the real orchestration), so it still returns not_evaluable, but for a
+    # different, still-honest reason than "no eligible cohort exists".
     result = tracks.run_track_c_against_registry(cohorts)
     assert is_not_evaluable(result)
-    assert result["reason_code"] == "NO_ELIGIBLE_EXPRESSION_OUTCOME_LINKAGE"
+    assert result["reason_code"] == "REAL_FITTING_NOT_IMPLEMENTED"
+    assert "tcga_lung_vital_status" in result["candidate_cohorts"]
     assert result["task"] == tracks.TASK_CANCER_PREDICTION
 
 
@@ -155,8 +172,9 @@ def test_track_a_real_weak_label_data_is_stamped_correctly(tmp_path):
     y_true = [0, 1, 1, 0, 0, 1]
     y_pred = [0, 1, 0, 0, 0, 1]
     subject_ids = [f"donor{i}" for i in range(6)]
-    out = tracks.run_track_a_on_real_weak_label_data(
+    out = tracks.run_copd_control_proxy_analysis(
         y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[raw_file],
+        **_real_identity_kwargs(),
     )
     validate_report(report_from_dict(out))
     assert out["identity"]["synthetic_flag"] is False
@@ -164,18 +182,30 @@ def test_track_a_real_weak_label_data_is_stamped_correctly(tmp_path):
     assert out["identity"]["evidence_level"] == "development_only_real_data"
     assert out["identity"]["dataset_accession"] == "GSE136831"
     assert out["identity"]["verified_label_count"] == 0
+    assert out["identity"]["task"] == tracks.TASK_PROXY_ANALYSIS
+    assert out["identity"]["task"] != tracks.TASK_SMOKE
+    assert out["identity"]["split_role"] == "development_holdout"
     assert out["metrics"]["weak_label_experiment"] is True
-    assert any("weak_label_experiment=True" in lim for lim in out["identity"]["limitations"])
+    assert any("proxy analysis" in lim for lim in out["identity"]["limitations"])
     # real sha256 fingerprint of the actual file content, not a placeholder
     assert len(out["identity"]["dataset_manifest_fingerprint"]) == 64
 
 
-def test_track_a_real_weak_label_data_missing_raw_file_raises(tmp_path):
+def test_copd_control_proxy_analysis_missing_raw_file_raises(tmp_path):
     missing = tmp_path / "does_not_exist.txt"
     with pytest.raises(FileNotFoundError):
-        tracks.run_track_a_on_real_weak_label_data(
+        tracks.run_copd_control_proxy_analysis(
             [0, 1], [0, 1], ["a", "b"], num_classes=2, raw_file_paths=[missing],
+            **_real_identity_kwargs(),
         )
+
+
+def test_copd_control_proxy_analysis_cannot_be_selected_as_smoke_evidence(cohorts):
+    # the proxy analysis's task is not TASK_SMOKE, so it can never appear
+    # among cohorts eligible for the verified smoke_classification task —
+    # there is no caller flag that promotes it.
+    eligible = tracks.eligible_cohorts_for_track(cohorts, tracks.TASK_PROXY_ANALYSIS, "development")
+    assert eligible == []
 
 
 def test_track_a_real_verified_label_data_is_stamped_correctly(tmp_path):
@@ -185,6 +215,7 @@ def test_track_a_real_verified_label_data_is_stamped_correctly(tmp_path):
     subject_ids = [f"GSM{i}" for i in range(6)]
     out = tracks.run_track_a_on_real_verified_label_data(
         y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[raw_file],
+        **_real_identity_kwargs(),
     )
     validate_report(report_from_dict(out))
     assert out["identity"]["synthetic_flag"] is False
@@ -194,6 +225,8 @@ def test_track_a_real_verified_label_data_is_stamped_correctly(tmp_path):
     assert out["identity"]["verified_label_count"] == len(y_true)
     assert out["metrics"]["weak_label_experiment"] is False
     assert out["identity"]["assay_modality"] == "bulk_microarray"
+    assert out["identity"]["split_role"] == "development_holdout"
+    assert "lifetime ever-versus-never" in out["identity"]["endpoint_definition"]
 
 
 def test_track_a_real_data_fingerprint_changes_with_file_content(tmp_path):
@@ -202,8 +235,61 @@ def test_track_a_real_data_fingerprint_changes_with_file_content(tmp_path):
     y_true, y_pred, subject_ids = [0, 1], [0, 1], ["s0", "s1"]
     out_a = tracks.run_track_a_on_real_verified_label_data(
         y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[file_a],
+        **_real_identity_kwargs(),
     )
     out_b = tracks.run_track_a_on_real_verified_label_data(
         y_true, y_pred, subject_ids, num_classes=2, raw_file_paths=[file_b],
+        **_real_identity_kwargs(),
     )
     assert out_a["identity"]["dataset_manifest_fingerprint"] != out_b["identity"]["dataset_manifest_fingerprint"]
+
+
+def test_track_a_real_verified_label_data_requires_real_fingerprints(tmp_path):
+    raw_file = _tiny_real_file(tmp_path, name="series_matrix_fixture.txt")
+    with pytest.raises(TypeError):
+        tracks.run_track_a_on_real_verified_label_data(
+            [0, 1], [0, 1], ["s0", "s1"], num_classes=2, raw_file_paths=[raw_file],
+        )
+
+
+# ─── Track C — real TCGA vital-status cancer-outcome prediction ───────────
+
+def _real_tcga_identity_kwargs():
+    return dict(
+        dataset_manifest_fingerprint=FAKE_FP, split_manifest_fingerprint=FAKE_FP,
+        model_fingerprint=FAKE_FP, environment_fingerprint=FAKE_FP,
+        preprocessing_artifact_fingerprint=FAKE_FP,
+    )
+
+
+def test_track_c_real_tcga_vital_status_is_stamped_correctly():
+    y_true = [0, 1, 1, 0, 1, 0]
+    y_prob = [0.2, 0.9, 0.6, 0.1, 0.8, 0.3]
+    subject_ids = [f"case{i}" for i in range(6)]
+    out = tracks.run_track_c_on_real_tcga_vital_status_data(
+        y_true, y_prob, subject_ids, **_real_tcga_identity_kwargs(),
+    )
+    validate_report(report_from_dict(out))
+    assert out["identity"]["synthetic_flag"] is False
+    assert out["identity"]["development_only_flag"] is True
+    assert out["identity"]["evidence_level"] == "development_only_real_data"
+    assert out["identity"]["task"] == tracks.TASK_CANCER_PREDICTION
+    assert out["identity"]["dataset_accession"] == "TCGA-LUAD+TCGA-LUSC"
+    assert out["metrics"]["endpoint_fields"]["censoring_status"] == "not_modeled_binary_vital_status_only"
+    assert any("time-to-event" in lim for lim in out["identity"]["limitations"])
+
+
+def test_track_c_real_tcga_vital_status_requires_real_fingerprints():
+    with pytest.raises(TypeError):
+        tracks.run_track_c_on_real_tcga_vital_status_data([0, 1], [0.1, 0.9], ["s0", "s1"])
+
+
+def test_track_c_real_tcga_never_claims_survival_semantics():
+    y_true = [0, 1, 1, 0]
+    y_prob = [0.2, 0.9, 0.6, 0.1]
+    subject_ids = ["case0", "case1", "case2", "case3"]
+    out = tracks.run_track_c_on_real_tcga_vital_status_data(
+        y_true, y_prob, subject_ids, **_real_tcga_identity_kwargs(),
+    )
+    assert out["metrics"]["endpoint_fields"]["prediction_horizon_years"] is None
+    assert out["metrics"]["endpoint_fields"]["follow_up_complete"] is False

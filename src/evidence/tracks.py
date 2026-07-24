@@ -41,6 +41,7 @@ from data.manifest import sha256_of_file
 
 from .cohort_registry import Cohort
 from .evidence_contract import build_report, not_evaluable
+from .run_identity import utc_now_iso
 
 TASK_SMOKE = "smoke_classification"
 TASK_MALIGNANCY = "malignancy_classification"
@@ -127,10 +128,10 @@ def run_track_a_against_registry(cohorts: Sequence[Cohort], role: str = "develop
     which cohorts the registry says are structurally eligible. Genuinely
     running a real fit against gse123352 or gse136831 happens through the
     dedicated, dataset-specific paths this module also provides
-    (run_track_a_on_real_verified_label_data / run_track_a_on_real_weak_label_data)
+    (run_track_a_on_real_verified_label_data / run_copd_control_proxy_analysis)
     and the scripts that call them
     (scripts/run_gse123352_verified_label_evidence.py,
-    scripts/run_gse136831_weak_label_evidence.py) — this generic path is
+    scripts/run_gse136831_copd_control_proxy_analysis.py) — this generic path is
     intentionally NOT auto-wired to invoke those, so that a caller of this
     function can never be surprised by an implicit multi-minute real
     training run or an implicit real-file read; it always returns a
@@ -158,7 +159,7 @@ def run_track_a_against_registry(cohorts: Sequence[Cohort], role: str = "develop
             "Run evidence.audit to confirm local data presence, then call the dedicated "
             "real-data function for the eligible cohort directly (e.g. "
             "evidence.tracks.run_track_a_on_real_verified_label_data for gse123352, "
-            "evidence.tracks.run_track_a_on_real_weak_label_data for gse136831) or the "
+            "evidence.tracks.run_copd_control_proxy_analysis for gse136831) or the "
             "matching script under scripts/."
         ),
         task=TASK_SMOKE, role=role, candidate_cohorts=[c.cohort_id for c in eligible],
@@ -224,7 +225,7 @@ def run_track_a_on_fixture(
         "verified_label_count": 0 if weak_label_experiment else len(y_true),
         "unknown_label_count": 0,
         "excluded_subject_count": 0,
-        "split_role": "train",
+        "split_role": "development_train",
         "split_manifest_fingerprint": _fp("track_a_split", subject_ids),
         "dataset_manifest_fingerprint": _fp("track_a_fixture", y_true),
         "preprocessing_artifact_fingerprint": _fp("track_a_preprocessing"),
@@ -237,7 +238,7 @@ def run_track_a_on_fixture(
         "frozen_test_access_status": "not_applicable",
         "evidence_level": "synthetic_software_validation",
         "limitations": limitations,
-        "evaluation_timestamp": "1970-01-01T00:00:00Z",
+        "evaluation_timestamp": utc_now_iso(),
         "report_schema_version": "1",
     }
     metrics = {
@@ -262,30 +263,46 @@ def run_track_a_on_fixture(
     return build_report(identity, metrics).to_dict()
 
 
-def run_track_a_on_real_weak_label_data(
+TASK_PROXY_ANALYSIS = "exploratory_disease_proxy_analysis"
+
+
+def run_copd_control_proxy_analysis(
     y_true: Sequence[int], y_pred: Sequence[int], subject_ids: Sequence[str], num_classes: int,
     *, raw_file_paths: Sequence[Union[str, Path]],
+    split_manifest_fingerprint: str,
+    model_fingerprint: str,
+    environment_fingerprint: str,
+    preprocessing_artifact_fingerprint: str,
     class_names: Optional[List[str]] = None,
     dataset_accession: str = "GSE136831",
     excluded_subject_count: int = 0,
     excluded_subject_reason: Optional[str] = None,
-    preprocessing_artifact_fingerprint: Optional[str] = None,
     random_seed: int = 0,
     extra_limitations: Optional[Sequence[str]] = None,
 ) -> dict:
-    """Real-data counterpart to run_track_a_on_fixture, for a documented
-    weak-label side-experiment against genuinely downloaded raw data (today
-    only GSE136831 — see cohort_registry's gse136831 entry and
-    scripts/run_gse136831_weak_label_evidence.py).
+    """Scores a documented COPD-vs-Control disease-status proxy sensitivity
+    analysis against genuinely downloaded raw data (today only GSE136831 —
+    see cohort_registry's gse136831 entry and
+    scripts/run_gse136831_copd_control_proxy_analysis.py).
 
-    weak_label_experiment is always True here — this function only exists
-    to score a weak-proxy result and must never be called to represent a
-    verified-label outcome. GSE136831 has no verified per-subject
-    cigarette-exposure field (see configs/cohorts.yaml's
-    gse136831.source_limitations); Disease_Identity=COPD is a documented
-    correlational proxy for cigarette exposure, and Disease_Identity=Control
-    is used here as the "never" side of that same weak proxy — never
-    described as a verified label anywhere this report is consumed.
+    This is deliberately NOT `TASK_SMOKE` — task=TASK_PROXY_ANALYSIS
+    ('exploratory_disease_proxy_analysis'). GSE136831 has no verified
+    per-subject cigarette-exposure field (see configs/cohorts.yaml's
+    gse136831.source_limitations). COPD is a clinical disease diagnosis with
+    strong smoking association but also documented non-smoking causes
+    (alpha-1 antitrypsin deficiency, occupational/environmental exposure,
+    biomass fuel smoke, genetic susceptibility); Control status does not
+    prove never-smoking (a control subject could be an undiagnosed or
+    former smoker who has not developed COPD). A high score on this analysis
+    may reflect COPD disease-state expression biology rather than exposure
+    biology, and this function cannot and does not estimate smoke-exposure
+    classification performance. verified_label_count is always 0.
+    weak_label_experiment is always True. This report's task is never
+    TASK_SMOKE, so it structurally cannot enter a verified Track A aggregate
+    (see eligible_cohorts_for_track / cohorts_supporting, which filter on
+    task) and cannot be promoted to verified-label evidence by any caller
+    flag — there is no parameter on this function that changes its task or
+    verified_label_count.
 
     Stamped conservatively: synthetic_flag=False (real downloaded data, real
     code execution) but development_only_flag=True and
@@ -296,12 +313,14 @@ def run_track_a_on_real_weak_label_data(
     cohort_role='development' for the same reason.
 
     raw_file_paths must point at the actual downloaded raw GSE136831 files
-    this run's h5ad conversion was built from (e.g. the *_RawCounts_Sparse.
-    mtx.gz, *_AllCells.GeneIDs.txt.gz, *_AllCells.cellBarcodes.txt.gz,
-    *_AllCells.Samples.CellType.MetadataTable.txt.gz quartet under
-    data/raw/cigarette/GSE136831/) — dataset_manifest_fingerprint is a real
-    sha256 over their actual bytes (data.manifest.sha256_of_file), never a
-    placeholder.
+    this run's h5ad conversion was built from — dataset_manifest_fingerprint
+    is a real sha256 over their actual bytes. split_manifest_fingerprint,
+    model_fingerprint, environment_fingerprint and
+    preprocessing_artifact_fingerprint must all be real fingerprints of the
+    actual fitted split/model/environment/preprocessing state (see
+    evidence/run_identity.py) — there is no fallback/placeholder value for
+    any of them; a caller that cannot supply the real value must not call
+    this function.
     """
     y_true = list(y_true)
     y_pred = list(y_pred)
@@ -322,12 +341,18 @@ def run_track_a_on_real_weak_label_data(
     ]
 
     limitations = [
-        "weak_label_experiment=True — GSE136831 (Vanderbilt/Habermann IPF/COPD/Control "
-        "atlas) has no verified per-subject cigarette-exposure field. Disease_Identity="
-        "COPD is used as a weak/correlational cigarette-exposure proxy and "
-        "Disease_Identity=Control as the weak 'never' proxy; IPF subjects are excluded "
-        "entirely (IPF is not a smoke-exposure proxy). This result must never be merged "
-        "with a verified-label primary smoke-classification result.",
+        "This is an exploratory COPD-vs-Control DISEASE-STATUS proxy analysis, not verified "
+        "smoke-exposure classification. COPD is a clinical diagnosis with strong smoking "
+        "association but also documented non-smoking causes (alpha-1 antitrypsin deficiency, "
+        "occupational/environmental exposure, biomass fuel smoke); Control does not prove "
+        "never-smoking. A high score here may reflect COPD disease-state expression biology "
+        "rather than smoke-exposure biology. verified_label_count=0. This result must never "
+        "be merged with, aggregated into, or used to select among verified-label smoke "
+        "classification results — its task (exploratory_disease_proxy_analysis) is "
+        "structurally distinct from smoke_classification and cannot satisfy smoke-evidence "
+        "eligibility or any clinical-readiness dimension.",
+        "GSE136831 (Vanderbilt/Habermann IPF/COPD/Control atlas). IPF subjects are excluded "
+        "entirely (IPF is not a smoking-exposure-relevant comparator for this analysis).",
         "One vote per subject via cell-level majority vote; abstention/coverage is secondary only.",
         "development_only_flag=True — gse136831's role_eligibility is [development] only "
         "and no frozen-test guard has ever been acquired for this cohort/task.",
@@ -343,11 +368,12 @@ def run_track_a_on_real_weak_label_data(
         limitations.extend(extra_limitations)
 
     identity = {
-        "task": TASK_SMOKE,
-        "endpoint": "subject_level_smoke_class_weak_label_sensitivity",
+        "task": TASK_PROXY_ANALYSIS,
+        "endpoint": "copd_vs_control_disease_status",
         "endpoint_definition": (
-            "weak COPD-diagnosis proxy for cigarette exposure vs Control proxy for never "
-            "exposure, one label per subject, IPF subjects excluded"
+            "COPD clinical diagnosis vs Control disease status, one label per subject, IPF "
+            "subjects excluded — a disease-status proxy sensitivity analysis, NOT a "
+            "smoke-exposure endpoint. See this function's docstring."
         ),
         "prediction_unit": "subject",
         "biological_specimen_type": "lung_tissue",
@@ -361,22 +387,20 @@ def run_track_a_on_real_weak_label_data(
         "verified_label_count": 0,
         "unknown_label_count": 0,
         "excluded_subject_count": excluded_subject_count,
-        "split_role": "train",
-        "split_manifest_fingerprint": _fp("track_a_real_weak_label_split", sorted(set(subject_ids))),
+        "split_role": "development_holdout",
+        "split_manifest_fingerprint": split_manifest_fingerprint,
         "dataset_manifest_fingerprint": _real_raw_file_fingerprint(raw_file_paths),
-        "preprocessing_artifact_fingerprint": (
-            preprocessing_artifact_fingerprint or _fp("track_a_real_weak_label_preprocessing", dataset_accession)
-        ),
-        "model_fingerprint": _fp("track_a_real_weak_label_model", y_pred),
+        "preprocessing_artifact_fingerprint": preprocessing_artifact_fingerprint,
+        "model_fingerprint": model_fingerprint,
         "random_seed": random_seed,
         "code_commit_sha": _git_commit_sha(),
-        "environment_fingerprint": _fp("track_a_real_weak_label_environment"),
+        "environment_fingerprint": environment_fingerprint,
         "synthetic_flag": False,
         "development_only_flag": True,
         "frozen_test_access_status": "not_applicable",
         "evidence_level": "development_only_real_data",
         "limitations": limitations,
-        "evaluation_timestamp": "1970-01-01T00:00:00Z",
+        "evaluation_timestamp": utc_now_iso(),
         "report_schema_version": "1",
     }
     metrics = {
@@ -404,11 +428,14 @@ def run_track_a_on_real_weak_label_data(
 def run_track_a_on_real_verified_label_data(
     y_true: Sequence[int], y_pred: Sequence[int], subject_ids: Sequence[str], num_classes: int,
     *, raw_file_paths: Sequence[Union[str, Path]],
+    split_manifest_fingerprint: str,
+    model_fingerprint: str,
+    environment_fingerprint: str,
+    preprocessing_artifact_fingerprint: str,
     class_names: Optional[List[str]] = None,
     dataset_accession: str = "GSE123352",
     excluded_subject_count: int = 0,
     excluded_subject_reason: Optional[str] = None,
-    preprocessing_artifact_fingerprint: Optional[str] = None,
     random_seed: int = 0,
 ) -> dict:
     """Real-data Track A path for a cohort with a genuinely VERIFIED
@@ -425,16 +452,25 @@ def run_track_a_on_real_verified_label_data(
     'internal_held_out_real_data' — see evidence_contract.validate_identity
     and cohort_registry.Cohort.eligible_for_role.
 
-    This is bulk pseudo-bulk microarray data, not single-cell — the
-    "subject_ids" here are one bulk sample per subject
-    (data.bulk_pipeline's subject_ids == sample_ids for this cohort), and
-    "prediction_unit"/endpoint reflect that; this must never be described
-    as a single-cell result.
+    This is bulk pseudo-bulk microarray data, not single-cell — "subject_ids"
+    here are VERIFIED donor identifiers (data/bulk_pipeline.py excludes any
+    sample whose subject identity could not be independently verified; see
+    that module and data/converters.py::_infer_subject_id_column), and
+    "prediction_unit"/endpoint reflect that; this must never be described as
+    a single-cell result.
 
     raw_file_paths must point at the actual downloaded raw GSE123352 files
     this run's conversion was built from (series matrix, platform
     annotation, non-normalized data) — dataset_manifest_fingerprint is a
     real sha256 over their actual bytes, never a placeholder.
+    split_manifest_fingerprint, model_fingerprint, environment_fingerprint
+    and preprocessing_artifact_fingerprint must all be real fingerprints of
+    the actual fitted split/model/environment/preprocessing state (see
+    evidence/run_identity.py's bulk_preprocessing_fingerprint /
+    bulk_model_fingerprint / build_environment_snapshot /
+    build_split_manifest) — none of them has a descriptive-label fallback
+    here; a caller that cannot supply the real value must not call this
+    function.
     """
     y_true = list(y_true)
     y_pred = list(y_pred)
@@ -474,7 +510,13 @@ def run_track_a_on_real_verified_label_data(
     identity = {
         "task": TASK_SMOKE,
         "endpoint": "subject_level_smoke_class_verified_bulk",
-        "endpoint_definition": "verified ever/never cigarette-smoker status at time of sampling, one label per subject",
+        "endpoint_definition": (
+            "verified lifetime ever-versus-never cigarette-smoking history, one label per "
+            "subject — the source phenotype (ever_never_smoker) records whether a subject has "
+            "ever smoked cigarettes, not current exposure at the time of sampling; an "
+            "'ever'/'cigarette' label may include former smokers and does not imply active "
+            "exposure at sampling"
+        ),
         "prediction_unit": "subject",
         "biological_specimen_type": "airway_epithelium",
         "assay_modality": "bulk_microarray",
@@ -487,22 +529,20 @@ def run_track_a_on_real_verified_label_data(
         "verified_label_count": len(y_true),
         "unknown_label_count": 0,
         "excluded_subject_count": excluded_subject_count,
-        "split_role": "train",
-        "split_manifest_fingerprint": _fp("track_a_real_verified_split", sorted(set(subject_ids))),
+        "split_role": "development_holdout",
+        "split_manifest_fingerprint": split_manifest_fingerprint,
         "dataset_manifest_fingerprint": _real_raw_file_fingerprint(raw_file_paths),
-        "preprocessing_artifact_fingerprint": (
-            preprocessing_artifact_fingerprint or _fp("track_a_real_verified_preprocessing", dataset_accession)
-        ),
-        "model_fingerprint": _fp("track_a_real_verified_model", y_pred),
+        "preprocessing_artifact_fingerprint": preprocessing_artifact_fingerprint,
+        "model_fingerprint": model_fingerprint,
         "random_seed": random_seed,
         "code_commit_sha": _git_commit_sha(),
-        "environment_fingerprint": _fp("track_a_real_verified_environment"),
+        "environment_fingerprint": environment_fingerprint,
         "synthetic_flag": False,
         "development_only_flag": True,
         "frozen_test_access_status": "not_applicable",
         "evidence_level": "development_only_real_data",
         "limitations": limitations,
-        "evaluation_timestamp": "1970-01-01T00:00:00Z",
+        "evaluation_timestamp": utc_now_iso(),
         "report_schema_version": "1",
     }
     metrics = {
@@ -577,7 +617,7 @@ def run_track_b_on_fixture(
         "verified_label_count": len(y_true),
         "unknown_label_count": 0,
         "excluded_subject_count": 0,
-        "split_role": "train",
+        "split_role": "development_train",
         "split_manifest_fingerprint": _fp("track_b_split", sample_ids),
         "dataset_manifest_fingerprint": _fp("track_b_fixture", y_true),
         "preprocessing_artifact_fingerprint": _fp("track_b_preprocessing"),
@@ -593,7 +633,7 @@ def run_track_b_on_fixture(
             "Synthetic/development fixture only — no real-world evidence claimed.",
             "No registered cohort currently supports this task on real data; see run_track_b_against_registry.",
         ],
-        "evaluation_timestamp": "1970-01-01T00:00:00Z",
+        "evaluation_timestamp": utc_now_iso(),
         "report_schema_version": "1",
         "threshold_fingerprint": _fp("track_b_threshold", threshold, threshold_method),
     }
@@ -675,7 +715,7 @@ def run_track_c_on_fixture(
         "verified_label_count": len(y_true),
         "unknown_label_count": 0,
         "excluded_subject_count": 0,
-        "split_role": "train",
+        "split_role": "development_train",
         "split_manifest_fingerprint": _fp("track_c_split", subject_ids),
         "dataset_manifest_fingerprint": _fp("track_c_fixture", y_true),
         "preprocessing_artifact_fingerprint": _fp("track_c_preprocessing"),
@@ -692,7 +732,7 @@ def run_track_c_on_fixture(
             "Binary fixed-horizon only; no time-to-event/survival metric computed against this fixture.",
             "No registered cohort currently supports this task on real data; see run_track_c_against_registry.",
         ],
-        "evaluation_timestamp": "1970-01-01T00:00:00Z",
+        "evaluation_timestamp": utc_now_iso(),
         "report_schema_version": "1",
         "threshold_fingerprint": _fp("track_c_threshold", threshold, threshold_method),
     }
@@ -705,5 +745,120 @@ def run_track_c_on_fixture(
         "prediction_horizon_years": prediction_horizon_years,
         "follow_up_complete": follow_up_complete,
         "censoring_status": "not_applicable_binary_fixed_horizon",
+    }
+    return build_report(identity, out_metrics).to_dict()
+
+
+def run_track_c_on_real_tcga_vital_status_data(
+    y_true: Sequence[int], y_prob: Sequence[float], subject_ids: Sequence[str],
+    *, dataset_manifest_fingerprint: str,
+    split_manifest_fingerprint: str,
+    model_fingerprint: str,
+    environment_fingerprint: str,
+    preprocessing_artifact_fingerprint: str,
+    dataset_accession: str = "TCGA-LUAD+TCGA-LUSC",
+    excluded_subject_count: int = 0,
+    excluded_subject_reason: Optional[str] = None,
+    threshold: float = 0.5,
+    random_seed: int = 0,
+) -> dict:
+    """Real-data Track C path for TCGA-LUAD/TCGA-LUSC's genuinely linked
+    subject-level expression<->vital-status outcome (see
+    data/converters.py::convert_tcga_vital_status and
+    data/tcga_outcome_pipeline.py) — the first cohort in this repository
+    with real expression AND a real, independently-recorded, subject-level
+    cancer outcome (not a fabricated linkage; not a bulk sample_type
+    tumor/normal proxy). `subject_ids` here are real GDC `case_id` values.
+
+    Honest scope, stated in every report this produces: `vital_status`
+    ("Dead"/"Alive" at last recorded GDC follow-up) is NOT a time-to-event
+    survival label. No censoring, follow-up duration, or time horizon is
+    modeled — this function never upgrades a binary vital-status label into
+    a survival/time-to-event claim, and never computes a survival metric
+    (C-index, time-dependent AUROC, integrated Brier score) that would
+    require genuinely valid censoring data this pipeline does not have.
+
+    Stamped development_only_flag=True / evidence_level=
+    'development_only_real_data': no frozen internal/external guard has
+    ever been acquired for this cohort/task — see
+    evidence_contract.validate_identity and
+    cohort_registry.Cohort.eligible_for_role. All fingerprint arguments
+    must be real (see evidence/run_identity.py) — none has a
+    descriptive-label fallback; a caller that cannot supply the real value
+    must not call this function.
+    """
+    y_true = [int(v) for v in y_true]
+    y_prob = [float(v) for v in y_prob]
+    subject_ids = [str(s) for s in subject_ids]
+    n_subjects = len(set(subject_ids))
+
+    metrics = cancer_prediction_metrics(y_true, y_prob, threshold=threshold)
+    curve = reliability_curve(np.asarray(y_true, dtype=float), np.asarray(y_prob, dtype=float))
+    class_counts = {"dead": int(sum(1 for v in y_true if v == 1)), "alive": int(sum(1 for v in y_true if v == 0))}
+
+    limitations = [
+        "vital_status ('Dead'/'Alive' at last recorded GDC follow-up) is a binary outcome "
+        "label, NOT a time-to-event survival label — no censoring, follow-up duration, or "
+        "time horizon is modeled; this is not a Cox/survival-analysis result.",
+        "Bulk RNA-seq primary-tumor expression, one sample per real GDC case_id — never "
+        "single-cell, never entered into the single-cell MIL pipeline (data/assay_policy.py).",
+        "development_only_flag=True — no frozen-test guard has ever been acquired for this "
+        "cohort/task.",
+        "Simple L2 logistic regression over train-only top-variance genes — a first honest "
+        "bulk baseline, not a tuned, externally validated, or clinically calibrated model.",
+        "TCGA-LUAD and TCGA-LUSC are combined on their shared gene set for statistical power; "
+        "any histology-specific (adenocarcinoma vs. squamous) difference in signal is not "
+        "separately analyzed here.",
+    ]
+    if excluded_subject_reason:
+        limitations.append(excluded_subject_reason)
+
+    identity = {
+        "task": TASK_CANCER_PREDICTION,
+        "endpoint": "subject_level_vital_status_at_last_follow_up",
+        "endpoint_definition": (
+            "binary vital status (deceased vs. alive) as recorded in the subject's GDC "
+            "demographic record at last follow-up — not a fixed-horizon or time-to-event "
+            "survival outcome; predicted from primary-tumor bulk RNA-seq expression for the "
+            "same real subject (GDC case_id)"
+        ),
+        "prediction_unit": "subject",
+        "biological_specimen_type": "lung_tumor_tissue",
+        "assay_modality": "bulk_rna_seq",
+        "dataset_accession": dataset_accession,
+        "cohort_role": "development",
+        "species": "human",
+        "sample_count": len(y_true),
+        "unique_subject_count": n_subjects,
+        "class_counts": class_counts,
+        "verified_label_count": len(y_true),
+        "unknown_label_count": 0,
+        "excluded_subject_count": excluded_subject_count,
+        "split_role": "development_holdout",
+        "split_manifest_fingerprint": split_manifest_fingerprint,
+        "dataset_manifest_fingerprint": dataset_manifest_fingerprint,
+        "preprocessing_artifact_fingerprint": preprocessing_artifact_fingerprint,
+        "model_fingerprint": model_fingerprint,
+        "random_seed": random_seed,
+        "code_commit_sha": _git_commit_sha(),
+        "environment_fingerprint": environment_fingerprint,
+        "synthetic_flag": False,
+        "development_only_flag": True,
+        "frozen_test_access_status": "not_applicable",
+        "evidence_level": "development_only_real_data",
+        "limitations": limitations,
+        "evaluation_timestamp": utc_now_iso(),
+        "report_schema_version": "1",
+        "threshold_fingerprint": _fp("tcga_vital_status_threshold", threshold),
+    }
+    out_metrics = dict(metrics)
+    out_metrics["calibration_curve"] = curve
+    out_metrics["threshold_method"] = "fixed_default"
+    out_metrics["endpoint_fields"] = {
+        "event_indicator_field": "demographic.vital_status",
+        "time_origin": "not_applicable",
+        "prediction_horizon_years": None,
+        "follow_up_complete": False,
+        "censoring_status": "not_modeled_binary_vital_status_only",
     }
     return build_report(identity, out_metrics).to_dict()

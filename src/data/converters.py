@@ -40,8 +40,19 @@ def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list
     the series ships its expression matrix as a separate supplementary file
     instead of embedding it, e.g. GSE307690/CANUCK).
     """
+    sample_ids, meta, table_lines, _titles = _parse_sample_metadata_with_titles(gz_path)
+    return sample_ids, meta, table_lines
+
+
+def _parse_sample_metadata_with_titles(gz_path: Path) -> tuple[list[str], pd.DataFrame, list[str], list[str]]:
+    """Same as `_parse_sample_metadata`, plus the raw `!Sample_title` values
+    (in the same GSM column order) — used by `_infer_subject_id_column` to
+    recover a genuine donor identifier for cohorts whose series matrix
+    encodes one in the sample title (e.g. GSE123352's
+    "non_involved_lung_tissue_patient_N")."""
     opener = gzip.open if gz_path.suffix == ".gz" else open
     sample_ids: list[str] = []
+    titles: list[str] = []
     char_rows: dict[str, list[str]] = {}
     table_lines: list[str] = []
     in_table = False
@@ -51,6 +62,8 @@ def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list
             line = line.rstrip("\n")
             if line.startswith("!Sample_geo_accession"):
                 sample_ids = [s.strip('"') for s in line.split("\t")[1:]]
+            elif line.startswith("!Sample_title"):
+                titles = [s.strip('"') for s in line.split("\t")[1:]]
             elif line.startswith("!Sample_characteristics_ch1"):
                 vals = [s.strip('"') for s in line.split("\t")[1:]]
                 for v in vals:
@@ -69,7 +82,79 @@ def _parse_sample_metadata(gz_path: Path) -> tuple[list[str], pd.DataFrame, list
         if len(vals) == len(sample_ids):
             meta[key] = vals
 
-    return sample_ids, meta, table_lines
+    if len(titles) != len(sample_ids):
+        titles = []
+
+    return sample_ids, meta, table_lines, titles
+
+
+_PATIENT_TITLE_RE = re.compile(r"patient[_\s]?(\d+)", re.I)
+
+
+def _infer_subject_id_column(
+    accession: str, sample_ids: list[str], titles: list[str],
+) -> "tuple[pd.Series, pd.Series, str]":
+    """Cohort-specific, versioned subject-identity policy for series-matrix
+    accessions that encode a donor number in `!Sample_title` (documented
+    today for GSE123352: titles of the form
+    "non_involved_lung_tissue_patient_<N> <GEO array position>", one
+    distinct N per GSM with no repeats — i.e. one bulk sample per donor;
+    see docs/DATA_CARD.md).
+
+    Returns (subject_id, subject_id_verified, policy_note). subject_id is
+    only trusted (subject_id_verified=True for every row) when every
+    sample's title matches the documented "patient_<N>" pattern AND the
+    resulting donor numbers are unique across the whole series — i.e. a
+    verified one-sample-per-donor mapping. If titles are absent, any
+    sample's title fails to match, or two samples resolve to the same
+    donor number, this fails closed: subject_id falls back to sample_id
+    (GSM accession) but subject_id_verified=False for every row, so a
+    caller that requires verified subject independence (see
+    data/bulk_pipeline.py) must refuse to make a subject-level claim
+    rather than silently trust sample_id as if it were a genuine donor id.
+    """
+    if not titles:
+        return (
+            pd.Series(sample_ids, index=sample_ids),
+            pd.Series(False, index=sample_ids),
+            "no !Sample_title field was present to parse a donor identifier from — "
+            "subject independence could not be verified; sample_id was used as a "
+            "fallback and must not be treated as a verified subject id.",
+        )
+
+    matches = [_PATIENT_TITLE_RE.search(t) for t in titles]
+    if not all(matches):
+        return (
+            pd.Series(sample_ids, index=sample_ids),
+            pd.Series(False, index=sample_ids),
+            "one or more !Sample_title values did not match the documented "
+            "'patient_<N>' pattern — subject independence could not be verified; "
+            "sample_id was used as a fallback and must not be treated as a "
+            "verified subject id.",
+        )
+
+    donor_nums = [m.group(1) for m in matches]
+    if len(set(donor_nums)) != len(donor_nums):
+        return (
+            pd.Series(sample_ids, index=sample_ids),
+            pd.Series(False, index=sample_ids),
+            "two or more samples resolved to the same donor number parsed from "
+            "!Sample_title — this contradicts the documented one-sample-per-donor "
+            "assumption for this accession; subject independence could not be "
+            "verified and sample_id was used as a fallback only.",
+        )
+
+    subject_ids = pd.Series(
+        [f"{accession}_patient_{n}" for n in donor_nums], index=sample_ids,
+    )
+    return (
+        subject_ids,
+        pd.Series(True, index=sample_ids),
+        "subject_id parsed and verified from !Sample_title's documented "
+        "'patient_<N>' pattern: every sample resolved to a distinct donor number, "
+        "confirming one bulk sample per donor for this accession (see "
+        "docs/DATA_CARD.md's GSE123352 subject-identity policy).",
+    )
 
 
 def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -83,7 +168,14 @@ def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             parsed from `!Sample_characteristics_ch1` lines of the form
             "key: value".
     """
-    sample_ids, meta, table_lines = _parse_sample_metadata(gz_path)
+    expr, meta, _titles = _parse_series_matrix_with_titles(gz_path)
+    return expr, meta
+
+
+def _parse_series_matrix_with_titles(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Same as `_parse_series_matrix`, plus the raw `!Sample_title` values in
+    GSM column order (see `_parse_sample_metadata_with_titles`)."""
+    sample_ids, meta, table_lines, titles = _parse_sample_metadata_with_titles(gz_path)
     if not table_lines:
         raise ValueError(f"No expression table found in {gz_path}")
 
@@ -91,7 +183,7 @@ def _parse_series_matrix(gz_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     expr = pd.read_csv(StringIO("\n".join(table_lines)), sep="\t", index_col=0)
     expr.columns = [c.strip('"') for c in expr.columns]
 
-    return expr, meta
+    return expr, meta, titles
 
 
 _SMOKE_STATUS_PATTERNS = {
@@ -187,7 +279,7 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
     (transforms.py) already resolves BioMart's many-probes-to-one-gene case.
     """
     out_dir = _mkout()
-    expr, meta = _parse_series_matrix(gz_path)
+    expr, meta, titles = _parse_series_matrix_with_titles(gz_path)
 
     if platform_annot_path is not None:
         n_probes = len(expr)
@@ -216,6 +308,13 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
         ),
         index=expr.columns,
     )
+
+    subject_id, subject_id_verified, subject_id_policy_note = _infer_subject_id_column(
+        accession, list(expr.columns), titles,
+    )
+    subject_id = subject_id.reindex(expr.columns)
+    subject_id_verified = subject_id_verified.reindex(expr.columns).fillna(False)
+
     pd.DataFrame({
         "sample_id": expr.columns,
         "smoke_type": smoke.values,
@@ -223,6 +322,9 @@ def convert_microarray(accession: str, gz_path: Path, default_smoke_type: str,
         "smoke_type_source": f"GEO {accession} series matrix characteristics",
         "smoke_type_method": "regex_pattern_match",
         "smoke_type_limitation": limitation.values,
+        "subject_id": subject_id.values,
+        "subject_id_verified": subject_id_verified.values,
+        "subject_id_policy_note": subject_id_policy_note,
     }).to_csv(meta_path, index=False)
 
     n_unknown = int((~known).sum())
@@ -749,6 +851,114 @@ def convert_tcga(project: str, src_dir: Path) -> Optional[Path]:
     outcomes["cancer_label"] = outcomes["cancer_label"].astype(int)
     outcomes.to_csv(outcomes_path, index=False)
     print(f"[convert] {project}  {len(outcomes):,} subjects → {outcomes_path.name}")
+    return csv_path
+
+
+_TCGA_STAR_STAT_ROWS = {"N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous"}
+
+
+def _read_tcga_star_gene_counts(path: Path, value_col: str = "tpm_unstranded") -> pd.Series:
+    """One GDC 'STAR - Counts' augmented gene-count file (open-access tier —
+    downloaded directly via the GDC /data/{file_id} API, no gdc-client/token
+    needed) -> a gene_id (Ensembl, version-stripped) -> value Series. Drops
+    the four alignment-statistics pseudo-rows GDC includes in the same file
+    (N_unmapped/N_multimapping/N_noFeature/N_ambiguous) — these are QC
+    counters, not genes, and would otherwise silently enter the expression
+    matrix as four bogus "genes" with mostly-empty values."""
+    df = pd.read_csv(path, sep="\t", comment="#", dtype=str, compression=None)
+    df = df[~df["gene_id"].isin(_TCGA_STAR_STAT_ROWS)]
+    df["gene_id"] = df["gene_id"].str.split(".").str[0]
+    return df.set_index("gene_id")[value_col].astype(float)
+
+
+def convert_tcga_vital_status(project: str, src_dir: Path, value_col: str = "tpm_unstranded") -> Optional[Path]:
+    """
+    TCGA-LUAD/TCGA-LUSC primary-tumor gene expression -> genuine subject-level
+    vital-status (deceased vs. alive at last follow-up) outcome CSV, for the
+    real subject-level cancer-outcome-prediction task Issue #16 could not
+    previously produce (no cohort had both compatible expression AND a
+    genuinely linked subject-level outcome). Unlike `convert_tcga`'s
+    tumor/normal `sample_type` malignancy label (a property of which
+    specimen was dissected, known at collection time), vital_status is a
+    real, independently-recorded clinical outcome from GDC's demographic
+    record for the same `case_id` the expression file is filed under — a
+    genuine expression -> outcome subject-level link, not an inferred or
+    fabricated one.
+
+    Reads `src_dir/outcome_meta.csv` (file_id, case_id, submitter_id,
+    vital_status, days_to_death — written by the real GDC case-query results
+    used to build the download manifest) and `src_dir/<file_id>.tsv.gz`
+    (GDC's open-access "STAR - Counts" augmented gene-count file for that
+    case's primary-tumor sample; despite the extension these are plain
+    tab-separated text, not gzip-compressed — GDC serves them that way).
+
+    A case is excluded (never coerced) if: its vital_status is neither
+    'Alive' nor 'Dead'; its expression file is missing; or more than one
+    downloaded file resolves to the same case_id (this simple pipeline, like
+    data/bulk_pipeline.py, requires exactly one sample per subject and does
+    not implement multi-sample aggregation).
+    """
+    out_dir = _mkout()
+    meta_csv = src_dir / "outcome_meta.csv"
+    if not meta_csv.exists():
+        print(f"[convert] {project}  no outcome_meta.csv in {src_dir} — re-download real TCGA vital-status data first.")
+        return None
+
+    meta = pd.read_csv(meta_csv, dtype=str)
+    duplicate_cases = meta["case_id"].value_counts()
+    duplicate_cases = set(duplicate_cases[duplicate_cases > 1].index)
+
+    columns, vital_status, subject_id, excluded, reasons = {}, {}, {}, [], {}
+    for _, row in meta.iterrows():
+        file_id = row["file_id"]
+        case_id = row["case_id"]
+        vs = row["vital_status"]
+        fpath = src_dir / f"{file_id}.tsv.gz"
+        if case_id in duplicate_cases:
+            excluded.append(file_id)
+            reasons["duplicate_case_id"] = reasons.get("duplicate_case_id", 0) + 1
+            continue
+        if vs not in ("Alive", "Dead"):
+            excluded.append(file_id)
+            reasons["vital_status_unknown"] = reasons.get("vital_status_unknown", 0) + 1
+            continue
+        if not fpath.exists():
+            excluded.append(file_id)
+            reasons["file_missing"] = reasons.get("file_missing", 0) + 1
+            continue
+        try:
+            columns[file_id] = _read_tcga_star_gene_counts(fpath, value_col=value_col)
+        except Exception as exc:
+            excluded.append(file_id)
+            reasons["parse_error"] = reasons.get("parse_error", 0) + 1
+            print(f"[convert] {project}  failed to parse {fpath.name}: {exc}")
+            continue
+        vital_status[file_id] = 1.0 if vs == "Dead" else 0.0
+        subject_id[file_id] = case_id
+
+    if not columns:
+        print(f"[convert] {project}  no usable vital-status expression samples found under {src_dir}.")
+        return None
+
+    expr = pd.DataFrame(columns).fillna(0.0)
+    csv_path = out_dir / f"{project}_vital_status.csv"
+    meta_path = out_dir / f"{project}_vital_status_samples_meta.csv"
+    expr.to_csv(csv_path)
+    pd.DataFrame({
+        "sample_id": expr.columns,
+        "subject_id": [subject_id[s] for s in expr.columns],
+        # case_id comes directly from GDC's own case record for this
+        # file — an authoritative, GDC-assigned subject identifier, not an
+        # inference from a title/metadata field the way GSE123352's
+        # subject_id is — so it is always verified when present.
+        "subject_id_verified": True,
+        "vital_status_known": True,
+        "vital_status": [vital_status[s] for s in expr.columns],
+    }).to_csv(meta_path, index=False)
+
+    n_dead = sum(v == 1.0 for v in vital_status.values())
+    print(f"[convert] {project}  {expr.shape[1]} samples x {expr.shape[0]} genes → {csv_path.name}"
+          f"  ({n_dead} dead / {expr.shape[1] - n_dead} alive; excluded {len(excluded)}: {reasons})")
     return csv_path
 
 

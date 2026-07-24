@@ -22,10 +22,17 @@ Pipeline
    mapping via the platform annotation file, real per-sample smoking-status
    parsed from the GEO series-matrix characteristics — see that module's
    docstrings). Samples whose smoke_type_known is False are excluded, never
-   guessed.
+   guessed. The sidecar also carries subject_id/subject_id_verified,
+   produced by converters.py's cohort-specific subject-identity policy
+   (`_infer_subject_id_column`) — this module never assumes sample_id==
+   subject_id; a sample whose subject identity was not genuinely verified
+   is excluded rather than trusted (see build_bulk_smoke_dataset).
 2. `build_bulk_smoke_dataset()` assembles a samples x genes matrix `X`,
-   integer labels `y`, and subject ids (one sample = one subject for this
-   cohort) restricted to the two verified classes this module supports.
+   integer labels `y`, and VERIFIED subject ids (excluding any sample whose
+   subject_id_verified is False, and refusing to proceed if two kept
+   samples resolve to the same subject — this simple pipeline does not
+   implement multi-sample-per-subject grouping) restricted to the two
+   verified classes this module supports.
 3. `split_bulk_subjects()` reuses `data.splitting.subject_train_val_test_split`
    for a deterministic, leakage-free subject-level train/test split (every
    sample here is already one subject, so this is one row per group, but
@@ -57,11 +64,82 @@ import pandas as pd
 SUPPORTED_BULK_CLASSES = ("unexposed", "cigarette")  # index 0 / 1 — binary ever/never
 DEFAULT_TOP_VARIANCE_GENES = 2000
 
+# The only representations accepted as a boolean label-known flag when
+# parsed from a persisted CSV — a round trip through pandas can turn a
+# native bool into any of these string forms depending on dtype inference,
+# but nothing outside this exact set is accepted. In particular the string
+# "False" is REJECTED as a distinct, explicit value (not coerced via
+# Python's truthy bool("False") == True), which is the specific defect this
+# parser exists to close.
+_TRUE_TOKENS = {True, 1, "true", "True", "1"}
+_FALSE_TOKENS = {False, 0, "false", "False", "0"}
+
 
 class BulkPipelineError(ValueError):
     """Raised when a bulk cohort's real expression matrix or verified label
     field cannot be honestly parsed/assembled — never papered over with a
     guessed or defaulted label."""
+
+
+def parse_strict_bool(value: object, *, field_name: str, row_context: str) -> bool:
+    """Strict boolean parser for persisted/user-provided label-known flags.
+
+    Accepts only: native bool, int 0/1, and the strings "true"/"True"/"1"/
+    "false"/"False"/"0". Everything else — NaN, None, empty/whitespace
+    strings, "yes"/"no", arbitrary strings, arbitrary ints, lists/dicts —
+    is rejected with a BulkPipelineError naming the field and row rather
+    than silently treated as unknown/False. Callers must not catch this and
+    continue; a malformed boolean field means the row cannot be honestly
+    included at all.
+    """
+    if isinstance(value, float) and pd.isna(value):
+        raise BulkPipelineError(
+            f"{field_name} for {row_context} is NaN — a missing boolean flag cannot be "
+            "parsed and must not be treated as False or unknown-but-continue."
+        )
+    if value is None:
+        raise BulkPipelineError(
+            f"{field_name} for {row_context} is None — a missing boolean flag cannot be "
+            "parsed and must not be treated as False or unknown-but-continue."
+        )
+    if isinstance(value, (list, dict)):
+        raise BulkPipelineError(
+            f"{field_name} for {row_context} has non-scalar value {value!r} — cannot parse a boolean."
+        )
+    if isinstance(value, str) and value.strip() == "":
+        raise BulkPipelineError(
+            f"{field_name} for {row_context} is an empty/whitespace string — cannot parse a boolean."
+        )
+    # bool is an int subclass in Python — check bool first so True/False
+    # native values hit the fast, unambiguous path before the int check.
+    # numpy's bool_ is a distinct type from Python's builtin bool (not an
+    # isinstance(..., bool) match), but pandas frequently hands one back
+    # from a bool-dtype column — handled explicitly rather than falling
+    # through to the "unrecognized type" branch.
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        if value in _TRUE_TOKENS:
+            return True
+        if value in _FALSE_TOKENS:
+            return False
+        raise BulkPipelineError(
+            f"{field_name} for {row_context} has unrecognized string value {value!r} — only "
+            "'true'/'True'/'1' and 'false'/'False'/'0' are accepted."
+        )
+    if isinstance(value, (int, np.integer)):
+        if int(value) == 1:
+            return True
+        if int(value) == 0:
+            return False
+        raise BulkPipelineError(
+            f"{field_name} for {row_context} has unrecognized integer value {value!r} — only "
+            "0 and 1 are accepted."
+        )
+    raise BulkPipelineError(
+        f"{field_name} for {row_context} has unrecognized type {type(value).__name__} "
+        f"(value={value!r}) — cannot parse a boolean."
+    )
 
 
 @dataclass
@@ -123,8 +201,19 @@ def load_bulk_expression_and_labels(
             f"{meta_path} is missing required column(s) {sorted(missing)} — cannot "
             "honestly determine which samples carry a verified smoke label."
         )
+    if {"subject_id", "subject_id_verified"} - set(meta.columns):
+        raise BulkPipelineError(
+            f"{meta_path} is missing 'subject_id'/'subject_id_verified' columns — "
+            "regenerate it with the current data/converters.py, which stamps a "
+            "cohort-specific, verified subject-identity policy (see "
+            "_infer_subject_id_column) rather than assuming sample_id==subject_id."
+        )
     meta = meta.set_index("sample_id")
-    n_known = int(meta["smoke_type_known"].astype(bool).sum())
+    parsed_known = [
+        parse_strict_bool(v, field_name="smoke_type_known", row_context=f"sample_id={sid!r}")
+        for sid, v in meta["smoke_type_known"].items()
+    ]
+    n_known = int(sum(parsed_known))
     if n_known == 0:
         raise BulkPipelineError(
             f"{meta_path} carries zero samples with smoke_type_known=True — no "
@@ -148,7 +237,8 @@ def build_bulk_smoke_dataset(
     sample_ids_ordered = [str(c) for c in expr.columns]
     excluded: List[str] = []
     reasons: Dict[str, int] = {}
-    kept_ids: List[str] = []
+    kept_sample_ids: List[str] = []
+    kept_subject_ids: List[str] = []
     kept_labels: List[int] = []
 
     for sid in sample_ids_ordered:
@@ -157,7 +247,10 @@ def build_bulk_smoke_dataset(
             reasons["no_phenotype_row"] = reasons.get("no_phenotype_row", 0) + 1
             continue
         row = meta.loc[sid]
-        if not bool(row["smoke_type_known"]):
+        known = parse_strict_bool(
+            row["smoke_type_known"], field_name="smoke_type_known", row_context=f"sample_id={sid!r}"
+        )
+        if not known:
             excluded.append(sid)
             reasons["smoke_type_unknown"] = reasons.get("smoke_type_unknown", 0) + 1
             continue
@@ -166,20 +259,42 @@ def build_bulk_smoke_dataset(
             excluded.append(sid)
             reasons["unsupported_class"] = reasons.get("unsupported_class", 0) + 1
             continue
-        kept_ids.append(sid)
+        subject_verified = parse_strict_bool(
+            row["subject_id_verified"], field_name="subject_id_verified", row_context=f"sample_id={sid!r}",
+        )
+        if not subject_verified:
+            excluded.append(sid)
+            reasons["subject_identity_unverified"] = reasons.get("subject_identity_unverified", 0) + 1
+            continue
+        kept_sample_ids.append(sid)
+        kept_subject_ids.append(str(row["subject_id"]))
         kept_labels.append(SUPPORTED_BULK_CLASSES.index(smoke_type))
 
-    if not kept_ids:
+    if not kept_sample_ids:
         raise BulkPipelineError(
-            "No sample survived verified-label filtering — every sample was excluded "
-            f"({reasons})."
+            "No sample survived verified-label/verified-subject-identity filtering — "
+            f"every sample was excluded ({reasons})."
         )
 
-    X = expr[kept_ids].T.values.astype(np.float32)  # samples x genes
+    duplicate_subjects = {
+        sub: count for sub, count in
+        {s: kept_subject_ids.count(s) for s in set(kept_subject_ids)}.items()
+        if count > 1
+    }
+    if duplicate_subjects:
+        raise BulkPipelineError(
+            "Multiple kept samples resolved to the same verified subject_id "
+            f"({duplicate_subjects}) — this simple bulk pipeline requires exactly one "
+            "sample per subject and does not implement multi-sample-per-subject "
+            "aggregation/grouping; fix the cohort's subject-identity policy or grouping "
+            "upstream before calling this pipeline."
+        )
+
+    X = expr[kept_sample_ids].T.values.astype(np.float32)  # samples x genes
     y = np.asarray(kept_labels, dtype=int)
 
     return BulkExpressionDataset(
-        X=X, y=y, subject_ids=list(kept_ids), sample_ids=list(kept_ids),
+        X=X, y=y, subject_ids=kept_subject_ids, sample_ids=kept_sample_ids,
         gene_names=list(expr.index.astype(str)),
         excluded_sample_ids=excluded, excluded_reason_counts=reasons,
     )
